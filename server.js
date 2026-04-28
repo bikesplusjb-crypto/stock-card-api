@@ -8,7 +8,7 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => {
-  res.send("Stock Card API running with Yahoo Finance");
+  res.send("Stock API running (Yahoo)");
 });
 
 app.get("/stock/:ticker", async (req, res) => {
@@ -28,7 +28,7 @@ app.get("/stock/:ticker", async (req, res) => {
     const percent = ((last - first) / first) * 100;
 
     res.json({
-      ticker: ticker,
+      ticker,
       price: meta.regularMarketPrice,
       previousClose: meta.chartPreviousClose,
       oneMonthChangePercent: percent.toFixed(2) + "%",
@@ -39,7 +39,7 @@ app.get("/stock/:ticker", async (req, res) => {
   } catch (err) {
     res.json({
       ticker,
-      error: "Yahoo stock fetch failed"
+      error: "Yahoo fetch failed"
     });
   }
 });
