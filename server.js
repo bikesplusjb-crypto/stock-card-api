@@ -8,65 +8,47 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => {
-  res.send("Stock API running");
+  res.send("Stock API running with Yahoo");
 });
 
 app.get("/stock/:ticker", async (req, res) => {
-  const ticker = req.params.ticker.toLowerCase();
+  const ticker = req.params.ticker.toUpperCase();
 
   try {
-    const url = `https://stooq.com/q/l/?s=${ticker}.us&f=sd2t2ohlcv&e=csv`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=1mo&interval=1d`;
+
     const response = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0" }
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json"
+      }
     });
 
-    const text = await response.text();
+    const data = await response.json();
 
-    // 🛑 SAFETY CHECK
-    if (!text || text.length < 20) {
-      return res.json({
-        ticker: ticker.toUpperCase(),
-        price: "N/A",
-        error: "No data returned"
-      });
-    }
+    const result = data.chart.result[0];
+    const meta = result.meta;
+    const prices = result.indicators.quote[0].close.filter(Boolean);
 
-    const lines = text.trim().split("\n");
-
-    if (lines.length < 2) {
-      return res.json({
-        ticker: ticker.toUpperCase(),
-        price: "N/A",
-        error: "Invalid CSV format"
-      });
-    }
-
-    const values = lines[1].split(",");
-
-    const close = values[6];
-    const volume = values[7];
-
-    if (!close || close === "N/D") {
-      return res.json({
-        ticker: ticker.toUpperCase(),
-        price: "N/A",
-        error: "No valid price"
-      });
-    }
+    const first = prices[0];
+    const last = prices[prices.length - 1];
+    const percent = ((last - first) / first) * 100;
 
     res.json({
-      ticker: ticker.toUpperCase(),
-      price: close,
-      oneMonthChangePercent: "Live",
-      volume: volume,
-      source: "Stooq Stable"
+      ticker,
+      price: meta.regularMarketPrice,
+      previousClose: meta.chartPreviousClose,
+      oneMonthChangePercent: percent.toFixed(2) + "%",
+      currency: meta.currency,
+      source: "Yahoo Finance"
     });
 
   } catch (err) {
     res.json({
-      ticker: ticker.toUpperCase(),
+      ticker,
       price: "N/A",
-      error: "Fetch failed",
+      oneMonthChangePercent: "N/A",
+      error: "Yahoo fetch failed",
       details: err.message
     });
   }
