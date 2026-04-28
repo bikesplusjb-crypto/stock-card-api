@@ -16,10 +16,31 @@ app.get("/stock/:ticker", async (req, res) => {
 
   try {
     const url = `https://stooq.com/q/l/?s=${ticker}.us&f=sd2t2ohlcv&e=csv`;
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0" }
+    });
+
     const text = await response.text();
 
-    const lines = text.split("\n");
+    // 🛑 SAFETY CHECK
+    if (!text || text.length < 20) {
+      return res.json({
+        ticker: ticker.toUpperCase(),
+        price: "N/A",
+        error: "No data returned"
+      });
+    }
+
+    const lines = text.trim().split("\n");
+
+    if (lines.length < 2) {
+      return res.json({
+        ticker: ticker.toUpperCase(),
+        price: "N/A",
+        error: "Invalid CSV format"
+      });
+    }
+
     const values = lines[1].split(",");
 
     const close = values[6];
@@ -29,7 +50,7 @@ app.get("/stock/:ticker", async (req, res) => {
       return res.json({
         ticker: ticker.toUpperCase(),
         price: "N/A",
-        error: "No data"
+        error: "No valid price"
       });
     }
 
@@ -38,7 +59,7 @@ app.get("/stock/:ticker", async (req, res) => {
       price: close,
       oneMonthChangePercent: "Live",
       volume: volume,
-      source: "Stooq CSV"
+      source: "Stooq Stable"
     });
 
   } catch (err) {
