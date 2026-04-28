@@ -8,38 +8,48 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => {
-  res.send("Stock API running (Yahoo)");
+  res.send("Stock Card API running");
 });
 
 app.get("/stock/:ticker", async (req, res) => {
   const ticker = req.params.ticker.toUpperCase();
 
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?range=1mo&interval=1d`;
-    const response = await fetch(url);
-    const data = await response.json();
+    // Safer no-key stock source
+    const stooqUrl = `https://stooq.com/q/l/?s=${ticker.toLowerCase()}.us&f=sd2t2ohlcv&h&e=json`;
+    const stooqRes = await fetch(stooqUrl, {
+      headers: { "User-Agent": "Mozilla/5.0" }
+    });
 
-    const result = data.chart.result[0];
-    const meta = result.meta;
-    const prices = result.indicators.quote[0].close.filter(Boolean);
+    const stooqData = await stooqRes.json();
+    const quote = stooqData.symbols && stooqData.symbols[0];
 
-    const first = prices[0];
-    const last = prices[prices.length - 1];
-    const percent = ((last - first) / first) * 100;
+    if (quote && quote.close && quote.close !== "N/D") {
+      return res.json({
+        ticker,
+        price: quote.close,
+        oneMonthChangePercent: "Live",
+        volume: quote.volume,
+        date: quote.date,
+        source: "Stooq"
+      });
+    }
 
-    res.json({
+    return res.json({
       ticker,
-      price: meta.regularMarketPrice,
-      previousClose: meta.chartPreviousClose,
-      oneMonthChangePercent: percent.toFixed(2) + "%",
-      currency: meta.currency,
-      source: "Yahoo Finance"
+      price: "N/A",
+      oneMonthChangePercent: "N/A",
+      error: "No stock data found",
+      source: "Stooq"
     });
 
   } catch (err) {
     res.json({
       ticker,
-      error: "Yahoo fetch failed"
+      price: "N/A",
+      oneMonthChangePercent: "N/A",
+      error: "Stock fetch failed",
+      details: err.message
     });
   }
 });
