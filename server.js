@@ -1,3 +1,31 @@
+const fetch = require("node-fetch");
+
+let ebayToken = null;
+let tokenExpires = 0;
+
+async function getEbayToken() {
+  if (ebayToken && Date.now() < tokenExpires) return ebayToken;
+
+  const auth = Buffer.from(
+    process.env.EBAY_CLIENT_ID + ":" + process.env.EBAY_CLIENT_SECRET
+  ).toString("base64");
+
+  const res = await fetch("https://api.ebay.com/identity/v1/oauth2/token", {
+    method: "POST",
+    headers: {
+      "Authorization": `Basic ${auth}`,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: "grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope"
+  });
+
+  const data = await res.json();
+
+  ebayToken = data.access_token;
+  tokenExpires = Date.now() + (data.expires_in - 60) * 1000;
+
+  return ebayToken;
+}
 const express = require("express");
 const fetch = require("node-fetch");
 const cors = require("cors");
