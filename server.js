@@ -28,6 +28,10 @@ async function getEbayToken() {
 
   const data = await res.json();
 
+  if (!data.access_token) {
+    throw new Error("Could not get eBay token");
+  }
+
   ebayToken = data.access_token;
   tokenExpires = Date.now() + (data.expires_in - 60) * 1000;
 
@@ -68,6 +72,7 @@ app.get("/stock/:ticker", async (req, res) => {
       currency: meta.currency,
       source: "Yahoo Finance"
     });
+
   } catch (err) {
     res.json({
       ticker,
@@ -85,7 +90,7 @@ app.get("/card/:name", async (req, res) => {
     const token = await getEbayToken();
 
     const response = await fetch(
-      `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodeURIComponent(query)}&limit=10`,
+      `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodeURIComponent(query)}&limit=25`,
       {
         headers: {
           Authorization: `Bearer ${token}`,
@@ -100,29 +105,68 @@ app.get("/card/:name", async (req, res) => {
       return res.json({
         search: query,
         avgPrice: "N/A",
+        lowPrice: "N/A",
+        highPrice: "N/A",
         listings: 0,
         source: "eBay Browse API",
+        ebayUrl: `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}`,
         error: "No items found"
       });
     }
 
-    const prices = data.itemSummaries
-      .map(item => parseFloat(item.price && item.price.value))
-      .filter(p => !isNaN(p));
+    const clean = data.itemSummaries.filter(item => {
+      const title = String(item.title || "").toLowerCase();
 
-    const avg = prices.length
-      ? prices.reduce((a, b) => a + b, 0) / prices.length
-      : 0;
+      return (
+        item.price &&
+        item.price.value &&
+        !title.includes("lot") &&
+        !title.includes("reprint") &&
+        !title.includes("custom") &&
+        !title.includes("digital") &&
+        !title.includes("break")
+      );
+    });
+
+    const prices = clean
+      .map(item => parseFloat(item.price.value))
+      .filter(p => !isNaN(p) && p > 5 && p < 5000);
+
+    if (prices.length === 0) {
+      return res.json({
+        search: query,
+        avgPrice: "N/A",
+        lowPrice: "N/A",
+        highPrice: "N/A",
+        listings: 0,
+        source: "eBay Cleaned Data",
+        ebayUrl: `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}`,
+        error: "No valid comps"
+      });
+    }
+
+    prices.sort((a, b) => a - b);
+
+    const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
+    const low = prices[0];
+    const high = prices[prices.length - 1];
 
     res.json({
       search: query,
-      avgPrice: avg ? avg.toFixed(2) : "N/A",
-      listings: data.total || data.itemSummaries.length,
-      source: "eBay Browse API",
+      avgPrice: avg.toFixed(2),
+      lowPrice: low.toFixed(2),
+      highPrice: high.toFixed(2),
+      listings: prices.length,
+      source: "eBay Cleaned Data",
       ebayUrl: `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}`
     });
+
   } catch (err) {
     res.json({
+      avgPrice: "N/A",
+      lowPrice: "N/A",
+      highPrice: "N/A",
+      listings: 0,
       error: "eBay fetch failed",
       details: err.message
     });
