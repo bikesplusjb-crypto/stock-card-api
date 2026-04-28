@@ -8,52 +8,49 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => {
-  res.send("Stock Card API running");
+  res.send("Stock API running");
 });
 
 app.get("/stock/:ticker", async (req, res) => {
-  const ticker = req.params.ticker.toUpperCase();
+  const ticker = req.params.ticker.toLowerCase();
 
   try {
-    // Safer no-key stock source
-    const stooqUrl = `https://stooq.com/q/l/?s=${ticker.toLowerCase()}.us&f=sd2t2ohlcv&h&e=json`;
-    const stooqRes = await fetch(stooqUrl, {
-      headers: { "User-Agent": "Mozilla/5.0" }
-    });
+    const url = `https://stooq.com/q/l/?s=${ticker}.us&f=sd2t2ohlcv&e=csv`;
+    const response = await fetch(url);
+    const text = await response.text();
 
-    const stooqData = await stooqRes.json();
-    const quote = stooqData.symbols && stooqData.symbols[0];
+    const lines = text.split("\n");
+    const values = lines[1].split(",");
 
-    if (quote && quote.close && quote.close !== "N/D") {
+    const close = values[6];
+    const volume = values[7];
+
+    if (!close || close === "N/D") {
       return res.json({
-        ticker,
-        price: quote.close,
-        oneMonthChangePercent: "Live",
-        volume: quote.volume,
-        date: quote.date,
-        source: "Stooq"
+        ticker: ticker.toUpperCase(),
+        price: "N/A",
+        error: "No data"
       });
     }
 
-    return res.json({
-      ticker,
-      price: "N/A",
-      oneMonthChangePercent: "N/A",
-      error: "No stock data found",
-      source: "Stooq"
+    res.json({
+      ticker: ticker.toUpperCase(),
+      price: close,
+      oneMonthChangePercent: "Live",
+      volume: volume,
+      source: "Stooq CSV"
     });
 
   } catch (err) {
     res.json({
-      ticker,
+      ticker: ticker.toUpperCase(),
       price: "N/A",
-      oneMonthChangePercent: "N/A",
-      error: "Stock fetch failed",
+      error: "Fetch failed",
       details: err.message
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`running on ${PORT}`);
+  console.log("running on " + PORT);
 });
