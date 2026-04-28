@@ -172,7 +172,15 @@ app.get("/card/:name", async (req, res) => {
     });
   }
 });
+// 👇 ADD THIS
+app.get('/api/test', (req, res) => {
+  res.json({ status: 'backend working' });
+});
 
+// 👇 THIS SHOULD ALREADY EXIST (leave it)
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
 app.listen(PORT, () => {
   console.log("running on " + PORT);
 });
