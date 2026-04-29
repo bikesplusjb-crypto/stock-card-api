@@ -109,7 +109,7 @@ app.get("/card/:name", async (req, res) => {
         highPrice: "N/A",
         listings: 0,
         source: "eBay Browse API",
-        ebayUrl: `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&campid=YOUR-ID`,
+        ebayUrl: `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&campid=5339149252
 error: "No items found"
       });
     }
@@ -140,7 +140,7 @@ error: "No items found"
         highPrice: "N/A",
         listings: 0,
         source: "eBay Cleaned Data",
-        ebayUrl: `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&campid=YOUR-ID`,
+        ebayUrl: `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&campid=5339149252
 error: "No items found"
       });
     }
@@ -158,7 +158,7 @@ error: "No items found"
       highPrice: high.toFixed(2),
       listings: prices.length,
       source: "eBay Cleaned Data",
-      ebayUrl: `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&campid=YOUR-ID`
+      ebayUrl: `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&campid=5339149252
     });
 
   } catch (err) {
