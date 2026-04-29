@@ -109,8 +109,8 @@ app.get("/card/:name", async (req, res) => {
         highPrice: "N/A",
         listings: 0,
         source: "eBay Browse API",
-        ebayUrl: `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&campid=YOUR-ID`
-        error: "No items found"
+        ebayUrl: `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&campid=YOUR-ID`,
+error: "No items found"
       });
     }
 
@@ -140,8 +140,8 @@ app.get("/card/:name", async (req, res) => {
         highPrice: "N/A",
         listings: 0,
         source: "eBay Cleaned Data",
-        ebayUrl: `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&campid=YOUR-ID`
-        error: "No valid comps"
+        ebayUrl: `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&campid=YOUR-ID`,
+error: "No items found"
       });
     }
 
