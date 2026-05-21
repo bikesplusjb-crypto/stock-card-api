@@ -288,12 +288,6 @@ async function scanWithOpenAI(frontFile, backFile) {
 }
 
 // ── /api/dollar-bin ───────────────────────────────────────────
-// Returns 20+ sub-$5 sports/Pokemon cards across multiple categories.
-// Cached 6 hours so we don't hammer eBay's API on every page load.
-
-// Pool is pulled from eBay at most once per cache window; every request
-// returns a fresh, balanced random 24 drawn from the cached pool — so the
-// Refresh button shows different cards with NO extra eBay API calls.
 let dollarBinPool = { cats: [], fetchedAt: 0, expires: 0 };
 const DOLLAR_BIN_CACHE_HOURS = 6;
 
@@ -306,7 +300,6 @@ const DOLLAR_BIN_QUERIES = [
   { tag: "REFRACTORS",  query: "Topps Chrome refractor rookie",         emoji: "✨" },
 ];
 
-// Category-matched reasons — coherent with the card, not random.
 const REASONS_BY_CATEGORY = {
   "POKEMON": [
     "Holo rare under $5 — cheap PSA candidate",
@@ -353,7 +346,6 @@ const REASONS_FALLBACK = [
   "Underpriced for the category"
 ];
 
-// Deterministic by title, so the same card always shows the same reason.
 function pickReason(category, title) {
   const pool = REASONS_BY_CATEGORY[category] || REASONS_FALLBACK;
   const s = String(title || "");
@@ -368,17 +360,12 @@ function pickUpside(price) {
   return "LOW";
 }
 
-// Dollar Bin stays RAW-ONLY — exclude graded / slabbed listings.
-// Kept separate from isLikelyCardListing (the scanner still handles graded cards).
 function dbIsGraded(title) {
   const t = " " + String(title || "").toLowerCase() + " ";
   if (t.includes("graded") || t.includes("slab") || t.includes("encased")) return true;
   return /\b(psa|bgs|bvg|cgc|sgc|hga|gma|csg)\b/.test(t);
 }
 
-// Build a balanced, freshly-shuffled set of up to 24 from the cached pool.
-// Each category is reshuffled and round-robined, so every refresh looks
-// different while still spreading across all categories.
 function buildDollarBinResponse(cats, fetchedAt) {
   const queues = cats.map(arr => [...arr].sort(() => Math.random() - 0.5));
   const mixed = [];
@@ -452,17 +439,14 @@ async function fetchDollarBinCategory(category) {
 
 app.get("/api/dollar-bin", async (req, res) => {
   try {
-    // Pool still fresh → return a NEW random 24 from it (no extra eBay calls)
     if (dollarBinPool.cats.length && Date.now() < dollarBinPool.expires) {
       return res.json(buildDollarBinResponse(dollarBinPool.cats, dollarBinPool.fetchedAt));
     }
 
-    // Pool stale → refetch every category from eBay and rebuild the pool
     const results = await Promise.all(
       DOLLAR_BIN_QUERIES.map(cat => fetchDollarBinCategory(cat))
     );
 
-    // Keep up to 20 per category in the pool for lots of refresh variety
     const cats = results.map(items => items.slice(0, 20)).filter(arr => arr.length);
 
     if (!cats.length) {
@@ -599,21 +583,9 @@ app.post(
 );
 
 // ── /api/vs-market ─────────────────────────────────────────────
-// "Cards vs. Wall Street" communal scoreboard.
-// Forward-looking: each matchup is locked on a start date with a
-// fixed start price for the card and the stock. % change since the
-// start is what's scored. NO database — start prices live as
-// constants below (set once, in Stage 2). Current prices are fetched
-// live every request and compared to the locked anchors.
-//
-// STAGE 1 (capture): stockStart / cardStart are null below, so the
-// endpoint runs in CAPTURE mode and just reports TODAY's live prices.
-// Copy that response back and the anchors get baked in (Stage 2).
-// Once anchors are real numbers, it auto-switches to SCOREBOARD mode.
-
 const VS_MARKET_DOLLARS    = 100;
-const VS_MARKET_START_DATE = "2026-05-17"; // anchors locked this date
-const VS_MARKET_CACHE_MIN  = 15;   // cache 15 min — protects API limits, keeps it fast
+const VS_MARKET_START_DATE = "2026-05-17";
+const VS_MARKET_CACHE_MIN  = 15;
 
 const VS_MARKET_MATCHUPS = [
   {
@@ -759,10 +731,6 @@ app.get("/api/vs-market", async (req, res) => {
 });
 
 // ── WATCHLIST DAILY PRICE REFRESH ──────────────────────────────
-// Runs once a day at 4 AM ET. For every row in watchlist_items, hits
-// eBay via getEbayCardMarket() and updates current_price + last_checked_at.
-// Uses Supabase service_role key so it can update across all users.
-
 const cron = require("node-cron");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -807,7 +775,6 @@ async function refreshWatchlistPrices() {
     let updated = 0;
     let failed = 0;
 
-    // Throttle: ~1 card per second to be polite to eBay's API
     for (const item of items) {
       try {
         const market = await getEbayCardMarket(item.card_name);
@@ -828,7 +795,6 @@ async function refreshWatchlistPrices() {
           updated++;
         }
 
-        // Pause 1 second between cards
         await new Promise(resolve => setTimeout(resolve, 1000));
       } catch (e) {
         console.error(`[watchlist-refresh] error on card ${item.id}:`, e.message);
@@ -843,17 +809,25 @@ async function refreshWatchlistPrices() {
   }
 }
 
-// Schedule: every day at 4 AM Eastern Time
 cron.schedule("0 4 * * *", refreshWatchlistPrices, {
   timezone: "America/New_York"
 });
 console.log("Watchlist daily refresh scheduled for 4:00 AM ET");
 
-// Manual trigger endpoint — useful for testing without waiting 24 hours.
-// Hit https://card-scanner-backend-2frn.onrender.com/api/refresh-watchlist?key=YOUR_SECRET
+// Manual trigger endpoint — with diagnostic info to surface why the
+// secret check is failing (compares loaded env to received query param).
 app.get("/api/refresh-watchlist", async (req, res) => {
   if (!process.env.REFRESH_SECRET || req.query.key !== process.env.REFRESH_SECRET) {
-    return res.status(403).json({ success: false, error: "Forbidden" });
+    return res.status(403).json({
+      success: false,
+      error: "Forbidden",
+      debug: {
+        secretIsSet: !!process.env.REFRESH_SECRET,
+        secretLength: process.env.REFRESH_SECRET ? process.env.REFRESH_SECRET.length : 0,
+        receivedKey: req.query.key || "(none)",
+        receivedKeyLength: req.query.key ? req.query.key.length : 0
+      }
+    });
   }
   res.json({ success: true, message: "Refresh started — check server logs" });
   refreshWatchlistPrices();
