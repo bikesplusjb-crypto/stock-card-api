@@ -11,7 +11,6 @@ const fetch = require("node-fetch");
 
 const app = express();
 
-// ── CORS — allow all origins (fixes Wix iframe fetch) ──────────
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true }));
@@ -21,7 +20,6 @@ const upload = multer({
   limits: { fileSize: 15 * 1024 * 1024 }
 });
 
-// ── eBay Partner Network (EPN) Affiliate Config ────────────────
 const EPN_CAMPAIGN_ID = "5339149252";
 
 function ebayUrl(query, sold) {
@@ -48,11 +46,9 @@ function addAffiliateToUrl(url) {
   }
 }
 
-// ── State ──────────────────────────────────────────────────────
 let ebayToken = null;
 let ebayTokenExpires = 0;
 
-// ── Root & Health ──────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -82,7 +78,6 @@ app.get("/api/affiliate-test", (req, res) => {
   });
 });
 
-// ── Helpers ────────────────────────────────────────────────────
 function fileToDataUrl(file) {
   const mime = file.mimetype || "image/jpeg";
   const base64 = file.buffer.toString("base64");
@@ -287,7 +282,6 @@ async function scanWithOpenAI(frontFile, backFile) {
   }
 }
 
-// ── /api/dollar-bin ───────────────────────────────────────────
 let dollarBinPool = { cats: [], fetchedAt: 0, expires: 0 };
 const DOLLAR_BIN_CACHE_HOURS = 6;
 
@@ -471,7 +465,6 @@ app.get("/api/dollar-bin", async (req, res) => {
   }
 });
 
-// ── /api/card-market ───────────────────────────────────────────
 app.get("/api/card-market", async (req, res) => {
   try {
     const query = req.query.query || req.query.cardName;
@@ -500,7 +493,6 @@ app.get("/api/card-market", async (req, res) => {
   }
 });
 
-// ── /api/card-price ────────────────────────────────────────────
 app.get("/api/card-price", async (req, res) => {
   try {
     const cardName = req.query.cardName;
@@ -529,7 +521,6 @@ app.get("/api/card-price", async (req, res) => {
   }
 });
 
-// ── /api/scan-card ─────────────────────────────────────────────
 app.post(
   "/api/scan-card",
   upload.fields([{ name: "front", maxCount: 1 }, { name: "back", maxCount: 1 }]),
@@ -582,7 +573,6 @@ app.post(
   }
 );
 
-// ── /api/vs-market ─────────────────────────────────────────────
 const VS_MARKET_DOLLARS    = 100;
 const VS_MARKET_START_DATE = "2026-05-17";
 const VS_MARKET_CACHE_MIN  = 15;
@@ -814,20 +804,11 @@ cron.schedule("0 4 * * *", refreshWatchlistPrices, {
 });
 console.log("Watchlist daily refresh scheduled for 4:00 AM ET");
 
-// Manual trigger endpoint — with diagnostic info to surface why the
-// secret check is failing (compares loaded env to received query param).
+// HARDCODED KEY — bypass env var entirely
+// Test URL: https://card-scanner-backend-2frn.onrender.com/api/refresh-watchlist?key=cgrefresh2026
 app.get("/api/refresh-watchlist", async (req, res) => {
-  if (!process.env.REFRESH_SECRET || req.query.key !== process.env.REFRESH_SECRET) {
-    return res.status(403).json({
-      success: false,
-      error: "Forbidden",
-      debug: {
-        secretIsSet: !!process.env.REFRESH_SECRET,
-        secretLength: process.env.REFRESH_SECRET ? process.env.REFRESH_SECRET.length : 0,
-        receivedKey: req.query.key || "(none)",
-        receivedKeyLength: req.query.key ? req.query.key.length : 0
-      }
-    });
+  if (req.query.key !== "cgrefresh2026") {
+    return res.status(403).json({ success: false, error: "Forbidden" });
   }
   res.json({ success: true, message: "Refresh started — check server logs" });
   refreshWatchlistPrices();
