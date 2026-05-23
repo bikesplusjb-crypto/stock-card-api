@@ -2,6 +2,7 @@
    CARDGAUGE / TRACK THE MARKET
    AI SCANNER + EBAY CARD MARKET BACKEND
    server.js — eBay EPN Affiliate v2
+   v2026.05.23 — improved scanner prompt
 ================================ */
 
 const express = require("express");
@@ -229,6 +230,12 @@ async function getEbayCardMarket(query) {
   }
 }
 
+/* ===========================================================
+   AI CARD IDENTIFICATION — IMPROVED PROMPT v2026.05.23
+   Goal: better accuracy across categories (sports / Pokemon /
+   MTG / Lorcana / vintage). Honesty enforced — returns
+   "Unknown" instead of confidently guessing wrong.
+=========================================================== */
 async function scanWithOpenAI(frontFile, backFile) {
   if (!process.env.OPENAI_API_KEY) {
     return {
@@ -237,20 +244,67 @@ async function scanWithOpenAI(frontFile, backFile) {
       signal: "VERIFY", confidence: "Low", summary: "OpenAI API key missing."
     };
   }
-  const images = [{ type: "image_url", image_url: { url: fileToDataUrl(frontFile) } }];
-  if (backFile) images.push({ type: "image_url", image_url: { url: fileToDataUrl(backFile) } });
+
+  const images = [
+    { type: "image_url", image_url: { url: fileToDataUrl(frontFile), detail: "high" } }
+  ];
+  if (backFile) {
+    images.push({ type: "image_url", image_url: { url: fileToDataUrl(backFile), detail: "high" } });
+  }
+
+  const systemPrompt = `You are an expert trading card identifier. You analyze photos of sports cards, Pokemon cards, Magic: The Gathering cards, Disney Lorcana cards, and other collectible cards.
+
+YOUR JOB: Read the text and visual elements on the card and extract structured information. Be precise. NEVER guess.
+
+HONESTY RULE — THIS IS CRITICAL:
+If you cannot clearly read a piece of information from the card image, you MUST return "Unknown" for that field. Do NOT invent, guess, or fill in plausible-sounding values. Returning "Unknown" is correct and expected when text is unreadable, blurry, obscured, or missing. A confident wrong answer is worse than admitting you don't know.
+
+INSPECTION METHODOLOGY — examine the card in this order:
+1. Card type: Is this a sports card (baseball/basketball/football/soccer/hockey), Pokemon card, Magic card, Lorcana card, or other?
+2. Brand/manufacturer: Look at the logo, usually in a corner. Common brands:
+   - Sports: Topps, Panini, Bowman, Upper Deck, Fleer, Donruss, Score, Stadium Club, Select, Prizm, Optic, Chrome, Heritage, Allen & Ginter
+   - Pokemon: "Pokemon" + set symbol (Base Set, Jungle, Fossil, Sword & Shield, Scarlet & Violet, etc.)
+   - MTG: Wizards of the Coast / mana symbols in top right
+   - Lorcana: Disney Lorcana logo + chapter name
+3. Year: Look for copyright text (©2023, ©2024), set release year, or season notation (e.g., "2023-24"). Vintage cards often show year prominently.
+4. Player/character name: Usually printed prominently on the card front. For Pokemon, this is the Pokemon name. For Lorcana, the character name + version.
+5. Card number: Usually small text at the bottom of the card or back. Format examples: "1 of 100", "#45", "045/204", "RC-12"
+6. Set name: Often printed near the card number or in a banner (e.g., "Topps Chrome", "Prizm Premier League", "Sword & Shield: Brilliant Stars")
+7. Parallel/variant: If visible, note "refractor", "holo", "rainbow", "gold", "rookie card / RC", "alt art", etc.
+
+OUTPUT REQUIREMENTS:
+Return ONLY valid JSON. No markdown, no code fences, no preamble. Just the JSON object.
+
+Required fields:
+- cardName: Full descriptive name combining year + brand + player + parallel (or "Unknown Trading Card" if you cannot identify)
+- player: Player or character name, or "Unknown"
+- year: 4-digit year as a string (e.g., "2017", "1999"), or "Unknown"
+- set: Set name (e.g., "Prizm", "Base Set Shadowless"), or "Unknown"
+- brand: Manufacturer (e.g., "Topps", "Panini", "Pokemon"), or "Unknown"
+- cardNumber: Card number as printed, or "Unknown"
+- sport: One of "Baseball", "Basketball", "Football", "Soccer", "Hockey", "Pokemon", "Magic", "Lorcana", "Other", or "Unknown"
+- signal: One of "GRADE", "WATCH", "SELL RAW", "HOT", "VERIFY". Default to "VERIFY" for low-confidence identifications.
+- confidence: One of "High", "Medium", "Low" — based on YOUR ability to read the card clearly
+- summary: One sentence describing what you see. Be honest about uncertainty.
+
+NEVER include price estimates in any field. Pricing is handled separately.`;
+
+  const userPrompt = `Identify this trading card following the inspection methodology in your instructions. Read the text carefully. If something is unclear, return "Unknown" for that field rather than guessing. Return ONLY the JSON object.`;
+
   const payload = {
     model: "gpt-4o-mini",
     messages: [
-      { role: "system", content: "You identify sports cards, Pokemon cards, trading cards, slabs, sealed wax, and collectibles from images. Return ONLY valid JSON. Do not guess exact market value." },
+      { role: "system", content: systemPrompt },
       { role: "user", content: [
-        { type: "text", text: "Identify this card. Return JSON only with: cardName, player, year, set, brand, cardNumber, sport, signal, confidence, summary. Signal must be one of GRADE, WATCH, SELL RAW, HOT, VERIFY. Do not include price estimates." },
+        { type: "text", text: userPrompt },
         ...images
       ]}
     ],
     temperature: 0.1,
-    max_tokens: 700
+    max_tokens: 900,
+    response_format: { type: "json_object" }
   };
+
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -259,6 +313,7 @@ async function scanWithOpenAI(frontFile, backFile) {
     },
     body: JSON.stringify(payload)
   });
+
   const rawText = await response.text();
   if (!response.ok) {
     console.error("OpenAI error:", rawText);
@@ -268,6 +323,7 @@ async function scanWithOpenAI(frontFile, backFile) {
       signal: "VERIFY", confidence: "Low", summary: "AI could not identify this card."
     };
   }
+
   const apiData = JSON.parse(rawText);
   const content = apiData?.choices?.[0]?.message?.content || "";
   try {
@@ -805,7 +861,7 @@ cron.schedule("0 4 * * *", refreshWatchlistPrices, {
 console.log("Watchlist daily refresh scheduled for 4:00 AM ET");
 
 // HARDCODED KEY — bypass env var entirely
-// Test URL: https://card-scanner-backend-2frn.onrender.com/api/refresh-watchlist?key=cgrefresh2026
+// Test URL: https://stock-card-api.onrender.com/api/refresh-watchlist?key=cgrefresh2026
 app.get("/api/refresh-watchlist", async (req, res) => {
   if (req.query.key !== "cgrefresh2026") {
     return res.status(403).json({ success: false, error: "Forbidden" });
