@@ -2,7 +2,7 @@
    CARDGAUGE / TRACK THE MARKET
    AI SCANNER + EBAY CARD MARKET BACKEND
    server.js — eBay EPN Affiliate v2
-   v2026.05.30 — expanded vs-market to 15 matchups
+   v2026.05.30 — 15 matchups, all anchors locked
 ================================ */
 
 const express = require("express");
@@ -230,12 +230,6 @@ async function getEbayCardMarket(query) {
   }
 }
 
-/* ===========================================================
-   AI CARD IDENTIFICATION — IMPROVED PROMPT v2026.05.23
-   Goal: better accuracy across categories (sports / Pokemon /
-   MTG / Lorcana / vintage). Honesty enforced — returns
-   "Unknown" instead of confidently guessing wrong.
-=========================================================== */
 async function scanWithOpenAI(frontFile, backFile) {
   if (!process.env.OPENAI_API_KEY) {
     return {
@@ -633,13 +627,11 @@ const VS_MARKET_DOLLARS    = 100;
 const VS_MARKET_START_DATE = "2026-05-17";
 const VS_MARKET_CACHE_MIN  = 15;
 
-// ── VS MARKET MATCHUPS ──────────────────────────────────────
-// First 5 entries: original anchored matchups (start prices locked)
-// Last 10 entries: new — stockStart/cardStart at 0 so the endpoint
-//   runs in CAPTURE mode and returns live prices to lock in.
-// Once captured, paste numbers back here and redeploy.
+// ── VS MARKET MATCHUPS — ALL 15 ANCHORED ──────────────────────
+// Original 5: anchored May 17, 2026 (preserved — DO NOT change)
+// New 10: anchored May 30, 2026 — captured live from /api/vs-market
 const VS_MARKET_MATCHUPS = [
-  // ── ORIGINAL 5 (already anchored, do not touch) ────────
+  // ── ORIGINAL 5 — ANCHORED MAY 17 (LOCKED, 13 days of history) ────────
   {
     id: "aapl-ohtani",
     stockSymbol: "AAPL", stockLabel: "Apple",
@@ -676,76 +668,76 @@ const VS_MARKET_MATCHUPS = [
     stockStart: 739.17, cardStart: 447
   },
 
-  // ── NEW 10 (need anchor prices captured via CAPTURE mode) ────────
+  // ── NEW 10 — ANCHORED MAY 30, 2026 (captured today) ────────
   {
     id: "tsla-wembanyama",
     stockSymbol: "TSLA", stockLabel: "Tesla",
     cardLabel: "2023-24 Panini Prizm Victor Wembanyama RC",
     cardQuery: "2023-24 Panini Prizm Victor Wembanyama rookie RC 136",
-    stockStart: 0, cardStart: 0
+    stockStart: 435.79, cardStart: 401
   },
   {
     id: "amzn-trout",
     stockSymbol: "AMZN", stockLabel: "Amazon",
     cardLabel: "2011 Topps Update Mike Trout RC",
     cardQuery: "2011 Topps Update Mike Trout rookie RC US175",
-    stockStart: 0, cardStart: 0
+    stockStart: 270.64, cardStart: 771
   },
   {
     id: "msft-jordan",
     stockSymbol: "MSFT", stockLabel: "Microsoft",
     cardLabel: "1986 Fleer Michael Jordan RC",
     cardQuery: "1986 Fleer Michael Jordan rookie RC 57",
-    stockStart: 0, cardStart: 0
+    stockStart: 450.24, cardStart: 10699
   },
   {
     id: "googl-trae",
     stockSymbol: "GOOGL", stockLabel: "Google",
     cardLabel: "2018-19 Panini Prizm Trae Young RC",
     cardQuery: "2018-19 Panini Prizm Trae Young rookie RC 78",
-    stockStart: 0, cardStart: 0
+    stockStart: 380.34, cardStart: 63
   },
   {
     id: "meta-lebron",
     stockSymbol: "META", stockLabel: "Meta",
     cardLabel: "2003-04 Topps Chrome LeBron James RC",
     cardQuery: "2003-04 Topps Chrome LeBron James rookie RC 111",
-    stockStart: 0, cardStart: 0
+    stockStart: 632.51, cardStart: 6781
   },
   {
     id: "nflx-moonbreon",
     stockSymbol: "NFLX", stockLabel: "Netflix",
     cardLabel: "Pokemon Umbreon VMAX Alt Art (Moonbreon)",
     cardQuery: "Pokemon Umbreon VMAX Evolving Skies 215 alt art",
-    stockStart: 0, cardStart: 0
+    stockStart: 86.02, cardStart: 2544
   },
   {
     id: "cost-burrow",
     stockSymbol: "COST", stockLabel: "Costco",
     cardLabel: "2020 Panini Prizm Joe Burrow RC",
     cardQuery: "2020 Panini Prizm Joe Burrow rookie RC 307",
-    stockStart: 0, cardStart: 0
+    stockStart: 956.32, cardStart: 173
   },
   {
     id: "wmt-messi",
     stockSymbol: "WMT", stockLabel: "Walmart",
     cardLabel: "2004 Panini Megacracks Lionel Messi RC",
     cardQuery: "2004 Panini Megacracks Lionel Messi rookie 71",
-    stockStart: 0, cardStart: 0
+    stockStart: 115.75, cardStart: 22044
   },
   {
     id: "amd-bonds",
     stockSymbol: "AMD", stockLabel: "AMD",
     cardLabel: "1987 Topps Barry Bonds RC",
     cardQuery: "1987 Topps Barry Bonds rookie RC 320",
-    stockStart: 0, cardStart: 0
+    stockStart: 516.10, cardStart: 76
   },
   {
     id: "v-jeter",
     stockSymbol: "V", stockLabel: "Visa",
     cardLabel: "1993 SP Derek Jeter Foil RC",
     cardQuery: "1993 SP Derek Jeter Foil rookie RC 279",
-    stockStart: 0, cardStart: 0
+    stockStart: 326.36, cardStart: 529
   }
 ];
 
