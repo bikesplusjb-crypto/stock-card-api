@@ -743,7 +743,9 @@ const VS_MARKET_MATCHUPS = [
 
 let vsMarketCache = { data: null, expires: 0 };
 
-async function getStockQuote(symbol) {
+async function getStockQuote(symbol, attempt) {
+  attempt = attempt || 1;
+  const MAX_ATTEMPTS = 3;
   try {
     const key = process.env.FINNHUB_API_KEY;
     if (!key) return { symbol, price: 0, ok: false, note: "Missing FINNHUB_API_KEY in Render" };
@@ -752,11 +754,32 @@ async function getStockQuote(symbol) {
     );
     const d = await r.json();
     const price = safeNumber(d && d.c, 0);
-    if (!price) return { symbol, price: 0, ok: false, note: "No price (check symbol / key / rate limit)" };
-    return { symbol, price, ok: true, note: "" };
+    if (!price && attempt < MAX_ATTEMPTS) {
+      // Exponential backoff: 400ms, 800ms, 1600ms
+      await new Promise(res => setTimeout(res, 400 * attempt));
+      return getStockQuote(symbol, attempt + 1);
+    }
+    if (!price) return { symbol, price: 0, ok: false, note: `No price after ${MAX_ATTEMPTS} attempts` };
+    return { symbol, price, ok: true, note: attempt > 1 ? `OK on attempt ${attempt}` : "" };
   } catch (e) {
+    if (attempt < MAX_ATTEMPTS) {
+      await new Promise(res => setTimeout(res, 400 * attempt));
+      return getStockQuote(symbol, attempt + 1);
+    }
     return { symbol, price: 0, ok: false, note: e.message };
   }
+}
+
+// Wrapper: retry getEbayCardMarket if it returns 0 listings/price
+async function getEbayCardMarketWithRetry(query, attempt) {
+  attempt = attempt || 1;
+  const MAX_ATTEMPTS = 3;
+  const result = await getEbayCardMarket(query);
+  if ((!result.avgPrice || !result.listingCount) && attempt < MAX_ATTEMPTS) {
+    await new Promise(res => setTimeout(res, 500 * attempt));
+    return getEbayCardMarketWithRetry(query, attempt + 1);
+  }
+  return result;
 }
 
 app.get("/api/vs-market", async (req, res) => {
@@ -766,10 +789,14 @@ app.get("/api/vs-market", async (req, res) => {
     }
 
     const rows = await Promise.all(
-      VS_MARKET_MATCHUPS.map(async (m) => {
+      VS_MARKET_MATCHUPS.map(async (m, idx) => {
+        // Stagger by 120ms per matchup to spread burst load on Finnhub/eBay
+        // (15 * 120ms = ~1.8s spread instead of all 15 firing at t=0)
+        await new Promise(res => setTimeout(res, idx * 120));
+
         const [stockQ, cardM] = await Promise.all([
           getStockQuote(m.stockSymbol),
-          getEbayCardMarket(m.cardQuery)
+          getEbayCardMarketWithRetry(m.cardQuery)
         ]);
         const stockNow = stockQ.price;
         const cardNow  = safeNumber(cardM.avgPrice, 0);
@@ -838,7 +865,16 @@ app.get("/api/vs-market", async (req, res) => {
       };
     }
 
-    vsMarketCache = { data: payload, expires: Date.now() + VS_MARKET_CACHE_MIN * 60 * 1000 };
+    // Only cache if EVERY matchup has real data — never cache failures.
+    // If any matchup has stockNow=0 or cardNow=0, the next request will
+    // retry instead of serving a stuck-at-zero result.
+    const allClean = rows.every(r => r.stock.priceNow > 0 && r.card.priceNow > 0);
+    if (allClean) {
+      vsMarketCache = { data: payload, expires: Date.now() + VS_MARKET_CACHE_MIN * 60 * 1000 };
+    } else {
+      const failed = rows.filter(r => !r.stock.priceNow || !r.card.priceNow).map(r => r.id);
+      console.log(`[vs-market] not caching — ${failed.length} failed: ${failed.join(", ")}`);
+    }
     res.json(payload);
   } catch (error) {
     console.error("vs-market error:", error);
