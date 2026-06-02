@@ -2,7 +2,7 @@
    CARDGAUGE / TRACK THE MARKET
    AI SCANNER + EBAY CARD MARKET BACKEND
    server.js — eBay EPN Affiliate v2
-   v2026.06.02 — 15 matchups + hot/cold auto-refresh
+   v2026.06.02 — 15 matchups + hot/cold + pokemon auto-refresh
 ================================ */
 
 const express = require("express");
@@ -628,10 +628,7 @@ const VS_MARKET_START_DATE = "2026-05-17";
 const VS_MARKET_CACHE_MIN  = 15;
 
 // ── VS MARKET MATCHUPS — ALL 15 ANCHORED ──────────────────────
-// Original 5: anchored May 17, 2026 (preserved — DO NOT change)
-// New 10: anchored May 30, 2026 — captured live from /api/vs-market
 const VS_MARKET_MATCHUPS = [
-  // ── ORIGINAL 5 — ANCHORED MAY 17 (LOCKED, 13 days of history) ────────
   {
     id: "aapl-ohtani",
     stockSymbol: "AAPL", stockLabel: "Apple",
@@ -667,8 +664,6 @@ const VS_MARKET_MATCHUPS = [
     cardQuery: "1989 Upper Deck Ken Griffey Jr rookie RC 1",
     stockStart: 739.17, cardStart: 447
   },
-
-  // ── NEW 10 — ANCHORED MAY 30, 2026 (captured today) ────────
   {
     id: "tsla-wembanyama",
     stockSymbol: "TSLA", stockLabel: "Tesla",
@@ -755,7 +750,6 @@ async function getStockQuote(symbol, attempt) {
     const d = await r.json();
     const price = safeNumber(d && d.c, 0);
     if (!price && attempt < MAX_ATTEMPTS) {
-      // Exponential backoff: 400ms, 800ms, 1600ms
       await new Promise(res => setTimeout(res, 400 * attempt));
       return getStockQuote(symbol, attempt + 1);
     }
@@ -770,7 +764,6 @@ async function getStockQuote(symbol, attempt) {
   }
 }
 
-// Wrapper: retry getEbayCardMarket if it returns 0 listings/price
 async function getEbayCardMarketWithRetry(query, attempt) {
   attempt = attempt || 1;
   const MAX_ATTEMPTS = 3;
@@ -790,8 +783,6 @@ app.get("/api/vs-market", async (req, res) => {
 
     const rows = await Promise.all(
       VS_MARKET_MATCHUPS.map(async (m, idx) => {
-        // Stagger by 120ms per matchup to spread burst load on Finnhub/eBay
-        // (15 * 120ms = ~1.8s spread instead of all 15 firing at t=0)
         await new Promise(res => setTimeout(res, idx * 120));
 
         const [stockQ, cardM] = await Promise.all([
@@ -865,9 +856,6 @@ app.get("/api/vs-market", async (req, res) => {
       };
     }
 
-    // Only cache if EVERY matchup has real data — never cache failures.
-    // If any matchup has stockNow=0 or cardNow=0, the next request will
-    // retry instead of serving a stuck-at-zero result.
     const allClean = rows.every(r => r.stock.priceNow > 0 && r.card.priceNow > 0);
     if (allClean) {
       vsMarketCache = { data: payload, expires: Date.now() + VS_MARKET_CACHE_MIN * 60 * 1000 };
@@ -882,7 +870,12 @@ app.get("/api/vs-market", async (req, res) => {
   }
 });
 
-// ── WATCHLIST DAILY PRICE REFRESH ──────────────────────────────
+// ===========================================================
+// SUPABASE ADMIN CLIENT + DAILY REFRESH JOBS
+// 3 cron jobs: watchlist (4 AM), hot/cold (5 AM), pokemon (6 AM)
+// Spread 1 hour apart to avoid eBay API burst load.
+// ===========================================================
+
 const cron = require("node-cron");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -893,11 +886,12 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
     process.env.SUPABASE_SERVICE_ROLE_KEY,
     { auth: { persistSession: false } }
   );
-  console.log("Supabase admin client ready for watchlist refresh");
+  console.log("Supabase admin client ready for daily refresh jobs");
 } else {
-  console.log("Supabase env vars missing — watchlist refresh disabled");
+  console.log("Supabase env vars missing — refresh jobs disabled");
 }
 
+// ── WATCHLIST DAILY PRICE REFRESH (4:00 AM ET) ─────────────
 async function refreshWatchlistPrices() {
   if (!supabaseAdmin) {
     console.log("[watchlist-refresh] skipped — no Supabase client");
@@ -966,8 +960,6 @@ cron.schedule("0 4 * * *", refreshWatchlistPrices, {
 });
 console.log("Watchlist daily refresh scheduled for 4:00 AM ET");
 
-// HARDCODED KEY — bypass env var entirely
-// Test URL: https://stock-card-api.onrender.com/api/refresh-watchlist?key=cgrefresh2026
 app.get("/api/refresh-watchlist", async (req, res) => {
   if (req.query.key !== "cgrefresh2026") {
     return res.status(403).json({ success: false, error: "Forbidden" });
@@ -976,12 +968,7 @@ app.get("/api/refresh-watchlist", async (req, res) => {
   refreshWatchlistPrices();
 });
 
-// ===========================================================
-// ── HOT/COLD CARDS DAILY PRICE REFRESH ─────────────────────
-// Mirrors the watchlist refresh pattern above.
-// Runs daily at 5:00 AM ET (1 hour after watchlist to spread load).
-// ===========================================================
-
+// ── HOT/COLD CARDS DAILY PRICE REFRESH (5:00 AM ET) ────────
 async function refreshHotColdPrices() {
   if (!supabaseAdmin) {
     console.log("[hotcold-refresh] skipped — no Supabase client");
@@ -1018,7 +1005,6 @@ async function refreshHotColdPrices() {
         const market = await getEbayCardMarket(card.card_name);
         const newPrice = safeNumber(market.avgPrice, 0);
 
-        // Skip cards where eBay returns no valid price (preserve existing data)
         if (newPrice <= 0) {
           console.log(`[hotcold-refresh] skipping ${card.id} (${card.card_name}) — no eBay price`);
           skipped++;
@@ -1026,7 +1012,6 @@ async function refreshHotColdPrices() {
           continue;
         }
 
-        // Rotate: today's current becomes yesterday's prev, eBay price becomes new current
         const oldPrice = safeNumber(card.current_price, 0);
         let pctChange = 0;
         if (oldPrice > 0) {
@@ -1050,7 +1035,6 @@ async function refreshHotColdPrices() {
           updated++;
         }
 
-        // 1 second between cards (prevent eBay rate limits — same as watchlist)
         await new Promise(r => setTimeout(r, 1000));
       } catch (e) {
         console.error(`[hotcold-refresh] error on card ${card.id}:`, e.message);
@@ -1065,20 +1049,113 @@ async function refreshHotColdPrices() {
   }
 }
 
-// Schedule daily at 5:00 AM ET (1 hour after watchlist to spread load)
 cron.schedule("0 5 * * *", refreshHotColdPrices, {
   timezone: "America/New_York"
 });
 console.log("Hot/Cold daily refresh scheduled for 5:00 AM ET");
 
-// Manual trigger endpoint — fire from your phone any time
-// Test URL: https://stock-card-api.onrender.com/api/refresh-hotcold?key=cgrefresh2026
 app.get("/api/refresh-hotcold", async (req, res) => {
   if (req.query.key !== "cgrefresh2026") {
     return res.status(403).json({ success: false, error: "Forbidden" });
   }
   res.json({ success: true, message: "Hot/Cold refresh started — check server logs" });
   refreshHotColdPrices();
+});
+
+// ── POKEMON ZONE DAILY PRICE REFRESH (6:00 AM ET) ──────────
+async function refreshPokemonPrices() {
+  if (!supabaseAdmin) {
+    console.log("[pokemon-refresh] skipped — no Supabase client");
+    return;
+  }
+
+  const startTime = Date.now();
+  console.log("[pokemon-refresh] starting…");
+
+  try {
+    const { data: cards, error } = await supabaseAdmin
+      .from("pokemon_cards")
+      .select("id, card_name, current_price")
+      .eq("is_active", true);
+
+    if (error) {
+      console.error("[pokemon-refresh] fetch error:", error.message);
+      return;
+    }
+
+    if (!cards || !cards.length) {
+      console.log("[pokemon-refresh] no cards to refresh");
+      return;
+    }
+
+    console.log(`[pokemon-refresh] refreshing ${cards.length} cards…`);
+
+    let updated = 0;
+    let failed = 0;
+    let skipped = 0;
+
+    for (const card of cards) {
+      try {
+        const market = await getEbayCardMarket(card.card_name);
+        const newPrice = safeNumber(market.avgPrice, 0);
+
+        // Skip cards with no eBay price (preserve existing data)
+        if (newPrice <= 0) {
+          console.log(`[pokemon-refresh] skipping ${card.id} (${card.card_name}) — no eBay price`);
+          skipped++;
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
+
+        // Rotate prev/current and compute pct_change
+        const oldPrice = safeNumber(card.current_price, 0);
+        let pctChange = 0;
+        if (oldPrice > 0) {
+          pctChange = +(((newPrice - oldPrice) / oldPrice) * 100).toFixed(2);
+        }
+
+        const { error: updateError } = await supabaseAdmin
+          .from("pokemon_cards")
+          .update({
+            prev_price: oldPrice,
+            current_price: newPrice,
+            pct_change: pctChange,
+            updated_at: new Date().toISOString()
+          })
+          .eq("id", card.id);
+
+        if (updateError) {
+          console.error(`[pokemon-refresh] update failed for ${card.id}:`, updateError.message);
+          failed++;
+        } else {
+          updated++;
+        }
+
+        await new Promise(r => setTimeout(r, 1000));
+      } catch (e) {
+        console.error(`[pokemon-refresh] error on card ${card.id}:`, e.message);
+        failed++;
+      }
+    }
+
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    console.log(`[pokemon-refresh] done. updated=${updated} skipped=${skipped} failed=${failed} elapsed=${elapsed}s`);
+  } catch (e) {
+    console.error("[pokemon-refresh] fatal error:", e.message);
+  }
+}
+
+cron.schedule("0 6 * * *", refreshPokemonPrices, {
+  timezone: "America/New_York"
+});
+console.log("Pokemon daily refresh scheduled for 6:00 AM ET");
+
+app.get("/api/refresh-pokemon", async (req, res) => {
+  if (req.query.key !== "cgrefresh2026") {
+    return res.status(403).json({ success: false, error: "Forbidden" });
+  }
+  res.json({ success: true, message: "Pokemon refresh started — check server logs" });
+  refreshPokemonPrices();
 });
 
 app.use((req, res) => {
