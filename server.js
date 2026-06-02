@@ -2,7 +2,7 @@
    CARDGAUGE / TRACK THE MARKET
    AI SCANNER + EBAY CARD MARKET BACKEND
    server.js — eBay EPN Affiliate v2
-   v2026.05.30 — 15 matchups, all anchors locked
+   v2026.06.02 — 15 matchups + hot/cold auto-refresh
 ================================ */
 
 const express = require("express");
@@ -974,6 +974,111 @@ app.get("/api/refresh-watchlist", async (req, res) => {
   }
   res.json({ success: true, message: "Refresh started — check server logs" });
   refreshWatchlistPrices();
+});
+
+// ===========================================================
+// ── HOT/COLD CARDS DAILY PRICE REFRESH ─────────────────────
+// Mirrors the watchlist refresh pattern above.
+// Runs daily at 5:00 AM ET (1 hour after watchlist to spread load).
+// ===========================================================
+
+async function refreshHotColdPrices() {
+  if (!supabaseAdmin) {
+    console.log("[hotcold-refresh] skipped — no Supabase client");
+    return;
+  }
+
+  const startTime = Date.now();
+  console.log("[hotcold-refresh] starting…");
+
+  try {
+    const { data: cards, error } = await supabaseAdmin
+      .from("hot_cold_cards")
+      .select("id, card_name, current_price")
+      .eq("is_active", true);
+
+    if (error) {
+      console.error("[hotcold-refresh] fetch error:", error.message);
+      return;
+    }
+
+    if (!cards || !cards.length) {
+      console.log("[hotcold-refresh] no cards to refresh");
+      return;
+    }
+
+    console.log(`[hotcold-refresh] refreshing ${cards.length} cards…`);
+
+    let updated = 0;
+    let failed = 0;
+    let skipped = 0;
+
+    for (const card of cards) {
+      try {
+        const market = await getEbayCardMarket(card.card_name);
+        const newPrice = safeNumber(market.avgPrice, 0);
+
+        // Skip cards where eBay returns no valid price (preserve existing data)
+        if (newPrice <= 0) {
+          console.log(`[hotcold-refresh] skipping ${card.id} (${card.card_name}) — no eBay price`);
+          skipped++;
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
+
+        // Rotate: today's current becomes yesterday's prev, eBay price becomes new current
+        const oldPrice = safeNumber(card.current_price, 0);
+        let pctChange = 0;
+        if (oldPrice > 0) {
+          pctChange = +(((newPrice - oldPrice) / oldPrice) * 100).toFixed(2);
+        }
+
+        const { error: updateError } = await supabaseAdmin
+          .from("hot_cold_cards")
+          .update({
+            prev_price: oldPrice,
+            current_price: newPrice,
+            pct_change: pctChange,
+            updated_at: new Date().toISOString()
+          })
+          .eq("id", card.id);
+
+        if (updateError) {
+          console.error(`[hotcold-refresh] update failed for ${card.id}:`, updateError.message);
+          failed++;
+        } else {
+          updated++;
+        }
+
+        // 1 second between cards (prevent eBay rate limits — same as watchlist)
+        await new Promise(r => setTimeout(r, 1000));
+      } catch (e) {
+        console.error(`[hotcold-refresh] error on card ${card.id}:`, e.message);
+        failed++;
+      }
+    }
+
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    console.log(`[hotcold-refresh] done. updated=${updated} skipped=${skipped} failed=${failed} elapsed=${elapsed}s`);
+  } catch (e) {
+    console.error("[hotcold-refresh] fatal error:", e.message);
+  }
+}
+
+// Schedule daily at 5:00 AM ET (1 hour after watchlist to spread load)
+cron.schedule("0 5 * * *", refreshHotColdPrices, {
+  timezone: "America/New_York"
+});
+console.log("Hot/Cold daily refresh scheduled for 5:00 AM ET");
+
+// Manual trigger endpoint — fire from your phone any time
+// Test URL: https://stock-card-api.onrender.com/api/refresh-hotcold?key=cgrefresh2026
+app.get("/api/refresh-hotcold", async (req, res) => {
+  if (req.query.key !== "cgrefresh2026") {
+    return res.status(403).json({ success: false, error: "Forbidden" });
+  }
+  res.json({ success: true, message: "Hot/Cold refresh started — check server logs" });
+  refreshHotColdPrices();
 });
 
 app.use((req, res) => {
