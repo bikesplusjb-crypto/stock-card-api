@@ -891,6 +891,13 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
   console.log("Supabase env vars missing — refresh jobs disabled");
 }
 
+// Verify REFRESH_SECRET is set for manual refresh endpoints
+if (process.env.REFRESH_SECRET) {
+  console.log("REFRESH_SECRET loaded — manual refresh endpoints active");
+} else {
+  console.log("⚠️  REFRESH_SECRET missing — manual refresh endpoints will reject ALL requests");
+}
+
 // ── WATCHLIST DAILY PRICE REFRESH (4:00 AM ET) ─────────────
 async function refreshWatchlistPrices() {
   if (!supabaseAdmin) {
@@ -961,7 +968,7 @@ cron.schedule("0 4 * * *", refreshWatchlistPrices, {
 console.log("Watchlist daily refresh scheduled for 4:00 AM ET");
 
 app.get("/api/refresh-watchlist", async (req, res) => {
-  if (req.query.key !== "cgrefresh2026") {
+  if (!process.env.REFRESH_SECRET || req.query.key !== process.env.REFRESH_SECRET) {
     return res.status(403).json({ success: false, error: "Forbidden" });
   }
   res.json({ success: true, message: "Refresh started — check server logs" });
@@ -1055,7 +1062,7 @@ cron.schedule("0 5 * * *", refreshHotColdPrices, {
 console.log("Hot/Cold daily refresh scheduled for 5:00 AM ET");
 
 app.get("/api/refresh-hotcold", async (req, res) => {
-  if (req.query.key !== "cgrefresh2026") {
+  if (!process.env.REFRESH_SECRET || req.query.key !== process.env.REFRESH_SECRET) {
     return res.status(403).json({ success: false, error: "Forbidden" });
   }
   res.json({ success: true, message: "Hot/Cold refresh started — check server logs" });
@@ -1151,7 +1158,7 @@ cron.schedule("0 6 * * *", refreshPokemonPrices, {
 console.log("Pokemon daily refresh scheduled for 6:00 AM ET");
 
 app.get("/api/refresh-pokemon", async (req, res) => {
-  if (req.query.key !== "cgrefresh2026") {
+  if (!process.env.REFRESH_SECRET || req.query.key !== process.env.REFRESH_SECRET) {
     return res.status(403).json({ success: false, error: "Forbidden" });
   }
   res.json({ success: true, message: "Pokemon refresh started — check server logs" });
