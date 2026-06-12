@@ -3,6 +3,7 @@
    AI SCANNER + EBAY CARD MARKET BACKEND
    server.js — eBay EPN Affiliate v2
    v2026.06.02 — 15 matchups + hot/cold + pokemon auto-refresh
+   v2026.06.12 — hot/cold refresh now auto-updates direction from price movement
 ================================ */
 
 const express = require("express");
@@ -1025,12 +1026,17 @@ async function refreshHotColdPrices() {
           pctChange = +(((newPrice - oldPrice) / oldPrice) * 100).toFixed(2);
         }
 
+        // Auto-correct direction from price movement so the Hot/Cold
+        // filters stay accurate as prices change. Up (or flat) = hot, down = cold.
+        const newDirection = pctChange >= 0 ? "hot" : "cold";
+
         const { error: updateError } = await supabaseAdmin
           .from("hot_cold_cards")
           .update({
             prev_price: oldPrice,
             current_price: newPrice,
             pct_change: pctChange,
+            direction: newDirection,
             updated_at: new Date().toISOString()
           })
           .eq("id", card.id);
