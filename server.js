@@ -1251,7 +1251,167 @@ app.get("/api/card-history", async (req, res) => {
     res.status(500).json({ success: false, error: "History lookup failed", details: e.message });
   }
 });
+// ===========================================================
+// CARDGAUGE — AI GRADE PRE-SCREEN endpoint (OpenAI vision)
+// Reuses your existing `upload`, `fileToDataUrl`, `cleanJsonText`,
+// `safeNumber`, and `supabaseAdmin`. No new deps, no new key.
+//
+// PASTE THIS BLOCK **ABOVE** your 404 catch-all:
+//     app.use((req, res) => { res.status(404)... });
+// If you paste it below that line, it will 404.
+//
+// Endpoint:  POST /api/grade-estimate
+// Expects multipart/form-data:
+//   - front      (image file, required)
+//   - back       (image file, optional but recommended)
+//   - condition  (JSON string {surface,corners,edges,creases}, optional)
+//   - notes      (text, optional)
+// ===========================================================
 
+function buildGradePrompt(userCondition, userNotes) {
+  return `You are a trading card PRE-SCREEN assistant. You are given photos of the FRONT and BACK of a single trading card, plus notes from the owner about what they see in hand.
+
+Your job: give a ROUGH, HONEST grade RANGE (1-10 scale, like PSA) to help the owner decide whether the card is worth submitting for professional grading. You are NOT a professional grader and must never pretend to be. A photo cannot reveal fine surface scratches, print lines, or subtle flaws that a grader sees under raking light and magnification.
+
+Assess these four factors from the images:
+- CENTERING: estimate the border ratios left/right and top/bottom. This is the factor you can judge best from a photo. Be specific.
+- CORNERS: look for softening, rounding, or dings at each corner.
+- EDGES: look for whitening or chipping along the edges.
+- SURFACE: note anything visible, but be explicit that you CANNOT confirm fine surface condition from a photo.
+
+The owner reported this condition (they are holding the card, so trust their input for surface/corners/edges/creases and factor it in — it can only LOWER your estimate, never raise it):
+${JSON.stringify(userCondition || {}, null, 2)}
+Owner's free-text notes: "${userNotes || "none"}"
+
+Return ONLY valid JSON. No markdown, no code fences, no preamble. Exactly this shape:
+{
+  "gradeLow": <integer 1-10>,
+  "gradeHigh": <integer 1-10>,
+  "confidence": "Lower" | "Moderate" | "Higher",
+  "subgrades": {
+    "centering": <integer 0-100>,
+    "corners": <integer 0-100>,
+    "edges": <integer 0-100>,
+    "surface": <integer 0-100>
+  },
+  "findings": [
+    "<short plain-English observation>"
+  ],
+  "surfaceCaveat": "<one sentence reminding that surface can't be fully confirmed from a photo>"
+}
+
+Rules:
+- gradeLow and gradeHigh give a RANGE, never a single confident grade.
+- Lower your confidence if surface is unknown or the owner reported creases.
+- Keep findings to 3-6 short items.
+- Output must be valid JSON and nothing else.`;
+}
+
+async function gradeEstimateWithOpenAI(frontFile, backFile, condition, notes) {
+  if (!process.env.OPENAI_API_KEY) {
+    return { error: "OpenAI API key missing." };
+  }
+
+  const images = [
+    { type: "image_url", image_url: { url: fileToDataUrl(frontFile), detail: "high" } }
+  ];
+  if (backFile) {
+    images.push({ type: "image_url", image_url: { url: fileToDataUrl(backFile), detail: "high" } });
+  }
+
+  const payload = {
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: buildGradePrompt(condition, notes) },
+      { role: "user", content: [
+        { type: "text", text: "Front image first, then back image if present. Return ONLY the JSON object." },
+        ...images
+      ]}
+    ],
+    temperature: 0.2,
+    max_tokens: 900,
+    response_format: { type: "json_object" }
+  };
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const rawText = await response.text();
+  if (!response.ok) {
+    console.error("grade-estimate OpenAI error:", rawText);
+    return { error: "AI could not analyze this card." };
+  }
+
+  const apiData = JSON.parse(rawText);
+  const content = apiData?.choices?.[0]?.message?.content || "";
+  try {
+    return JSON.parse(cleanJsonText(content));
+  } catch (e) {
+    console.log("grade-estimate parse error:", content);
+    return { error: "AI result could not be parsed." };
+  }
+}
+
+// (optional) Phase 2 dataset logging — reuses your existing supabaseAdmin.
+// Create a table `grade_estimates` with columns to match, then this
+// silently banks every estimate. Never throws into the request.
+async function logGradeEstimate(result, condition, notes) {
+  if (!supabaseAdmin || !result || result.error) return;
+  try {
+    await supabaseAdmin.from("grade_estimates").insert({
+      grade_low: result.gradeLow ?? null,
+      grade_high: result.gradeHigh ?? null,
+      confidence: result.confidence ?? null,
+      subgrades: result.subgrades ?? null,
+      findings: result.findings ?? null,
+      owner_condition: condition ?? null,
+      owner_notes: notes ?? null,
+      created_at: new Date().toISOString()
+    });
+  } catch (e) {
+    console.error("[grade-estimate] log failed:", e.message);
+  }
+}
+
+app.post(
+  "/api/grade-estimate",
+  upload.fields([{ name: "front", maxCount: 1 }, { name: "back", maxCount: 1 }]),
+  async (req, res) => {
+    try {
+      const front = req.files?.front?.[0] || null;
+      const back  = req.files?.back?.[0]  || null;
+
+      if (!front) {
+        return res.status(400).json({ success: false, error: "Front image required" });
+      }
+
+      let condition = {};
+      try { condition = req.body.condition ? JSON.parse(req.body.condition) : {}; }
+      catch (e) { condition = {}; }
+      const notes = req.body.notes || "";
+
+      const result = await gradeEstimateWithOpenAI(front, back, condition, notes);
+
+      if (result.error) {
+        return res.status(502).json({ success: false, error: result.error });
+      }
+
+      // Phase 2: bank the estimate (no-op if table/env not set up)
+      logGradeEstimate(result, condition, notes);
+
+      return res.json({ success: true, ...result, timestamp: Date.now() });
+    } catch (error) {
+      console.error("grade-estimate server error:", error);
+      return res.status(500).json({ success: false, error: "Grade estimate failed", details: error.message });
+    }
+  }
+);
 app.use((req, res) => {
   res.status(404).json({ success: false, error: "Endpoint not found" });
 });
