@@ -2,6 +2,7 @@
    CARDGAUGE / TRACK THE MARKET
    AI SCANNER + EBAY CARD MARKET BACKEND
    server.js — eBay EPN Affiliate v2
+   + median pricing + graded/raw split
 ================================ */
 
 const express = require("express");
@@ -107,8 +108,6 @@ function average(nums) {
 }
 
 // Median — resistant to junk lots and mispriced whales.
-// Active listings skew high (unsold inventory sits at fantasy prices),
-// so the mean badly overstates true market value.
 function median(sortedNums) {
   if (!sortedNums.length) return 0;
   const n = sortedNums.length;
@@ -117,8 +116,7 @@ function median(sortedNums) {
   return Math.round(m);
 }
 
-// Trimmed range — drops the extreme ~10% on each end so one mislisted
-// item doesn't define LOW/HIGH. Skips trimming on small samples.
+// Trimmed range — drops the extreme ~10% on each end.
 function trimmedRange(sortedNums) {
   if (!sortedNums.length) return { low: 0, high: 0 };
   const n = sortedNums.length;
@@ -127,6 +125,40 @@ function trimmedRange(sortedNums) {
     low:  Math.round(sortedNums[cut]),
     high: Math.round(sortedNums[n - 1 - cut])
   };
+}
+
+// Detect a graded slab and pull the company + grade out of the title.
+// "PSA 10", "BGS 9.5", "SGC 8" → {graded:true, company:"PSA", grade:10}
+function detectGrade(title) {
+  const t = " " + String(title || "").toLowerCase() + " ";
+  const m = t.match(/\b(psa|bgs|bvg|cgc|sgc|hga|gma|csg)\s*\.?\s*(10|[1-9](?:\.5)?)\b/);
+  if (m) return { graded: true, company: m[1].toUpperCase(), grade: parseFloat(m[2]) };
+  if (/\b(psa|bgs|bvg|cgc|sgc|hga|gma|csg)\b/.test(t)) return { graded: true, company: null, grade: null };
+  if (t.includes("graded") || t.includes("slab") || t.includes("encased")) return { graded: true, company: null, grade: null };
+  return { graded: false, company: null, grade: null };
+}
+
+// Summarize a group of listings (raw or graded)
+function summarizeGroup(items) {
+  const prices = items.map(x => x.price).sort((a, b) => a - b);
+  const r = trimmedRange(prices);
+  return { count: items.length, median: median(prices), low: r.low, high: r.high };
+}
+
+// Per-grade medians, e.g. [{grade:"PSA 9", count:4, median:200}, ...]
+function gradeBreakdown(gradedItems) {
+  const buckets = {};
+  gradedItems.forEach(x => {
+    if (!x.gradeCompany || x.gradeValue == null) return;
+    const key = x.gradeCompany + " " + x.gradeValue;
+    if (!buckets[key]) buckets[key] = [];
+    buckets[key].push(x.price);
+  });
+  return Object.keys(buckets).sort().map(k => ({
+    grade:  k,
+    count:  buckets[k].length,
+    median: median(buckets[k].sort((a, b) => a - b))
+  }));
 }
 
 function normalizeCardQuery(query) {
@@ -206,7 +238,10 @@ async function getEbayCardMarket(query) {
     if (!token || !cleanQuery) {
       return {
         query: cleanQuery, avgPrice: 0, lowPrice: 0, highPrice: 0,
-        listingCount: 0, image: "", priceSource: "Missing eBay token or query", listings: []
+        listingCount: 0, image: "", priceSource: "Missing eBay token or query",
+        raw: { count:0, median:0, low:0, high:0 },
+        graded: { count:0, median:0, low:0, high:0 },
+        gradeBreakdown: [], listings: []
       };
     }
 
@@ -227,33 +262,48 @@ async function getEbayCardMarket(query) {
 
     const listings = rawItems
       .filter(item => isLikelyCardListing(item.title))
-      .map(item => ({
-        title:    item.title || "",
-        price:    safeNumber(item.price && item.price.value, 0),
-        currency: item.price && item.price.currency ? item.price.currency : "USD",
-        image:    item.image && item.image.imageUrl ? item.image.imageUrl : "",
-        url:      addAffiliateToUrl(item.itemWebUrl || "")
-      }))
+      .map(item => {
+        const g = detectGrade(item.title);
+        return {
+          title:        item.title || "",
+          price:        safeNumber(item.price && item.price.value, 0),
+          currency:     item.price && item.price.currency ? item.price.currency : "USD",
+          image:        item.image && item.image.imageUrl ? item.image.imageUrl : "",
+          url:          addAffiliateToUrl(item.itemWebUrl || ""),
+          graded:       g.graded,
+          gradeCompany: g.company,
+          gradeValue:   g.grade
+        };
+      })
       .filter(item => item.price > 0);
 
     const prices = listings.map(item => item.price).sort((a, b) => a - b);
     const range  = trimmedRange(prices);
 
+    const rawGroup    = listings.filter(x => !x.graded);
+    const gradedGroup = listings.filter(x =>  x.graded);
+
     return {
-      query:        cleanQuery,
-      avgPrice:     median(prices),
-      lowPrice:     range.low,
-      highPrice:    range.high,
-      listingCount: listings.length,
-      image:        listings.find(x => x.image)?.image || "",
-      priceSource:  listings.length ? "eBay active card listings (median)" : "No clean card listings found",
+      query:          cleanQuery,
+      avgPrice:       median(prices),
+      lowPrice:       range.low,
+      highPrice:      range.high,
+      listingCount:   listings.length,
+      image:          listings.find(x => x.image)?.image || "",
+      priceSource:    listings.length ? "eBay active card listings (median)" : "No clean card listings found",
+      raw:            summarizeGroup(rawGroup),
+      graded:         summarizeGroup(gradedGroup),
+      gradeBreakdown: gradeBreakdown(gradedGroup),
       listings
     };
   } catch (error) {
     console.log("eBay card market error:", error.message);
     return {
       query, avgPrice: 0, lowPrice: 0, highPrice: 0,
-      listingCount: 0, image: "", priceSource: "eBay lookup failed", listings: []
+      listingCount: 0, image: "", priceSource: "eBay lookup failed",
+      raw: { count:0, median:0, low:0, high:0 },
+      graded: { count:0, median:0, low:0, high:0 },
+      gradeBreakdown: [], listings: []
     };
   }
 }
@@ -515,6 +565,9 @@ app.get("/api/card-market", async (req, res) => {
       soldCount:         0,
       image:             market.image,
       priceSource:       market.priceSource,
+      raw:               market.raw,
+      graded:            market.graded,
+      gradeBreakdown:    market.gradeBreakdown,
       listings:          market.listings,
       soldCompsUrl:      ebayUrl(clean, true),
       activeListingsUrl: ebayUrl(clean, false)
@@ -544,6 +597,9 @@ app.get("/api/card-price", async (req, res) => {
       soldCount:         0,
       image:             market.image,
       priceSource:       market.priceSource,
+      raw:               market.raw,
+      graded:            market.graded,
+      gradeBreakdown:    market.gradeBreakdown,
       listings:          market.listings,
       soldCompsUrl:      ebayUrl(clean, true),
       activeListingsUrl: ebayUrl(clean, false)
@@ -594,6 +650,9 @@ app.post(
         soldCount:         0,
         image:             market.image,
         priceSource:       market.priceSource,
+        raw:               market.raw,
+        graded:            market.graded,
+        gradeBreakdown:    market.gradeBreakdown,
         listings:          market.listings,
         soldCompsUrl:      ebayUrl(clean, true),
         activeListingsUrl: ebayUrl(clean, false),
@@ -735,7 +794,7 @@ app.get("/api/vs-market", async (req, res) => {
       payload = {
         success: true,
         mode: "CAPTURE",
-        note: "Anchors not set yet. These are today's live prices. Copy this WHOLE response back to lock the scoreboard.",
+        note: "Anchors not set yet. These are today's live prices.",
         captureBlock: rows.map(r => ({
           id: r.id,
           stockStart: r.stock.priceNow,
