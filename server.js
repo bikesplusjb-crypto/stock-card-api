@@ -2,7 +2,7 @@
    CARDGAUGE / TRACK THE MARKET
    AI SCANNER + EBAY CARD MARKET BACKEND
    server.js — eBay EPN Affiliate v2
-   + median pricing + graded/raw split
+   + median pricing + graded/raw split + parallel-aware scanning
 ================================ */
 
 const express = require("express");
@@ -128,7 +128,6 @@ function trimmedRange(sortedNums) {
 }
 
 // Detect a graded slab and pull the company + grade out of the title.
-// "PSA 10", "BGS 9.5", "SGC 8" → {graded:true, company:"PSA", grade:10}
 function detectGrade(title) {
   const t = " " + String(title || "").toLowerCase() + " ";
   const m = t.match(/\b(psa|bgs|bvg|cgc|sgc|hga|gma|csg)\s*\.?\s*(10|[1-9](?:\.5)?)\b/);
@@ -138,14 +137,12 @@ function detectGrade(title) {
   return { graded: false, company: null, grade: null };
 }
 
-// Summarize a group of listings (raw or graded)
 function summarizeGroup(items) {
   const prices = items.map(x => x.price).sort((a, b) => a - b);
   const r = trimmedRange(prices);
   return { count: items.length, median: median(prices), low: r.low, high: r.high };
 }
 
-// Per-grade medians, e.g. [{grade:"PSA 9", count:4, median:200}, ...]
 function gradeBreakdown(gradedItems) {
   const buckets = {};
   gradedItems.forEach(x => {
@@ -198,6 +195,51 @@ function isLikelyCardListing(title) {
     "phone case","digital","code card only"
   ];
   return positive.some(w => t.includes(w)) && !negative.some(w => t.includes(w));
+}
+
+// Build a precise eBay query from the AI's structured identification.
+// Parallels and serial numbering are the biggest price drivers — a base
+// card and a /99 refractor of the same player are different products.
+function buildCardQuery(ai) {
+  var parts = [];
+  var push = function (v) {
+    if (!v) return;
+    var s = String(v).trim();
+    if (!s || /^(unknown|n\/a|none|-|null|base)$/i.test(s)) return;
+    parts.push(s);
+  };
+  push(ai.year); push(ai.brand); push(ai.set); push(ai.player); push(ai.parallel);
+  if (ai.cardNumber && !/^(unknown|n\/a|none|-)$/i.test(String(ai.cardNumber))) {
+    push('#' + String(ai.cardNumber).replace(/^#/, ''));
+  }
+  if (ai.serialNumber && /\/\s*\d+/.test(String(ai.serialNumber))) {
+    push(String(ai.serialNumber).replace(/\s+/g, ''));
+  }
+  if (ai.isRookie)     push('RC');
+  if (ai.isAutograph)  push('auto');
+  if (ai.isPatch)      push('patch');
+  if (ai.gradeCompany && ai.gradeValue) push(ai.gradeCompany + ' ' + ai.gradeValue);
+  var seen = {}, out = [];
+  parts.join(' ').split(/\s+/).forEach(function (w) {
+    var k = w.toLowerCase();
+    if (!seen[k]) { seen[k] = 1; out.push(w); }
+  });
+  return out.join(' ').trim();
+}
+
+// Human-readable card name for display, including the parallel.
+function buildDisplayName(ai) {
+  var n = [ai.year, ai.brand, ai.set, ai.player].filter(function (v) {
+    return v && !/^(unknown|n\/a|none|-)$/i.test(String(v));
+  }).join(' ');
+  if (ai.parallel && !/^(base|none|n\/a|unknown)$/i.test(String(ai.parallel))) {
+    n += ' ' + ai.parallel;
+  }
+  if (ai.serialNumber && /\/\s*\d+/.test(String(ai.serialNumber))) {
+    n += ' ' + String(ai.serialNumber).replace(/\s+/g, '');
+  }
+  if (ai.isRookie) n += ' RC';
+  return n.trim() || (ai.cardName || 'Unknown Trading Card');
 }
 
 async function getEbayToken() {
@@ -313,6 +355,8 @@ async function scanWithOpenAI(frontFile, backFile) {
     return {
       cardName: "Unknown Trading Card", player: "Unknown", year: "Unknown",
       set: "Unknown", brand: "Unknown", cardNumber: "Unknown", sport: "Unknown",
+      parallel: "", serialNumber: "", isRookie: false, isAutograph: false, isPatch: false,
+      gradeCompany: "", gradeValue: "",
       signal: "VERIFY", confidence: "Low", summary: "OpenAI API key missing."
     };
   }
@@ -321,9 +365,9 @@ async function scanWithOpenAI(frontFile, backFile) {
   const payload = {
     model: "gpt-4o-mini",
     messages: [
-      { role: "system", content: "You identify sports cards, Pokemon cards, trading cards, slabs, sealed wax, and collectibles from images. Return ONLY valid JSON. Do not guess exact market value." },
+      { role: "system", content: "You are an expert trading card identifier. You examine photos of sports cards, Pokemon cards, TCG cards, graded slabs, and sealed product. You return ONLY valid JSON with no markdown, no code fences, and no commentary. You never estimate dollar values." },
       { role: "user", content: [
-        { type: "text", text: "Identify this card. Return JSON only with: cardName, player, year, set, brand, cardNumber, sport, signal, confidence, summary. Signal must be one of GRADE, WATCH, SELL RAW, HOT, VERIFY. Do not include price estimates." },
+        { type: "text", text: "Identify this card as precisely as possible. Return ONLY a JSON object with these exact keys: cardName, player, year, brand, set, cardNumber, sport, parallel, serialNumber, isRookie, isAutograph, isPatch, gradeCompany, gradeValue, signal, confidence, summary.\n\nCRITICAL — PARALLEL IDENTIFICATION. Parallels change a card's value by 10x or more, so look carefully before concluding a card is base:\n- Border color is the main tell. Panini Prizm/Select/Optic parallels are named by color: Silver, Red, Blue, Green, Orange, Purple, Gold, Black, Pink, Camo, Mojo, Wave, Hyper, Disco, Shimmer, Ice.\n- Topps Chrome parallels: Refractor, X-Fractor, Prism, Atomic, Sepia, Gold, Orange, Red, SuperFractor, Negative, Speckle.\n- Look for rainbow/foil sheen, cracked-ice texture, sparkle, or a colored border that differs from the base design.\n- Look for serial numbering printed on the front or back, usually small, formatted like 25/99 or /99. Report it exactly as printed in serialNumber.\n- '1/1' or 'One of One' is critical — always report it.\n- If you see a colored border or foil pattern but cannot name the exact parallel, use the color plus the word Parallel, e.g. 'Blue Parallel'.\n- Use an empty string for parallel ONLY if the card is clearly a plain base card.\n\nOTHER RULES:\n- If a back image is provided, TRUST THE BACK for card number, set name, and copyright year — printed text beats inferring from the front design.\n- If the card is in a graded slab, read the label for company, grade, year, player, set, and card number.\n- isRookie, isAutograph, isPatch must be true or false booleans.\n- signal must be one of: GRADE, WATCH, SELL RAW, HOT, VERIFY.\n- confidence must be High, Medium, or Low. Use Low if the image is blurry or you are unsure about the parallel.\n- Never guess a dollar value. Never include price fields." },
         ...images
       ]}
     ],
@@ -344,6 +388,8 @@ async function scanWithOpenAI(frontFile, backFile) {
     return {
       cardName: "Unknown Trading Card", player: "Unknown", year: "Unknown",
       set: "Unknown", brand: "Unknown", cardNumber: "Unknown", sport: "Unknown",
+      parallel: "", serialNumber: "", isRookie: false, isAutograph: false, isPatch: false,
+      gradeCompany: "", gradeValue: "",
       signal: "VERIFY", confidence: "Low", summary: "AI could not identify this card."
     };
   }
@@ -356,6 +402,8 @@ async function scanWithOpenAI(frontFile, backFile) {
     return {
       cardName: "Unknown Trading Card", player: "Unknown", year: "Unknown",
       set: "Unknown", brand: "Unknown", cardNumber: "Unknown", sport: "Unknown",
+      parallel: "", serialNumber: "", isRookie: false, isAutograph: false, isPatch: false,
+      gradeCompany: "", gradeValue: "",
       signal: "VERIFY", confidence: "Low", summary: "AI result could not be parsed."
     };
   }
@@ -622,13 +670,11 @@ app.post(
 
       const ai = await scanWithOpenAI(front, back);
 
-      const cleanCardName =
-        ai.cardName && ai.cardName !== "Unknown Trading Card"
-          ? ai.cardName
-          : [ai.year, ai.brand, ai.player, ai.set].filter(Boolean).join(" ");
+      const cleanCardName = buildDisplayName(ai);
+      const searchQuery   = buildCardQuery(ai) || cleanCardName;
 
-      const market = await getEbayCardMarket(cleanCardName);
-      const clean  = normalizeCardQuery(cleanCardName);
+      const market = await getEbayCardMarket(searchQuery);
+      const clean  = normalizeCardQuery(searchQuery);
 
       return res.json({
         success:           true,
@@ -639,6 +685,12 @@ app.post(
         brand:             ai.brand      || "Unknown",
         cardNumber:        ai.cardNumber || "Unknown",
         sport:             ai.sport      || "Unknown",
+        parallel:          ai.parallel      || "",
+        serialNumber:      ai.serialNumber  || "",
+        isRookie:          !!ai.isRookie,
+        isAutograph:       !!ai.isAutograph,
+        isPatch:           !!ai.isPatch,
+        searchQuery:       searchQuery,
         signal:            ai.signal     || "VERIFY",
         confidence:        ai.confidence || "Medium",
         summary:           ai.summary    || "AI scan complete. Verify exact version, condition, and comps.",
