@@ -2,7 +2,8 @@
    CARDGAUGE / TRACK THE MARKET
    AI SCANNER + EBAY CARD MARKET BACKEND
    server.js — eBay EPN Affiliate v2
-   + median pricing + graded/raw split + parallel-aware scanning
+   + median pricing + graded/raw split
+   + TIERED PARALLEL-AWARE PRICING
 ================================ */
 
 const express = require("express");
@@ -24,6 +25,7 @@ const upload = multer({
 
 // ── eBay Partner Network (EPN) Affiliate Config ────────────────
 const EPN_CAMPAIGN_ID = "5339149252";
+const EBAY_FETCH_LIMIT = 100;   // was 25 — too small to filter parallels out of
 
 function ebayUrl(query, sold) {
   const base = "https://www.ebay.com/sch/i.html";
@@ -197,51 +199,238 @@ function isLikelyCardListing(title) {
   return positive.some(w => t.includes(w)) && !negative.some(w => t.includes(w));
 }
 
-// Build a precise eBay query from the AI's structured identification.
-// Parallels and serial numbering are the biggest price drivers — a base
-// card and a /99 refractor of the same player are different products.
-function buildCardQuery(ai) {
-  var parts = [];
-  var push = function (v) {
-    if (!v) return;
-    var s = String(v).trim();
-    if (!s || /^(unknown|n\/a|none|-|null|base)$/i.test(s)) return;
-    parts.push(s);
-  };
-  push(ai.year); push(ai.brand); push(ai.set); push(ai.player); push(ai.parallel);
-  if (ai.cardNumber && !/^(unknown|n\/a|none|-)$/i.test(String(ai.cardNumber))) {
-    push('#' + String(ai.cardNumber).replace(/^#/, ''));
-  }
-  if (ai.serialNumber && /\/\s*\d+/.test(String(ai.serialNumber))) {
-    push(String(ai.serialNumber).replace(/\s+/g, ''));
-  }
-  if (ai.isRookie)     push('RC');
-  if (ai.isAutograph)  push('auto');
-  if (ai.isPatch)      push('patch');
-  if (ai.gradeCompany && ai.gradeValue) push(ai.gradeCompany + ' ' + ai.gradeValue);
-  var seen = {}, out = [];
-  parts.join(' ').split(/\s+/).forEach(function (w) {
-    var k = w.toLowerCase();
-    if (!seen[k]) { seen[k] = 1; out.push(w); }
+/* ═══════════════════════════════════════════════════════════════
+   PARALLEL-AWARE QUERY BUILDING + LISTING SELECTION
+
+   The old buildCardQuery jammed every attribute into one eBay
+   keyword search. eBay ANDs those words together, so a parallel
+   card returned 0-2 listings and priced off noise. Three bugs:
+
+     1. "Base Set" / "Base Rookie" leaked into the query and never
+        matched a real listing title.
+     2. Word-level dedupe turned "Panini Prizm ... Silver Prizm"
+        into "... Silver", destroying the parallel.
+     3. The serial COPY number (25/99) was searched instead of the
+        denominator (/99), which almost never matches.
+
+   New approach: search wide, then filter titles down to the exact
+   parallel. Base cards also get parallels filtered OUT, which they
+   never did before — that was inflating base prices badly.
+═══════════════════════════════════════════════════════════════ */
+
+const GENERIC_SET = /^(base|base set|base rookie|base series|base card|common|rookie|rookies|n\/a|none|unknown|-)$/i;
+const JUNK_VALUE  = /^(unknown|n\/a|none|-|null|)$/i;
+
+// Brand/product names are deliberately EXCLUDED (Prizm, Chrome, Select,
+// Optic, Mosaic) — they appear in every title for the product and would
+// flag base cards as parallels.
+const COLOR_WORDS = [
+  "silver","gold","red","blue","green","orange","purple","pink","black",
+  "bronze","teal","aqua","yellow","white","rainbow","camo","sepia","neon",
+  "tie-dye","tiedye","fuchsia","magenta","lime","navy"
+];
+const TEXTURE_WORDS = [
+  "refractor","xfractor","x-fractor","superfractor","holo","holofoil","foil",
+  "shimmer","wave","mojo","disco","hyper","ice","cracked","laser","scope",
+  "velocity","pulsar","sparkle","atomic","negative","speckle","vinyl",
+  "reactive","genesis","asia","choice","dragon","tiger","zebra"
+];
+const PARALLEL_WORDS = COLOR_WORDS.concat(TEXTURE_WORDS);
+
+function cleanVal(v) {
+  const s = String(v == null ? "" : v).trim();
+  return JUNK_VALUE.test(s) ? "" : s;
+}
+
+// Dedupe WHOLE phrases, not individual words.
+function joinParts(parts) {
+  const seen = {}, out = [];
+  parts.forEach(p => {
+    const s = String(p || "").trim();
+    if (!s) return;
+    const k = s.toLowerCase();
+    if (seen[k]) return;
+    seen[k] = 1;
+    out.push(s);
   });
-  return out.join(' ').trim();
+  return out.join(" ").replace(/\s+/g, " ").trim();
+}
+
+// "Topps Update" + set "Update Series" -> keep only the new word(s).
+function trimOverlap(setName, brandName) {
+  if (!setName || !brandName) return setName;
+  const brandWords = {};
+  String(brandName).toLowerCase().split(/\s+/).forEach(w => { brandWords[w] = 1; });
+  return String(setName).split(/\s+/)
+    .filter(w => !brandWords[w.toLowerCase()])
+    .join(" ").trim();
+}
+
+function cardNumberToken(ai) {
+  const n = cleanVal(ai.cardNumber);
+  if (!n) return "";
+  return "#" + n.replace(/^#/, "");
+}
+
+// The serial DENOMINATOR is searchable ("/99"). The copy number is not.
+// "/1" is excluded because it substring-matches /10, /15, /199 etc.
+function serialDenominator(ai) {
+  const s = cleanVal(ai.serialNumber);
+  const m = s.match(/(\d+)\s*\/\s*(\d+)/);
+  if (!m) return "";
+  const denom = m[2];
+  if (denom === "1") return m[1] === "1" ? "1/1" : "";
+  return "/" + denom;
+}
+
+function buildQueryTiers(ai) {
+  const year   = cleanVal(ai.year);
+  const brand  = cleanVal(ai.brand);
+  const player = cleanVal(ai.player);
+  const setRaw = cleanVal(ai.set);
+  const set    = GENERIC_SET.test(setRaw) ? "" : trimOverlap(setRaw, brand);
+  const parRaw = cleanVal(ai.parallel);
+  const par    = GENERIC_SET.test(parRaw) ? "" : parRaw;
+  const num    = cardNumberToken(ai);
+  const grade  = (cleanVal(ai.gradeCompany) && cleanVal(ai.gradeValue))
+                 ? cleanVal(ai.gradeCompany) + " " + cleanVal(ai.gradeValue) : "";
+
+  const tight = joinParts([year, brand, set, player, par, num, grade]);
+  const core  = joinParts([year, brand, player, num, grade]);
+  const loose = joinParts([year, brand, player]);
+
+  const tiers = [];
+  if (tight) tiers.push({ tier: "tight", query: tight });
+  if (core && core !== tight) tiers.push({ tier: "core", query: core });
+  if (loose && loose !== core && loose !== tight) tiers.push({ tier: "loose", query: loose });
+  return tiers;
+}
+
+function parallelTerms(ai) {
+  const par = cleanVal(ai.parallel);
+  if (!par || GENERIC_SET.test(par)) return [];
+  return par.toLowerCase()
+    .replace(/[^a-z0-9\- ]/g, " ")
+    .split(/\s+/)
+    .filter(w => w.length > 2 && w !== "parallel");
+}
+
+function titleHasParallel(title, terms) {
+  if (!terms.length) return false;
+  const t = " " + String(title || "").toLowerCase() + " ";
+  return terms.every(term => t.includes(term));
+}
+
+function titleHasSerial(title, denom) {
+  if (!denom) return false;
+  return String(title || "").replace(/\s+/g, "").toLowerCase().includes(denom);
+}
+
+function titleLooksParallel(title, brandName) {
+  let t = " " + String(title || "").toLowerCase() + " ";
+  String(brandName || "").toLowerCase().split(/\s+/).forEach(w => {
+    if (w.length > 2) t = t.split(w).join(" ");
+  });
+  if (/\/\s*\d{1,4}\b/.test(t)) return true;
+  return PARALLEL_WORDS.some(w => t.includes(" " + w));
+}
+
+function selectListings(ai, byTier) {
+  const terms = parallelTerms(ai);
+  const denom = serialDenominator(ai);
+  const brand = cleanVal(ai.brand);
+  const isParallel = terms.length > 0 || !!denom;
+  const MIN = 4;
+
+  const tight = byTier.tight || [];
+
+  // For a BASE card the tight query is identical to the core query, so it
+  // returns parallels too. Strip them before trusting the sample, or a base
+  // card gets priced off refractors sitting in the same results.
+  if (tight.length >= MIN) {
+    if (!isParallel) {
+      const tightBase = tight.filter(l => !titleLooksParallel(l.title, brand));
+      if (tightBase.length >= 3) {
+        return { listings: tightBase, matchQuality: "exact", tierUsed: "tight-base",
+                 note: "Priced from base-card listings; parallels excluded." };
+      }
+    }
+    return { listings: tight, matchQuality: "exact", tierUsed: "tight",
+             note: isParallel ? "Priced from listings for this exact parallel."
+                              : "Priced from listings for this exact card." };
+  }
+
+  const wide = (byTier.core && byTier.core.length ? byTier.core : (byTier.loose || []));
+
+  if (isParallel && wide.length) {
+    let matched = wide.filter(l => titleHasParallel(l.title, terms));
+    if (denom) {
+      const ids = {};
+      matched.concat(wide.filter(l => titleHasSerial(l.title, denom)))
+             .forEach(l => { ids[l.title] = l; });
+      matched = Object.keys(ids).map(k => ids[k]);
+    }
+    if (matched.length >= 2) {
+      const thin = matched.length < 4;
+      return { listings: matched,
+               matchQuality: thin ? "thin" : "exact",
+               tierUsed: "core+filter",
+               note: thin
+                 ? "Only " + matched.length + " listings found for this parallel — treat this as a rough guide."
+                 : "Priced from listings matching this parallel." };
+    }
+    if (tight.length) {
+      return { listings: tight, matchQuality: "thin", tierUsed: "tight",
+               note: "Only " + tight.length + " listing" + (tight.length === 1 ? "" : "s") +
+                     " found for this parallel — treat this price as a rough guide." };
+    }
+    const base = wide.filter(l => !titleLooksParallel(l.title, brand));
+    if (base.length >= 3) {
+      return { listings: base, matchQuality: "base_fallback", tierUsed: "core-base",
+               note: "No listings found for this parallel. Showing BASE card prices — a parallel is usually worth more." };
+    }
+    return { listings: wide, matchQuality: "base_fallback", tierUsed: "core",
+             note: "No listings found for this parallel. Showing prices for the card generally." };
+  }
+
+  if (!isParallel && wide.length) {
+    const base = wide.filter(l => !titleLooksParallel(l.title, brand));
+    if (base.length >= 3) {
+      return { listings: base, matchQuality: "exact", tierUsed: "core-base",
+               note: "Priced from base-card listings; parallels excluded." };
+    }
+  }
+
+  if (tight.length) {
+    return { listings: tight, matchQuality: "thin", tierUsed: "tight",
+             note: "Very few listings found — treat this price as a rough guide." };
+  }
+  return { listings: wide, matchQuality: wide.length ? "loose" : "none", tierUsed: "loose",
+           note: wide.length ? "Priced from a broad search — verify the exact version."
+                             : "No clean card listings found." };
 }
 
 // Human-readable card name for display, including the parallel.
 function buildDisplayName(ai) {
-  var n = [ai.year, ai.brand, ai.set, ai.player].filter(function (v) {
-    return v && !/^(unknown|n\/a|none|-)$/i.test(String(v));
-  }).join(' ');
-  if (ai.parallel && !/^(base|none|n\/a|unknown)$/i.test(String(ai.parallel))) {
-    n += ' ' + ai.parallel;
-  }
-  if (ai.serialNumber && /\/\s*\d+/.test(String(ai.serialNumber))) {
-    n += ' ' + String(ai.serialNumber).replace(/\s+/g, '');
-  }
-  if (ai.isRookie) n += ' RC';
-  return n.trim() || (ai.cardName || 'Unknown Trading Card');
+  const brand  = cleanVal(ai.brand);
+  const setRaw = cleanVal(ai.set);
+  const set    = GENERIC_SET.test(setRaw) ? "" : trimOverlap(setRaw, brand);
+  let n = joinParts([cleanVal(ai.year), brand, set, cleanVal(ai.player)]);
+  const par = cleanVal(ai.parallel);
+  if (par && !GENERIC_SET.test(par)) n += " " + par;
+  const s = cleanVal(ai.serialNumber);
+  if (s && /\d+\s*\/\s*\d+/.test(s)) n += " " + s.replace(/\s+/g, "");
+  if (ai.isRookie) n += " RC";
+  return n.trim() || cleanVal(ai.cardName) || "Unknown Trading Card";
 }
 
+// Kept for backward compatibility — returns the tightest query.
+function buildCardQuery(ai) {
+  const tiers = buildQueryTiers(ai);
+  return tiers.length ? tiers[0].query : "";
+}
+
+// ── eBay fetching ──────────────────────────────────────────────
 async function getEbayToken() {
   if (ebayToken && Date.now() < ebayTokenExpires) return ebayToken;
   if (!process.env.EBAY_CLIENT_ID || !process.env.EBAY_CLIENT_SECRET) {
@@ -272,24 +461,16 @@ async function getEbayToken() {
   return ebayToken;
 }
 
-async function getEbayCardMarket(query) {
+// Raw listing fetch for a single query string.
+async function fetchEbayListings(query, limit) {
   try {
     const token = await getEbayToken();
     const cleanQuery = normalizeCardQuery(query);
-
-    if (!token || !cleanQuery) {
-      return {
-        query: cleanQuery, avgPrice: 0, lowPrice: 0, highPrice: 0,
-        listingCount: 0, image: "", priceSource: "Missing eBay token or query",
-        raw: { count:0, median:0, low:0, high:0 },
-        graded: { count:0, median:0, low:0, high:0 },
-        gradeBreakdown: [], listings: []
-      };
-    }
+    if (!token || !cleanQuery) return [];
 
     const url =
       "https://api.ebay.com/buy/browse/v1/item_summary/search?q=" +
-      encodeURIComponent(cleanQuery) + "&limit=25";
+      encodeURIComponent(cleanQuery) + "&limit=" + (limit || EBAY_FETCH_LIMIT);
 
     const response = await fetch(url, {
       headers: {
@@ -302,7 +483,7 @@ async function getEbayCardMarket(query) {
     const data = await response.json();
     const rawItems = Array.isArray(data.itemSummaries) ? data.itemSummaries : [];
 
-    const listings = rawItems
+    return rawItems
       .filter(item => isLikelyCardListing(item.title))
       .map(item => {
         const g = detectGrade(item.title);
@@ -318,62 +499,133 @@ async function getEbayCardMarket(query) {
         };
       })
       .filter(item => item.price > 0);
-
-    const prices = listings.map(item => item.price).sort((a, b) => a - b);
-    const range  = trimmedRange(prices);
-
-    const rawGroup    = listings.filter(x => !x.graded);
-    const gradedGroup = listings.filter(x =>  x.graded);
-
-    return {
-      query:          cleanQuery,
-      avgPrice:       median(prices),
-      lowPrice:       range.low,
-      highPrice:      range.high,
-      listingCount:   listings.length,
-      image:          listings.find(x => x.image)?.image || "",
-      priceSource:    listings.length ? "eBay active card listings (median)" : "No clean card listings found",
-      raw:            summarizeGroup(rawGroup),
-      graded:         summarizeGroup(gradedGroup),
-      gradeBreakdown: gradeBreakdown(gradedGroup),
-      listings
-    };
   } catch (error) {
-    console.log("eBay card market error:", error.message);
-    return {
-      query, avgPrice: 0, lowPrice: 0, highPrice: 0,
-      listingCount: 0, image: "", priceSource: "eBay lookup failed",
-      raw: { count:0, median:0, low:0, high:0 },
-      graded: { count:0, median:0, low:0, high:0 },
-      gradeBreakdown: [], listings: []
-    };
+    console.log("eBay fetch error:", error.message);
+    return [];
   }
 }
 
-async function scanWithOpenAI(frontFile, backFile) {
-  if (!process.env.OPENAI_API_KEY) {
-    return {
-      cardName: "Unknown Trading Card", player: "Unknown", year: "Unknown",
-      set: "Unknown", brand: "Unknown", cardNumber: "Unknown", sport: "Unknown",
-      parallel: "", serialNumber: "", isRookie: false, isAutograph: false, isPatch: false,
-      gradeCompany: "", gradeValue: "",
-      signal: "VERIFY", confidence: "Low", summary: "OpenAI API key missing."
-    };
+// Turn a listing array into the market summary shape the frontends expect.
+function summarizeListings(listings, cleanQuery, extra) {
+  const prices = listings.map(item => item.price).sort((a, b) => a - b);
+  const range  = trimmedRange(prices);
+  const rawGroup    = listings.filter(x => !x.graded);
+  const gradedGroup = listings.filter(x =>  x.graded);
+
+  return Object.assign({
+    query:          cleanQuery,
+    avgPrice:       median(prices),
+    lowPrice:       range.low,
+    highPrice:      range.high,
+    listingCount:   listings.length,
+    image:          (listings.find(x => x.image) || {}).image || "",
+    priceSource:    listings.length ? "eBay active card listings (median)" : "No clean card listings found",
+    raw:            summarizeGroup(rawGroup),
+    graded:         summarizeGroup(gradedGroup),
+    gradeBreakdown: gradeBreakdown(gradedGroup),
+    listings
+  }, extra || {});
+}
+
+const EMPTY_MARKET = (q, source) => ({
+  query: q, avgPrice: 0, lowPrice: 0, highPrice: 0,
+  listingCount: 0, image: "", priceSource: source,
+  raw: { count:0, median:0, low:0, high:0 },
+  graded: { count:0, median:0, low:0, high:0 },
+  gradeBreakdown: [], listings: []
+});
+
+// Plain text-query lookup (used by /api/card-market, /api/card-price,
+// vs-market and the watchlist refresh).
+async function getEbayCardMarket(query) {
+  try {
+    const cleanQuery = normalizeCardQuery(query);
+    const listings = await fetchEbayListings(cleanQuery);
+    if (!listings.length) return EMPTY_MARKET(cleanQuery, "No clean card listings found");
+    return summarizeListings(listings, cleanQuery);
+  } catch (error) {
+    console.log("eBay card market error:", error.message);
+    return EMPTY_MARKET(normalizeCardQuery(query), "eBay lookup failed");
   }
+}
+
+// Parallel-aware lookup for a scanned card. Searches tight first, widens
+// only if needed, then filters titles down to the right version.
+async function getCardMarketForCard(ai) {
+  const tiers = buildQueryTiers(ai);
+  if (!tiers.length) {
+    const fallback = cleanVal(ai.cardName) || "sports trading card";
+    const m = await getEbayCardMarket(fallback);
+    return Object.assign(m, {
+      searchQuery: fallback, matchQuality: "loose", tierUsed: "fallback",
+      priceNote: "Card could not be identified precisely — verify the exact version."
+    });
+  }
+
+  const byTier = {};
+  const tightTier = tiers.find(t => t.tier === "tight");
+  if (tightTier) byTier.tight = await fetchEbayListings(tightTier.query);
+
+  // Only widen when the tight search came back thin.
+  if (!byTier.tight || byTier.tight.length < 4) {
+    const coreTier = tiers.find(t => t.tier === "core");
+    if (coreTier) byTier.core = await fetchEbayListings(coreTier.query);
+    if (!byTier.core || byTier.core.length < 4) {
+      const looseTier = tiers.find(t => t.tier === "loose");
+      if (looseTier) byTier.loose = await fetchEbayListings(looseTier.query);
+    }
+  }
+
+  const picked = selectListings(ai, byTier);
+  const usedQuery =
+    picked.tierUsed.indexOf("tight") === 0 ? (tightTier ? tightTier.query : tiers[0].query)
+    : picked.tierUsed.indexOf("loose") === 0 ? ((tiers.find(t => t.tier === "loose") || tiers[0]).query)
+    : ((tiers.find(t => t.tier === "core") || tiers[0]).query);
+
+  if (!picked.listings.length) {
+    return Object.assign(EMPTY_MARKET(usedQuery, "No clean card listings found"), {
+      searchQuery: (tightTier ? tightTier.query : tiers[0].query),
+      matchQuality: "none", tierUsed: picked.tierUsed, priceNote: picked.note
+    });
+  }
+
+  return summarizeListings(picked.listings, usedQuery, {
+    searchQuery:  usedQuery,
+    matchQuality: picked.matchQuality,
+    tierUsed:     picked.tierUsed,
+    priceNote:    picked.note,
+    priceSource:  "eBay active card listings (median, " + picked.tierUsed + ")"
+  });
+}
+
+// ── OpenAI scan ────────────────────────────────────────────────
+const AI_FALLBACK = (summary) => ({
+  cardName: "Unknown Trading Card", player: "Unknown", year: "Unknown",
+  set: "Unknown", brand: "Unknown", cardNumber: "Unknown", sport: "Unknown",
+  parallel: "", serialNumber: "", isRookie: false, isAutograph: false, isPatch: false,
+  gradeCompany: "", gradeValue: "",
+  signal: "VERIFY", confidence: "Low", summary
+});
+
+async function scanWithOpenAI(frontFile, backFile) {
+  if (!process.env.OPENAI_API_KEY) return AI_FALLBACK("OpenAI API key missing.");
+
   const images = [{ type: "image_url", image_url: { url: fileToDataUrl(frontFile) } }];
   if (backFile) images.push({ type: "image_url", image_url: { url: fileToDataUrl(backFile) } });
+
   const payload = {
     model: "gpt-4o-mini",
     messages: [
       { role: "system", content: "You are an expert trading card identifier. You examine photos of sports cards, Pokemon cards, TCG cards, graded slabs, and sealed product. You return ONLY valid JSON with no markdown, no code fences, and no commentary. You never estimate dollar values." },
       { role: "user", content: [
-        { type: "text", text: "Identify this card as precisely as possible. Return ONLY a JSON object with these exact keys: cardName, player, year, brand, set, cardNumber, sport, parallel, serialNumber, isRookie, isAutograph, isPatch, gradeCompany, gradeValue, signal, confidence, summary.\n\nCRITICAL — PARALLEL IDENTIFICATION. Parallels change a card's value by 10x or more, so look carefully before concluding a card is base:\n- Border color is the main tell. Panini Prizm/Select/Optic parallels are named by color: Silver, Red, Blue, Green, Orange, Purple, Gold, Black, Pink, Camo, Mojo, Wave, Hyper, Disco, Shimmer, Ice.\n- Topps Chrome parallels: Refractor, X-Fractor, Prism, Atomic, Sepia, Gold, Orange, Red, SuperFractor, Negative, Speckle.\n- Look for rainbow/foil sheen, cracked-ice texture, sparkle, or a colored border that differs from the base design.\n- Look for serial numbering printed on the front or back, usually small, formatted like 25/99 or /99. Report it exactly as printed in serialNumber.\n- '1/1' or 'One of One' is critical — always report it.\n- If you see a colored border or foil pattern but cannot name the exact parallel, use the color plus the word Parallel, e.g. 'Blue Parallel'.\n- Use an empty string for parallel ONLY if the card is clearly a plain base card.\n\nOTHER RULES:\n- If a back image is provided, TRUST THE BACK for card number, set name, and copyright year — printed text beats inferring from the front design.\n- If the card is in a graded slab, read the label for company, grade, year, player, set, and card number.\n- isRookie, isAutograph, isPatch must be true or false booleans.\n- signal must be one of: GRADE, WATCH, SELL RAW, HOT, VERIFY.\n- confidence must be High, Medium, or Low. Use Low if the image is blurry or you are unsure about the parallel.\n- Never guess a dollar value. Never include price fields." },
+        { type: "text", text: "Identify this card as precisely as possible. Return ONLY a JSON object with these exact keys: cardName, player, year, brand, set, cardNumber, sport, parallel, serialNumber, isRookie, isAutograph, isPatch, gradeCompany, gradeValue, signal, confidence, summary.\n\nCRITICAL — PARALLEL IDENTIFICATION. Parallels change a card's value by 10x or more, so look carefully before concluding a card is base:\n- Border color is the main tell. Panini Prizm/Select/Optic parallels are named by color: Silver, Red, Blue, Green, Orange, Purple, Gold, Black, Pink, Camo, Mojo, Wave, Hyper, Disco, Shimmer, Ice.\n- Topps Chrome parallels: Refractor, X-Fractor, Prism, Atomic, Sepia, Gold, Orange, Red, SuperFractor, Negative, Speckle.\n- Look for rainbow/foil sheen, cracked-ice texture, sparkle, or a colored border that differs from the base design.\n- Look for serial numbering printed on the front or back, usually small, formatted like 25/99 or /99. Report it exactly as printed in serialNumber.\n- '1/1' or 'One of One' is critical — always report it.\n- If you see a colored border or foil pattern but cannot name the exact parallel, use the color plus the word Parallel, e.g. 'Blue Parallel'.\n- Use an empty string for parallel ONLY if the card is clearly a plain base card.\n\nSET FIELD RULES — IMPORTANT:\n- The 'set' field must be the actual product/subset name as it would appear in an eBay listing title, for example 'Update Series', 'Draft Picks', 'Downtown', 'Kaboom'.\n- If the card is just the base set of the product, return an EMPTY STRING for set. Never return 'Base', 'Base Set', 'Base Rookie', or 'Common' — those words do not appear in listing titles and break the price search.\n\nOTHER RULES:\n- If a back image is provided, TRUST THE BACK for card number, set name, and copyright year — printed text beats inferring from the front design.\n- If the card is in a graded slab, read the label for company, grade, year, player, set, and card number.\n- isRookie, isAutograph, isPatch must be true or false booleans.\n- signal must be one of: GRADE, WATCH, SELL RAW, HOT, VERIFY.\n- confidence must be High, Medium, or Low. Use Low if the image is blurry or you are unsure about the parallel.\n- Never guess a dollar value. Never include price fields." },
         ...images
       ]}
     ],
     temperature: 0.1,
     max_tokens: 700
   };
+
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -382,30 +634,20 @@ async function scanWithOpenAI(frontFile, backFile) {
     },
     body: JSON.stringify(payload)
   });
+
   const rawText = await response.text();
   if (!response.ok) {
     console.error("OpenAI error:", rawText);
-    return {
-      cardName: "Unknown Trading Card", player: "Unknown", year: "Unknown",
-      set: "Unknown", brand: "Unknown", cardNumber: "Unknown", sport: "Unknown",
-      parallel: "", serialNumber: "", isRookie: false, isAutograph: false, isPatch: false,
-      gradeCompany: "", gradeValue: "",
-      signal: "VERIFY", confidence: "Low", summary: "AI could not identify this card."
-    };
+    return AI_FALLBACK("AI could not identify this card.");
   }
+
   const apiData = JSON.parse(rawText);
   const content = apiData?.choices?.[0]?.message?.content || "";
   try {
     return JSON.parse(cleanJsonText(content));
   } catch (error) {
     console.log("AI parse error:", content);
-    return {
-      cardName: "Unknown Trading Card", player: "Unknown", year: "Unknown",
-      set: "Unknown", brand: "Unknown", cardNumber: "Unknown", sport: "Unknown",
-      parallel: "", serialNumber: "", isRookie: false, isAutograph: false, isPatch: false,
-      gradeCompany: "", gradeValue: "",
-      signal: "VERIFY", confidence: "Low", summary: "AI result could not be parsed."
-    };
+    return AI_FALLBACK("AI result could not be parsed.");
   }
 }
 
@@ -605,6 +847,7 @@ app.get("/api/card-market", async (req, res) => {
     res.json({
       success:           true,
       cardName:          clean,
+      searchQuery:       clean,
       avgPrice:          market.avgPrice,
       avgSoldPrice:      market.avgPrice,
       lowPrice:          market.lowPrice,
@@ -613,6 +856,8 @@ app.get("/api/card-market", async (req, res) => {
       soldCount:         0,
       image:             market.image,
       priceSource:       market.priceSource,
+      matchQuality:      market.listingCount ? "exact" : "none",
+      priceNote:         market.listingCount ? "" : "No clean card listings found.",
       raw:               market.raw,
       graded:            market.graded,
       gradeBreakdown:    market.gradeBreakdown,
@@ -637,6 +882,7 @@ app.get("/api/card-price", async (req, res) => {
     res.json({
       success:           true,
       cardName:          clean,
+      searchQuery:       clean,
       avgSoldPrice:      market.avgPrice,
       avgPrice:          market.avgPrice,
       lowPrice:          market.lowPrice,
@@ -671,10 +917,19 @@ app.post(
       const ai = await scanWithOpenAI(front, back);
 
       const cleanCardName = buildDisplayName(ai);
-      const searchQuery   = buildCardQuery(ai) || cleanCardName;
+      const market        = await getCardMarketForCard(ai);
+      const searchQuery   = market.searchQuery || buildCardQuery(ai) || cleanCardName;
 
-      const market = await getEbayCardMarket(searchQuery);
-      const clean  = normalizeCardQuery(searchQuery);
+      console.log(
+        "[scan] " + cleanCardName +
+        " | parallel=" + (ai.parallel || "-") +
+        " | serial=" + (ai.serialNumber || "-") +
+        " | q=" + searchQuery +
+        " | tier=" + (market.tierUsed || "-") +
+        " | match=" + (market.matchQuality || "-") +
+        " | n=" + market.listingCount +
+        " | median=$" + market.avgPrice
+      );
 
       return res.json({
         success:           true,
@@ -691,6 +946,9 @@ app.post(
         isAutograph:       !!ai.isAutograph,
         isPatch:           !!ai.isPatch,
         searchQuery:       searchQuery,
+        matchQuality:      market.matchQuality || "exact",
+        tierUsed:          market.tierUsed     || "",
+        priceNote:         market.priceNote    || "",
         signal:            ai.signal     || "VERIFY",
         confidence:        ai.confidence || "Medium",
         summary:           ai.summary    || "AI scan complete. Verify exact version, condition, and comps.",
@@ -706,8 +964,8 @@ app.post(
         graded:            market.graded,
         gradeBreakdown:    market.gradeBreakdown,
         listings:          market.listings,
-        soldCompsUrl:      ebayUrl(clean, true),
-        activeListingsUrl: ebayUrl(clean, false),
+        soldCompsUrl:      ebayUrl(searchQuery, true),
+        activeListingsUrl: ebayUrl(searchQuery, false),
         timestamp:         Date.now()
       });
     } catch (error) {
