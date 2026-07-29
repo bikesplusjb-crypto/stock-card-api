@@ -178,6 +178,12 @@ function gradeBreakdown(gradedItems) {
 /* How far apart are the listings? A typical ask of $19 with a high ask
    of $300 means the search is matching several different cards, not one.
    Worth telling the user rather than quietly reporting the median. */
+/* 4x between the typical ask and the trimmed high is enough to mean the
+   search is catching more than one card. Two real examples set this line:
+   "topps finest ohtani" ran 15x, "topps chrome judge" ran 4.2x, and both
+   were mixing base cards with autos and parallels. */
+const WIDE_SPREAD_AT = 4;
+
 function spreadRatio(sortedPrices) {
   if (sortedPrices.length < 4) return 0;
   const r = trimmedRange(sortedPrices);
@@ -546,7 +552,7 @@ function summarizeListings(listings, cleanQuery, extra) {
     highPrice:      range.high,
     listingCount:   listings.length,
     spreadRatio:    Number(spread.toFixed(1)),
-    wideSpread:     spread >= 8,
+    wideSpread:     spread >= WIDE_SPREAD_AT,
     image:          (listings.find(x => x.image) || {}).image || "",
     priceSource:    listings.length ? "eBay active card listings (median)" : "No clean card listings found",
     raw:            summarizeGroup(rawGroup),
