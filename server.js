@@ -139,10 +139,22 @@ function detectGrade(title) {
   return { graded: false, company: null, grade: null };
 }
 
+/* A median of one number is not a median. Below this many listings a
+   group is reported but flagged thin, and per-grade medians are dropped
+   entirely so the frontend falls back to an honest estimate. One junk
+   $24,999 listing must never become "the PSA 10 price". */
+const MIN_GROUP = 3;
+
 function summarizeGroup(items) {
   const prices = items.map(x => x.price).sort((a, b) => a - b);
   const r = trimmedRange(prices);
-  return { count: items.length, median: median(prices), low: r.low, high: r.high };
+  return {
+    count:  items.length,
+    median: median(prices),
+    low:    r.low,
+    high:   r.high,
+    thin:   items.length > 0 && items.length < MIN_GROUP
+  };
 }
 
 function gradeBreakdown(gradedItems) {
@@ -153,11 +165,25 @@ function gradeBreakdown(gradedItems) {
     if (!buckets[key]) buckets[key] = [];
     buckets[key].push(x.price);
   });
-  return Object.keys(buckets).sort().map(k => ({
-    grade:  k,
-    count:  buckets[k].length,
-    median: median(buckets[k].sort((a, b) => a - b))
-  }));
+  return Object.keys(buckets)
+    .filter(k => buckets[k].length >= MIN_GROUP)   // <- the fix
+    .sort()
+    .map(k => ({
+      grade:  k,
+      count:  buckets[k].length,
+      median: median(buckets[k].sort((a, b) => a - b))
+    }));
+}
+
+/* How far apart are the listings? A typical ask of $19 with a high ask
+   of $300 means the search is matching several different cards, not one.
+   Worth telling the user rather than quietly reporting the median. */
+function spreadRatio(sortedPrices) {
+  if (sortedPrices.length < 4) return 0;
+  const r = trimmedRange(sortedPrices);
+  const m = median(sortedPrices);
+  if (!m || !r.low) return 0;
+  return r.high / m;
 }
 
 function normalizeCardQuery(query) {
@@ -511,28 +537,42 @@ function summarizeListings(listings, cleanQuery, extra) {
   const range  = trimmedRange(prices);
   const rawGroup    = listings.filter(x => !x.graded);
   const gradedGroup = listings.filter(x =>  x.graded);
+  const spread = spreadRatio(prices);
 
-  return Object.assign({
+  const base = {
     query:          cleanQuery,
     avgPrice:       median(prices),
     lowPrice:       range.low,
     highPrice:      range.high,
     listingCount:   listings.length,
+    spreadRatio:    Number(spread.toFixed(1)),
+    wideSpread:     spread >= 8,
     image:          (listings.find(x => x.image) || {}).image || "",
     priceSource:    listings.length ? "eBay active card listings (median)" : "No clean card listings found",
     raw:            summarizeGroup(rawGroup),
     graded:         summarizeGroup(gradedGroup),
     gradeBreakdown: gradeBreakdown(gradedGroup),
     listings
-  }, extra || {});
+  };
+
+  // Only set a note if the caller hasn't already written a better one.
+  if (base.wideSpread && !(extra && extra.priceNote)) {
+    base.matchQuality = "loose";
+    base.priceNote =
+      "These listings vary a lot — the search is probably matching several " +
+      "different cards. Edit the search below to narrow it down.";
+  }
+
+  return Object.assign(base, extra || {});
 }
 
 const EMPTY_MARKET = (q, source) => ({
   query: q, avgPrice: 0, lowPrice: 0, highPrice: 0,
   listingCount: 0, image: "", priceSource: source,
-  raw: { count:0, median:0, low:0, high:0 },
-  graded: { count:0, median:0, low:0, high:0 },
-  gradeBreakdown: [], listings: []
+  raw: { count:0, median:0, low:0, high:0, thin:false },
+  graded: { count:0, median:0, low:0, high:0, thin:false },
+  gradeBreakdown: [], listings: [],
+  spreadRatio: 0, wideSpread: false
 });
 
 // Plain text-query lookup (used by /api/card-market, /api/card-price,
@@ -856,8 +896,10 @@ app.get("/api/card-market", async (req, res) => {
       soldCount:         0,
       image:             market.image,
       priceSource:       market.priceSource,
-      matchQuality:      market.listingCount ? "exact" : "none",
-      priceNote:         market.listingCount ? "" : "No clean card listings found.",
+      spreadRatio:       market.spreadRatio,
+      wideSpread:        market.wideSpread,
+      matchQuality:      market.matchQuality || (market.listingCount ? "exact" : "none"),
+      priceNote:         market.priceNote  || (market.listingCount ? "" : "No clean card listings found."),
       raw:               market.raw,
       graded:            market.graded,
       gradeBreakdown:    market.gradeBreakdown,
@@ -891,6 +933,10 @@ app.get("/api/card-price", async (req, res) => {
       soldCount:         0,
       image:             market.image,
       priceSource:       market.priceSource,
+      spreadRatio:       market.spreadRatio,
+      wideSpread:        market.wideSpread,
+      matchQuality:      market.matchQuality || (market.listingCount ? "exact" : "none"),
+      priceNote:         market.priceNote || "",
       raw:               market.raw,
       graded:            market.graded,
       gradeBreakdown:    market.gradeBreakdown,
@@ -960,6 +1006,8 @@ app.post(
         soldCount:         0,
         image:             market.image,
         priceSource:       market.priceSource,
+        spreadRatio:       market.spreadRatio,
+        wideSpread:        market.wideSpread,
         raw:               market.raw,
         graded:            market.graded,
         gradeBreakdown:    market.gradeBreakdown,
