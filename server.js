@@ -644,6 +644,236 @@ async function getCardMarketForCard(ai) {
   });
 }
 
+// ══════════════════════════════════════════════════════════════
+//  THE CARD API — REAL SOLD PRICES
+//
+//  eBay Browse gives asking prices. This gives what buyers actually
+//  paid, including accepted Best Offers, which eBay's own API does
+//  not expose. Starter plan: 10,000 records/day, 14-day lookback.
+//
+//  Budget discipline: ONE request per card, then split raw/graded
+//  and per-grade locally from the returned records. Asking for
+//  graded and raw separately would double the record spend for the
+//  same information. 100 records per scan ≈ 100 uncached scans/day,
+//  so the Supabase cache is what keeps this affordable.
+// ══════════════════════════════════════════════════════════════
+
+const CARDAPI_KEY      = process.env.CARDAPI_KEY || "";
+const CARDAPI_BASE     = "https://thecardapi.com/api/v1/market";
+const CARDAPI_LOOKBACK = Number(process.env.CARDAPI_LOOKBACK_DAYS || 14); // Starter = 14
+const CARDAPI_LIMIT    = Number(process.env.CARDAPI_LIMIT || 100);
+const CACHE_TTL_HOURS  = Number(process.env.SOLD_CACHE_TTL_HOURS || 12);
+
+function cacheKeyFor(query) {
+  return normalizeCardQuery(query).toLowerCase().replace(/\s+/g, " ").trim().slice(0, 300);
+}
+
+function daysAgoISO(n) {
+  const d = new Date(Date.now() - n * 86400000);
+  return d.toISOString().slice(0, 10);
+}
+
+// Grade buckets from the records themselves — no extra API calls.
+function soldGradeBreakdown(records) {
+  const buckets = {};
+  records.forEach(r => {
+    if (!r.grader || r.grade == null) return;
+    const g = String(r.grade).trim();
+    if (!/^(10|9\.5|9|8\.5|8|7\.5|7)$/.test(g)) return;
+    const key = String(r.grader).toUpperCase() + " " + g;
+    if (!buckets[key]) buckets[key] = [];
+    buckets[key].push(r.price);
+  });
+  return Object.keys(buckets)
+    .filter(k => buckets[k].length >= MIN_GROUP)
+    .sort()
+    .map(k => ({
+      grade:  k,
+      count:  buckets[k].length,
+      median: median(buckets[k].sort((a, b) => a - b))
+    }));
+}
+
+function summarizeSold(records, query) {
+  const clean = records
+    .map(r => ({
+      price:       safeNumber(r.price, 0),
+      title:       r.title || "",
+      saleDate:    r.sale_date || null,
+      listingType: r.listing_type || null,
+      grader:      r.grader || null,
+      grade:       r.grade != null ? String(r.grade) : null,
+      printRun:    r.print_run != null ? Number(r.print_run) : null,
+      platform:    r.platform || null,
+      url:         r.listing_url || null,
+      image:       r.thumbnail_url || r.image_url || null,
+      confirmed:   r.price_confirmed !== false
+    }))
+    .filter(r => r.price > 0 && r.confirmed);
+
+  if (!clean.length) {
+    return {
+      soldCount: 0, soldMedian: 0, soldLow: 0, soldHigh: 0,
+      soldRaw: { count: 0, median: 0 }, soldGraded: { count: 0, median: 0 },
+      soldGradeBreakdown: [], bestOfferCount: 0, lastSaleDate: null,
+      sales: [], query: query, lookbackDays: CARDAPI_LOOKBACK
+    };
+  }
+
+  const prices = clean.map(r => r.price).sort((a, b) => a - b);
+  const graded = clean.filter(r => r.grader && r.grade);
+  const raw    = clean.filter(r => !r.grader);
+  const rawP   = raw.map(r => r.price).sort((a, b) => a - b);
+  const grP    = graded.map(r => r.price).sort((a, b) => a - b);
+  const dates  = clean.map(r => r.saleDate).filter(Boolean).sort();
+
+  /* The headline number must describe ONE thing. A raw card is not worth
+     the median of raw sales and PSA 10 slabs mixed together — that median
+     drifts upward with every slab in the window. When there are enough raw
+     sales, they are the headline; the graded side is reported separately. */
+  const useRaw   = rawP.length >= MIN_GROUP;
+  const headline = useRaw ? rawP : prices;
+  const range    = trimmedRange(headline);
+
+  return {
+    soldCount:     clean.length,
+    soldMedian:    median(headline),
+    soldLow:       range.low,
+    soldHigh:      range.high,
+    soldBasis:     useRaw ? "raw" : "all",
+    soldMedianAll: median(prices),
+    soldCountUsed: headline.length,
+    soldRaw:    { count: raw.length,    median: median(rawP) },
+    soldGraded: { count: graded.length, median: median(grP) },
+    soldGradeBreakdown: soldGradeBreakdown(clean),
+    bestOfferCount: clean.filter(r => r.listingType === "best_offer").length,
+    lastSaleDate:   dates.length ? dates[dates.length - 1] : null,
+    sales:          clean.slice(0, 12),
+    query:          query,
+    lookbackDays:   CARDAPI_LOOKBACK
+  };
+}
+
+async function readSoldCache(key) {
+  if (!supabaseAdmin) return null;
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("sold_comps_cache")
+      .select("payload,fetched_at")
+      .eq("cache_key", key)
+      .maybeSingle();
+    if (error || !data) return null;
+    const ageHours = (Date.now() - new Date(data.fetched_at).getTime()) / 3600000;
+    if (ageHours > CACHE_TTL_HOURS) return null;
+    return data.payload;
+  } catch (e) { return null; }
+}
+
+async function writeSoldCache(key, query, payload) {
+  if (!supabaseAdmin) return;
+  try {
+    await supabaseAdmin.from("sold_comps_cache").upsert({
+      cache_key:    key,
+      query:        query,
+      payload:      payload,
+      record_count: payload.soldCount || 0,
+      fetched_at:   new Date().toISOString()
+    }, { onConflict: "cache_key" });
+  } catch (e) {}
+}
+
+// One row per card per day, kept permanently. This is how CardGauge
+// builds its own price history without paying for deep lookback.
+async function recordPriceHistory(key, query, sold, askMedian) {
+  if (!supabaseAdmin || !sold || !sold.soldCount) return;
+  try {
+    await supabaseAdmin.from("card_price_history").upsert({
+      cache_key:     key,
+      card_query:    query,
+      sale_date:     new Date().toISOString().slice(0, 10),
+      sold_median:   sold.soldMedian || null,
+      sold_low:      sold.soldLow || null,
+      sold_high:     sold.soldHigh || null,
+      sold_count:    sold.soldCount || 0,
+      ask_median:    safeNumber(askMedian, 0) || null,
+      raw_median:    (sold.soldRaw && sold.soldRaw.median) || null,
+      graded_median: (sold.soldGraded && sold.soldGraded.median) || null
+    }, { onConflict: "cache_key,sale_date" });
+  } catch (e) {}
+}
+
+async function fetchSoldComps(query) {
+  if (!CARDAPI_KEY) return null;
+  const clean = normalizeCardQuery(query);
+  if (!clean || clean.length < 4) return null;   // their q needs 4+ chars
+
+  const params = new URLSearchParams({
+    q:         clean,
+    limit:     String(CARDAPI_LIMIT),
+    sort:      "date_desc",
+    date_from: daysAgoISO(CARDAPI_LOOKBACK)
+  });
+
+  try {
+    const r = await fetch(CARDAPI_BASE + "/sales?" + params.toString(), {
+      headers: { "x-market-api-key": CARDAPI_KEY }
+    });
+
+    if (r.status === 429) {
+      console.log("[cardapi] daily record limit reached — serving asks only");
+      return { rateLimited: true };
+    }
+    if (r.status === 401) { console.log("[cardapi] bad API key"); return null; }
+    if (!r.ok) { console.log("[cardapi] HTTP " + r.status); return null; }
+
+    const remaining = r.headers.get("x-ratelimit-remaining");
+    const body = await r.json();
+    const recs = Array.isArray(body.data) ? body.data : [];
+    const out  = summarizeSold(recs, clean);
+    out.recordsUsed = recs.length;
+    out.budgetLeft  = remaining != null ? Number(remaining) : null;
+    return out;
+  } catch (e) {
+    console.log("[cardapi] error:", e.message);
+    return null;
+  }
+}
+
+// Cache-first sold lookup. askMedian is passed in only so the history
+// row can store the ask and the sold side from the same moment.
+async function getSoldComps(query, askMedian) {
+  if (!CARDAPI_KEY) return null;
+  const key = cacheKeyFor(query);
+  if (!key) return null;
+
+  const hit = await readSoldCache(key);
+  if (hit) { hit.cached = true; return hit; }
+
+  const fresh = await fetchSoldComps(query);
+  if (!fresh || fresh.rateLimited) return fresh;
+
+  fresh.cached = false;
+  await writeSoldCache(key, fresh.query, fresh);
+  await recordPriceHistory(key, fresh.query, fresh, askMedian);
+  return fresh;
+}
+
+/* Ask vs sold — the spread nobody else shows. Sellers ask one number,
+   buyers pay another; the gap is the whole reason to check comps. */
+function askVsSold(askMedian, sold) {
+  const ask = safeNumber(askMedian, 0);
+  if (!sold || !sold.soldCount || !ask) return null;
+  const soldMed = safeNumber(sold.soldMedian, 0);
+  if (!soldMed) return null;
+  const diff = ask - soldMed;
+  const pct  = Math.round((diff / soldMed) * 100);
+  let note;
+  if (pct >= 10)       note = "Sellers are asking " + pct + "% over what buyers actually pay. Don't pay list price.";
+  else if (pct <= -10) note = "Asking prices are " + Math.abs(pct) + "% BELOW recent sales — there may be a deal listed right now.";
+  else                 note = "Asking prices are close to what buyers actually pay.";
+  return { ask: ask, sold: soldMed, diff: Math.round(diff), pct: pct, note: note };
+}
+
 // ── OpenAI scan ────────────────────────────────────────────────
 const AI_FALLBACK = (summary) => ({
   cardName: "Unknown Trading Card", player: "Unknown", year: "Unknown",
@@ -889,11 +1119,14 @@ app.get("/api/card-market", async (req, res) => {
 
     const market = await getEbayCardMarket(query);
     const clean  = normalizeCardQuery(query);
+    const sold   = await getSoldComps(clean, market.avgPrice);
 
     res.json({
       success:           true,
       cardName:          clean,
       searchQuery:       clean,
+      sold:              sold || null,
+      askVsSold:         askVsSold(market.avgPrice, sold),
       avgPrice:          market.avgPrice,
       avgSoldPrice:      market.avgPrice,
       lowPrice:          market.lowPrice,
@@ -971,6 +1204,7 @@ app.post(
       const cleanCardName = buildDisplayName(ai);
       const market        = await getCardMarketForCard(ai);
       const searchQuery   = market.searchQuery || buildCardQuery(ai) || cleanCardName;
+      const sold          = await getSoldComps(searchQuery, market.avgPrice);
 
       console.log(
         "[scan] " + cleanCardName +
@@ -980,7 +1214,9 @@ app.post(
         " | tier=" + (market.tierUsed || "-") +
         " | match=" + (market.matchQuality || "-") +
         " | n=" + market.listingCount +
-        " | median=$" + market.avgPrice
+        " | ask=$" + market.avgPrice +
+        " | sold=$" + (sold && sold.soldMedian ? sold.soldMedian : "-") +
+        " (" + (sold ? sold.soldCount : 0) + " sales" + (sold && sold.cached ? ", cached" : "") + ")"
       );
 
       return res.json({
@@ -998,6 +1234,8 @@ app.post(
         isAutograph:       !!ai.isAutograph,
         isPatch:           !!ai.isPatch,
         searchQuery:       searchQuery,
+        sold:              sold || null,
+        askVsSold:         askVsSold(market.avgPrice, sold),
         matchQuality:      market.matchQuality || "exact",
         tierUsed:          market.tierUsed     || "",
         priceNote:         market.priceNote    || "",
@@ -1028,6 +1266,80 @@ app.post(
     }
   }
 );
+
+// ── /api/sold-comps ────────────────────────────────────────────
+// Sold prices on their own, for the frontends to call after a manual
+// search correction without re-running the whole scan.
+app.get("/api/sold-comps", async (req, res) => {
+  try {
+    const query = req.query.query || req.query.cardName;
+    if (!query) return res.status(400).json({ success: false, error: "Query required" });
+    if (!CARDAPI_KEY) {
+      return res.json({ success: true, available: false,
+        error: "Sold data not configured", sold: null, askVsSold: null });
+    }
+    const market = await getEbayCardMarket(query);
+    const sold   = await getSoldComps(query, market.avgPrice);
+    res.json({
+      success:   true,
+      available: !!(sold && !sold.rateLimited),
+      query:     normalizeCardQuery(query),
+      cacheKey:  cacheKeyFor(query),
+      askMedian: market.avgPrice,
+      sold:      sold || null,
+      askVsSold: askVsSold(market.avgPrice, sold)
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: "Sold comps lookup failed", details: error.message });
+  }
+});
+
+// ── /api/price-history ─────────────────────────────────────────
+// Reads back the daily rollups CardGauge has been storing itself.
+app.get("/api/price-history", async (req, res) => {
+  try {
+    const query = req.query.query || req.query.cardName;
+    if (!query) return res.status(400).json({ success: false, error: "Query required" });
+    if (!supabaseAdmin) return res.json({ success: true, points: [], note: "History not configured" });
+
+    const key  = cacheKeyFor(query);
+    const days = Math.max(1, Math.min(Number(req.query.days || 90), 3650));
+    const { data, error } = await supabaseAdmin
+      .from("card_price_history")
+      .select("sale_date,sold_median,sold_count,ask_median,raw_median,graded_median")
+      .eq("cache_key", key)
+      .gte("sale_date", daysAgoISO(days))
+      .order("sale_date", { ascending: true });
+
+    if (error) throw new Error(error.message);
+    res.json({ success: true, cacheKey: key, query: normalizeCardQuery(query),
+               days: days, points: data || [] });
+  } catch (error) {
+    res.status(500).json({ success: false, error: "History lookup failed", details: error.message });
+  }
+});
+
+// ── /api/cardapi-status ────────────────────────────────────────
+app.get("/api/cardapi-status", async (req, res) => {
+  if (!CARDAPI_KEY) return res.json({ success: true, configured: false });
+  try {
+    const r = await fetch(CARDAPI_BASE + "/sales?q=topps+chrome&limit=1", {
+      headers: { "x-market-api-key": CARDAPI_KEY }
+    });
+    res.json({
+      success:    true,
+      configured: true,
+      ok:         r.ok,
+      status:     r.status,
+      limit:      r.headers.get("x-ratelimit-limit"),
+      remaining:  r.headers.get("x-ratelimit-remaining"),
+      lookbackDays: CARDAPI_LOOKBACK,
+      cacheTtlHours: CACHE_TTL_HOURS
+    });
+  } catch (e) {
+    res.json({ success: false, configured: true, error: e.message });
+  }
+});
 
 // ── /api/vs-market ─────────────────────────────────────────────
 const VS_MARKET_DOLLARS    = 100;
