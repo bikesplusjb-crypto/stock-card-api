@@ -4,17 +4,274 @@
    server.js — eBay EPN Affiliate v2
    + median pricing + graded/raw split
    + TIERED PARALLEL-AWARE PRICING
+   + STRIPE PRO SUBSCRIPTIONS
 ================================ */
 
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const fetch = require("node-fetch");
+const crypto = require("crypto");
 
 const app = express();
 
 // ── CORS — allow all origins (fixes Wix iframe fetch) ──────────
 app.use(cors({ origin: "*" }));
+
+/* ══════════════════════════════════════════════════════════════
+   STRIPE WEBHOOK — CardGauge Pro subscriptions
+
+   MOUNTED HERE ON PURPOSE. Stripe signs the RAW request body.
+   express.json() below rewrites the body into an object, and the
+   signature then never matches. This route must stay ABOVE
+   app.use(express.json(...)) or every webhook fails verification.
+
+   No stripe npm package needed — the signature is an HMAC and
+   node's built-in crypto does it in six lines.
+
+   Render env vars required:
+     STRIPE_SECRET_KEY          (sk_live_...)
+     STRIPE_WEBHOOK_SECRET      (whsec_... — from the Stripe webhook page)
+     SUPABASE_URL
+     SUPABASE_SERVICE_ROLE_KEY
+══════════════════════════════════════════════════════════════ */
+
+const STRIPE_SECRET_KEY     = process.env.STRIPE_SECRET_KEY || "";
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function verifyStripeSignature(rawBody, sigHeader, secret) {
+  if (!sigHeader || !secret) return false;
+
+  let timestamp = null;
+  const signatures = [];
+  String(sigHeader).split(",").forEach(part => {
+    const idx = part.indexOf("=");
+    if (idx < 0) return;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    if (k === "t") timestamp = v;
+    if (k === "v1") signatures.push(v);
+  });
+
+  if (!timestamp || !signatures.length) return false;
+
+  // Replay protection — reject anything older than 5 minutes.
+  const age = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp));
+  if (!Number.isFinite(age) || age > 300) {
+    console.log("[stripe] signature timestamp out of range (" + age + "s)");
+    return false;
+  }
+
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(timestamp + "." + rawBody, "utf8")
+    .digest("hex");
+
+  return signatures.some(sig => {
+    try {
+      return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+    } catch (e) {
+      return false;
+    }
+  });
+}
+
+async function stripeGet(path) {
+  if (!STRIPE_SECRET_KEY) {
+    console.log("[stripe] STRIPE_SECRET_KEY missing — cannot look up " + path);
+    return null;
+  }
+  try {
+    const r = await fetch("https://api.stripe.com/v1/" + path, {
+      headers: { Authorization: "Bearer " + STRIPE_SECRET_KEY }
+    });
+    if (!r.ok) {
+      console.log("[stripe] GET " + path + " -> HTTP " + r.status);
+      return null;
+    }
+    return await r.json();
+  } catch (e) {
+    console.log("[stripe] GET error:", e.message);
+    return null;
+  }
+}
+
+/* The canonical email is whatever the user logs into CardGauge with,
+   because is_pro() matches the auth token against pro_users.email.
+   Stripe's prefilled email is editable at checkout, so it is only a
+   fallback — the Supabase user id passed as client_reference_id is
+   what makes the match reliable. */
+async function emailFromUserId(userId) {
+  if (!supabaseAdmin || !userId || !UUID_RE.test(String(userId))) return null;
+  try {
+    const { data, error } = await supabaseAdmin.auth.admin.getUserById(String(userId));
+    if (error || !data || !data.user) return null;
+    const email = String(data.user.email || "").trim().toLowerCase();
+    return email || null;
+  } catch (e) {
+    console.log("[stripe] user lookup failed:", e.message);
+    return null;
+  }
+}
+
+async function emailFromCustomer(customerId) {
+  if (!customerId) return null;
+  const c = await stripeGet("customers/" + customerId);
+  if (!c || c.deleted) return null;
+  const email = String(c.email || "").trim().toLowerCase();
+  return email || null;
+}
+
+async function setProStatus(email, active, note) {
+  if (!supabaseAdmin) {
+    console.log("[stripe] no Supabase client — cannot update pro_users");
+    return false;
+  }
+  if (!email) return false;
+
+  const clean = String(email).trim().toLowerCase();
+
+  try {
+    const { data: existing, error: readErr } = await supabaseAdmin
+      .from("pro_users")
+      .select("id")
+      .eq("email", clean)
+      .maybeSingle();
+
+    if (readErr) throw new Error(readErr.message);
+
+    if (existing && existing.id) {
+      const { error } = await supabaseAdmin
+        .from("pro_users")
+        .update({ active: active, source: "stripe", note: note || null })
+        .eq("id", existing.id);
+      if (error) throw new Error(error.message);
+    } else {
+      const { error } = await supabaseAdmin
+        .from("pro_users")
+        .insert({ email: clean, active: active, source: "stripe", note: note || null });
+      if (error) throw new Error(error.message);
+    }
+
+    console.log("[stripe] pro_users " + clean + " -> active=" + active);
+    return true;
+  } catch (e) {
+    console.log("[stripe] pro_users write FAILED for " + clean + ":", e.message);
+    return false;
+  }
+}
+
+app.post(
+  "/api/stripe-webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const raw = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : "";
+    const sig = req.headers["stripe-signature"];
+
+    if (!STRIPE_WEBHOOK_SECRET) {
+      console.log("[stripe] STRIPE_WEBHOOK_SECRET not set — rejecting webhook");
+      return res.status(500).send("webhook secret not configured");
+    }
+
+    if (!verifyStripeSignature(raw, sig, STRIPE_WEBHOOK_SECRET)) {
+      console.log("[stripe] BAD SIGNATURE — rejected");
+      return res.status(400).send("invalid signature");
+    }
+
+    let event;
+    try {
+      event = JSON.parse(raw);
+    } catch (e) {
+      return res.status(400).send("bad payload");
+    }
+
+    const type = event.type || "";
+    const obj  = (event.data && event.data.object) || {};
+
+    try {
+      if (type === "checkout.session.completed") {
+        // Ignore one-off payments — Pro is a subscription.
+        if (obj.mode && obj.mode !== "subscription") {
+          console.log("[stripe] checkout completed in mode=" + obj.mode + " — ignored");
+        } else {
+          let email = await emailFromUserId(obj.client_reference_id);
+          let via   = "client_reference_id";
+
+          if (!email) {
+            email = String(
+              (obj.customer_details && obj.customer_details.email) || obj.customer_email || ""
+            ).trim().toLowerCase() || null;
+            via = "checkout email";
+          }
+          if (!email && obj.customer) {
+            email = await emailFromCustomer(obj.customer);
+            via = "stripe customer";
+          }
+
+          if (email) {
+            await setProStatus(email, true, "Stripe subscribe via " + via);
+          } else {
+            console.log("[stripe] checkout.session.completed with NO resolvable email — session " + (obj.id || "?"));
+          }
+        }
+      }
+
+      else if (type === "customer.subscription.deleted") {
+        const email = await emailFromCustomer(obj.customer);
+        if (email) await setProStatus(email, false, "Stripe subscription canceled");
+        else console.log("[stripe] cancel event but no email for customer " + obj.customer);
+      }
+
+      else if (type === "customer.subscription.updated") {
+        const status = obj.status || "";
+        const email  = await emailFromCustomer(obj.customer);
+        if (!email) {
+          console.log("[stripe] update event but no email for customer " + obj.customer);
+        } else if (status === "active" || status === "trialing") {
+          await setProStatus(email, true, "Stripe subscription " + status);
+        } else if (status === "canceled" || status === "unpaid" || status === "incomplete_expired") {
+          await setProStatus(email, false, "Stripe subscription " + status);
+        } else {
+          // past_due, incomplete, paused — leave access alone, Stripe is retrying.
+          console.log("[stripe] subscription " + status + " for " + email + " — access unchanged");
+        }
+      }
+
+      else if (type === "invoice.payment_failed") {
+        /* Deliberately does NOT revoke access. Stripe retries a failed
+           card for about two weeks; if it never clears, Stripe cancels
+           the subscription and customer.subscription.deleted fires,
+           which is what actually turns Pro off. Killing access on the
+           first failed charge punishes people whose card just expired. */
+        console.log("[stripe] payment failed for customer " + obj.customer + " — access left ON, Stripe will retry");
+      }
+
+      else {
+        console.log("[stripe] ignored event: " + type);
+      }
+    } catch (e) {
+      console.error("[stripe] handler error on " + type + ":", e.message);
+    }
+
+    // Always 200 once the signature checked out, or Stripe retries forever.
+    res.json({ received: true, type: type });
+  }
+);
+
+// Safe config check — never returns key values, only whether they exist.
+app.get("/api/stripe-status", (req, res) => {
+  res.json({
+    success: true,
+    secretKeySet:     !!STRIPE_SECRET_KEY,
+    webhookSecretSet: !!STRIPE_WEBHOOK_SECRET,
+    supabaseAdmin:    !!supabaseAdmin,
+    liveMode:         STRIPE_SECRET_KEY.indexOf("sk_live") === 0,
+    ready:            !!(STRIPE_SECRET_KEY && STRIPE_WEBHOOK_SECRET && supabaseAdmin)
+  });
+});
+
+// ── Body parsers — everything BELOW this line gets parsed JSON ──
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -1589,4 +1846,8 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`CardGauge backend running on port ${PORT}`);
   console.log(`eBay EPN affiliate active — campid: ${EPN_CAMPAIGN_ID}`);
+  console.log(
+    "Stripe Pro webhook: " +
+    (STRIPE_SECRET_KEY && STRIPE_WEBHOOK_SECRET ? "configured" : "NOT configured — set STRIPE_SECRET_KEY + STRIPE_WEBHOOK_SECRET")
+  );
 });
