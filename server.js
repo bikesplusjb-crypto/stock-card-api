@@ -1738,6 +1738,258 @@ app.post(
   }
 );
 
+// ── /api/grade-estimate ────────────────────────────────────────
+//
+//  Powers /grade-prescreen. The page was live and linked from both
+//  scanners, but this endpoint did not exist — every submission returned
+//  "endpoint not found".
+//
+//  Two rules govern the whole thing:
+//
+//   1. It is a PRE-SCREEN, not a grade. A camera cannot see the fine
+//      scratches and print lines a grader catches under magnification, so
+//      the answer is a RANGE and the surface score is always the least
+//      trustworthy number on the page.
+//
+//   2. What the user reports from having the card in hand may only ever
+//      LOWER the estimate. The page promises this in writing. Someone
+//      holding the card knows more than the photo does about damage, but
+//      "looks clean to me" is not evidence of a 10.
+// ═══════════════════════════════════════════════════════════════
+
+/* Hard ceilings. A crease is the brutal one — graders cap creased cards
+   in the 2-4 range no matter how good everything else looks, which is
+   exactly the outcome someone needs to know BEFORE paying to submit. */
+const CONDITION_CAPS = {
+  surface: {
+    "clean": 10,
+    "light scratches": 8,
+    "visible scratches or print lines": 6
+  },
+  corners: {
+    "sharp": 10,
+    "slight softness": 8,
+    "rounded or dinged": 6
+  },
+  edges: {
+    "clean": 10,
+    "minor whitening": 8,
+    "chipping or heavy whitening": 6
+  },
+  creases: {
+    "none": 10,
+    "has a crease or bend": 3
+  }
+};
+
+// Sub-scores (0-100) the reported condition also can't exceed.
+const CONDITION_SUB_CAPS = {
+  surface: { "light scratches": 62, "visible scratches or print lines": 34 },
+  corners: { "slight softness": 62, "rounded or dinged": 34 },
+  edges:   { "minor whitening": 62, "chipping or heavy whitening": 34 },
+  creases: { "has a crease or bend": 20 }
+};
+
+const GRADE_FALLBACK = (reason) => ({
+  gradeLow: 0, gradeHigh: 0,
+  subgrades: { centering: 0, corners: 0, edges: 0, surface: 0 },
+  findings: [], confidence: "Lower", cardName: "",
+  summary: reason
+});
+
+async function gradeWithOpenAI(frontFile, backFile, condition, notes) {
+  if (!process.env.OPENAI_API_KEY) return GRADE_FALLBACK("OpenAI API key missing.");
+
+  const images = [{ type: "image_url", image_url: { url: fileToDataUrl(frontFile) } }];
+  if (backFile) images.push({ type: "image_url", image_url: { url: fileToDataUrl(backFile) } });
+
+  const reported = Object.keys(condition || {})
+    .filter(k => condition[k])
+    .map(k => k + ": " + condition[k])
+    .join("; ");
+
+  const userText =
+    "Pre-screen this trading card for grading. Return ONLY a JSON object with these exact keys: "
+    + "cardName, gradeLow, gradeHigh, centering, corners, edges, surface, findings, confidence, summary.\\n\\n"
+    + "HOW TO SCORE:\\n"
+    + "- gradeLow and gradeHigh are WHOLE NUMBERS from 1 to 10 describing the likely PSA range. "
+    + "The gap between them is your uncertainty — never return the same number for both unless the card is obviously damaged.\\n"
+    + "- centering, corners, edges and surface are each 0-100.\\n"
+    + "- BE CONSERVATIVE. A 10 requires near-perfect centering, four sharp corners, clean edges and a flawless surface. "
+    + "Most raw cards from a pack are 8-9. If you are unsure, score lower and widen the range.\\n"
+    + "- CENTERING is the one factor a photo shows reliably: compare the border widths left-to-right and top-to-bottom on BOTH sides. "
+    + "A 60/40 border is roughly a 9; 65/35 is an 8; worse than 70/30 caps most cards at 7.\\n"
+    + "- SURFACE is the least reliable from a photo. Say so in your summary and keep the range wide unless damage is clearly visible.\\n"
+    + "- findings is an array of 2-5 SHORT plain-English observations, each naming what you saw and where "
+    + "(e.g. 'Left border noticeably wider than right on the front', 'Slight whitening along the bottom edge'). "
+    + "Never invent a flaw you cannot see. If the card looks clean, say that.\\n"
+    + "- confidence must be exactly one of: Lower, Moderate, Higher. Use Lower when only one side was provided, "
+    + "when the photo is blurry or glare-heavy, or when the card is sleeved.\\n"
+    + "- cardName: identify the card if you can (year, brand, set, player). Empty string if you cannot.\\n"
+    + "- Never estimate a dollar value.\\n\\n"
+    + (reported ? ("THE OWNER IS HOLDING THE CARD AND REPORTS: " + reported
+        + ". Treat this as reliable evidence of damage the photo may not show. It may lower your scores. "
+        + "It must NEVER raise them.\\n") : "")
+    + (notes ? ("OWNER'S NOTES: " + String(notes).slice(0, 500) + "\\n") : "")
+    + (backFile ? "" : "ONLY THE FRONT was provided — centering and edges cannot be fully judged. Use Lower confidence and widen the range.\\n");
+
+  const payload = {
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: "You are a conservative trading card grading pre-screener. You examine photos and estimate a likely grade RANGE, never a single definitive grade. You know a camera cannot resolve fine surface scratches or print lines, and you say so. You return ONLY valid JSON with no markdown, no code fences, and no commentary. You never estimate dollar values. You would rather under-promise a grade than have someone waste money on a submission." },
+      { role: "user", content: [{ type: "text", text: userText }, ...images] }
+    ],
+    temperature: 0.2,
+    max_tokens: 800
+  };
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+    const rawText = await response.text();
+    if (!response.ok) {
+      console.error("[grade] OpenAI error:", rawText.slice(0, 300));
+      return GRADE_FALLBACK("AI could not read this card.");
+    }
+    const apiData = JSON.parse(rawText);
+    const content = (apiData && apiData.choices && apiData.choices[0]
+                     && apiData.choices[0].message && apiData.choices[0].message.content) || "";
+    return JSON.parse(cleanJsonText(content));
+  } catch (e) {
+    console.log("[grade] parse/network error:", e.message);
+    return GRADE_FALLBACK("AI result could not be read.");
+  }
+}
+
+function clampGrade(n, fallback) {
+  const v = Math.round(Number(n));
+  if (!Number.isFinite(v) || v < 1 || v > 10) return fallback;
+  return v;
+}
+function clampSub(n) {
+  const v = Math.round(Number(n));
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(0, Math.min(100, v));
+}
+
+app.post(
+  "/api/grade-estimate",
+  upload.fields([{ name: "front", maxCount: 1 }, { name: "back", maxCount: 1 }]),
+  async (req, res) => {
+    try {
+      const front = (req.files && req.files.front && req.files.front[0]) || null;
+      const back  = (req.files && req.files.back  && req.files.back[0])  || null;
+      if (!front) return res.status(400).json({ success: false, error: "Front image required" });
+
+      let condition = {};
+      try { condition = JSON.parse(req.body.condition || "{}") || {}; } catch (e) { condition = {}; }
+      const notes = String(req.body.notes || "").slice(0, 500);
+
+      const ai = await gradeWithOpenAI(front, back, condition, notes);
+
+      let low  = clampGrade(ai.gradeLow, 0);
+      let high = clampGrade(ai.gradeHigh, 0);
+      if (!low && !high) {
+        return res.json({
+          success: false,
+          error: ai.summary || "Could not pre-screen this card. Try a flatter, brighter photo."
+        });
+      }
+      if (!low)  low  = Math.max(1, high - 2);
+      if (!high) high = Math.min(10, low + 2);
+      if (low > high) { const t = low; low = high; high = t; }
+
+      const subs = {
+        centering: clampSub(ai.centering),
+        corners:   clampSub(ai.corners),
+        edges:     clampSub(ai.edges),
+        surface:   clampSub(ai.surface)
+      };
+
+      /* Apply what the owner reported. Downward only — the page promises
+         exactly that, and it is the honest direction anyway: a hand can
+         confirm damage a camera missed, but "looks clean to me" is not
+         evidence of a 10. */
+      const capsHit = [];
+      Object.keys(CONDITION_CAPS).forEach(group => {
+        const val = condition[group];
+        if (!val) return;
+        const cap = CONDITION_CAPS[group][val];
+        if (cap != null && high > cap) {
+          high = cap;
+          capsHit.push(group + " (" + val + ")");
+        }
+        if (cap != null && low > cap) low = Math.max(1, cap - 1);
+
+        const subCap = CONDITION_SUB_CAPS[group] && CONDITION_SUB_CAPS[group][val];
+        if (subCap != null) {
+          const target = group === "creases" ? "surface" : group;
+          if (subs[target] > subCap) subs[target] = subCap;
+        }
+      });
+      if (low > high) low = high;
+
+      /* A crease is the one flaw worth stating outright. Graders cap
+         creased cards in the low single digits regardless of how good the
+         rest of the card looks, and that is precisely what somebody needs
+         to hear BEFORE paying for a submission. */
+      const creased = condition.creases === "has a crease or bend";
+
+      let confidence = String(ai.confidence || "Moderate");
+      if (!/^(Lower|Moderate|Higher)$/i.test(confidence)) confidence = "Moderate";
+      if (!back) confidence = "Lower";
+      if (capsHit.length && !/lower/i.test(confidence)) confidence = "Moderate";
+
+      const findings = Array.isArray(ai.findings)
+        ? ai.findings.filter(Boolean).map(f => String(f).slice(0, 160)).slice(0, 5)
+        : [];
+      if (creased) {
+        findings.unshift("You reported a crease or bend — graders cap creased cards at roughly a 3, whatever else the card has going for it.");
+      }
+      if (!back) {
+        findings.push("Only the front was uploaded, so back centering and edges could not be checked.");
+      }
+
+      const surfaceCaveat = creased
+        ? "A crease is the one thing that makes this decision easy: at a 3 or below, grading almost never pays unless the card is genuinely rare. Check sold comps for graded 3s before you spend anything."
+        : "Surface is the factor a photo shows worst. Graders catch fine scratches and print lines under magnification and strong light that a camera will not resolve — the real grade can land below this range for reasons no photo would have revealed.";
+
+      console.log(
+        "[grade] " + (ai.cardName || "unidentified") +
+        " | back=" + (back ? "yes" : "no") +
+        " | range=" + low + "-" + high +
+        " | conf=" + confidence +
+        " | reported=" + (Object.keys(condition).filter(k => condition[k]).length || 0) +
+        " | caps=" + (capsHit.join(",") || "-")
+      );
+
+      return res.json({
+        success: true,
+        cardName: String(ai.cardName || ""),
+        gradeLow: low,
+        gradeHigh: high,
+        confidence: confidence,
+        subgrades: subs,
+        findings: findings,
+        surfaceCaveat: surfaceCaveat,
+        usedBack: !!back,
+        reportedCondition: condition,
+        summary: String(ai.summary || ""),
+        timestamp: Date.now()
+      });
+    } catch (error) {
+      console.error("[grade] server error:", error);
+      return res.status(500).json({ success: false, error: "Pre-screen failed on server", details: error.message });
+    }
+  }
+);
+
 // ── /api/sold-comps ────────────────────────────────────────────
 // Sold prices on their own, for the frontends to call after a manual
 // search correction without re-running the whole scan.
