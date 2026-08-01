@@ -578,7 +578,10 @@ function trimOverlap(setName, brandName) {
 function cardNumberToken(ai) {
   const n = cleanVal(ai.cardNumber);
   if (!n) return "";
-  return "#" + n.replace(/^#/, "");
+  const bare = n.replace(/^#/, "");
+  // Pokemon numbers are written "074/073" in listing titles, never "#074/073".
+  if (bare.indexOf("/") > -1) return bare;
+  return "#" + bare;
 }
 
 // The serial DENOMINATOR is searchable ("/99"). The copy number is not.
@@ -631,6 +634,25 @@ function parallelTerms(ai) {
     .filter(w => w.length > 2 && w !== "parallel");
 }
 
+/* Pokemon needs its own query shape, and the lack of it was the whole
+   problem.
+
+   buildQueryTiers builds every search around `player`. A Pokemon card has
+   no player, so when the AI left that field empty the search collapsed to
+   year + brand + set — a nameless query that matches half the set and
+   returns junk. The Pokemon's NAME is the player.
+
+   The variant also has to come out of the keyword query. eBay ANDs
+   keywords, and a seller listing a Coalossal VMAX rarely types "Full Art"
+   even when it is one. Requiring it returns nothing. The variant still
+   filters titles further down in selectListings, which is the right place
+   for it: narrow the results, don't narrow the search. */
+function isPokemon(ai) {
+  const hay = [ai && ai.sport, ai && ai.brand, ai && ai.set, ai && ai.cardName]
+    .map(v => String(v || "").toLowerCase()).join(" ");
+  return hay.indexOf("pok") > -1;
+}
+
 function buildQueryTiers(ai) {
   const year   = cleanVal(ai.year);
   const brand  = cleanVal(ai.brand);
@@ -643,9 +665,18 @@ function buildQueryTiers(ai) {
   const grade  = (cleanVal(ai.gradeCompany) && cleanVal(ai.gradeValue))
                  ? cleanVal(ai.gradeCompany) + " " + cleanVal(ai.gradeValue) : "";
 
-  const tight = joinParts([year, brand, set, player, par, num, grade]);
-  const core  = joinParts([year, brand, player, num, grade]);
-  const loose = joinParts([year, brand, player]);
+  let tight, core, loose;
+  if (isPokemon(ai)) {
+    // "pokemon" is forced in so eBay lands in the right category, and the
+    // variant is deliberately left out of the keywords.
+    tight = joinParts(["pokemon", player, set, num, grade]);
+    core  = joinParts(["pokemon", player, num, grade]);
+    loose = joinParts(["pokemon", player]);
+  } else {
+    tight = joinParts([year, brand, set, player, par, num, grade]);
+    core  = joinParts([year, brand, player, num, grade]);
+    loose = joinParts([year, brand, player]);
+  }
 
   const tiers = [];
   if (tight) tiers.push({ tier: "tight", query: tight });
@@ -1267,7 +1298,7 @@ async function scanWithOpenAI(frontFile, backFile) {
     messages: [
       { role: "system", content: "You are an expert trading card identifier. You examine photos of sports cards, Pokemon cards, TCG cards, graded slabs, and sealed product. You return ONLY valid JSON with no markdown, no code fences, and no commentary. You never estimate dollar values." },
       { role: "user", content: [
-        { type: "text", text: "Identify this card as precisely as possible. Return ONLY a JSON object with these exact keys: cardName, player, year, brand, set, cardNumber, sport, parallel, serialNumber, isRookie, isAutograph, isPatch, gradeCompany, gradeValue, signal, confidence, summary.\n\nCRITICAL — PARALLEL IDENTIFICATION. Parallels change a card's value by 10x or more, so look carefully before concluding a card is base:\n- Border color is the main tell. Panini Prizm/Select/Optic parallels are named by color: Silver, Red, Blue, Green, Orange, Purple, Gold, Black, Pink, Camo, Mojo, Wave, Hyper, Disco, Shimmer, Ice.\n- Topps Chrome parallels: Refractor, X-Fractor, Prism, Atomic, Sepia, Gold, Orange, Red, SuperFractor, Negative, Speckle.\n- POKEMON: the variant matters as much as any colour parallel. Report it in the parallel field. Vintage: 1st Edition (look for the black stamp to the left of the artwork), Shadowless (no drop shadow on the right of the art box). Any era: Reverse Holo (the CARD BODY is foil, the artwork is not), Full Art, Alt Art, Rainbow Rare, Gold Secret Rare, Illustration Rare. Do NOT write Unlimited or Regular \u2014 that is the base printing, so leave parallel empty.\n- Look for rainbow/foil sheen, cracked-ice texture, sparkle, or a colored border that differs from the base design.\n- Look for serial numbering printed on the front or back, usually small, formatted like 25/99 or /99. Report it exactly as printed in serialNumber. POKEMON CARD NUMBERS ARE NOT SERIAL NUMBERING: 074/073, 4/102 and SV107/SV122 are the card's number within its set. Put those in cardNumber and leave serialNumber EMPTY.\n- '1/1' or 'One of One' is critical — always report it.\n- If you see a colored border or foil pattern but cannot name the exact parallel, use the color plus the word Parallel, e.g. 'Blue Parallel'.\n- Use an empty string for parallel ONLY if the card is clearly a plain base card.\n\nSET FIELD RULES — IMPORTANT:\n- The 'set' field must be the actual product/subset name as it would appear in an eBay listing title, for example 'Update Series', 'Draft Picks', 'Downtown', 'Kaboom'.\n- If the card is just the base set of the product, return an EMPTY STRING for set. Never return 'Base', 'Base Set', 'Base Rookie', or 'Common' — those words do not appear in listing titles and break the price search.\n\nOTHER RULES:\n- If a back image is provided, TRUST THE BACK for card number, set name, and copyright year — printed text beats inferring from the front design.\n- If the card is in a graded slab, read the label for company, grade, year, player, set, and card number.\n- isRookie, isAutograph, isPatch must be true or false booleans.\n- signal must be one of: GRADE, WATCH, SELL RAW, HOT, VERIFY.\n- confidence must be High, Medium, or Low. Use Low if the image is blurry or you are unsure about the parallel.\n- Never guess a dollar value. Never include price fields." },
+        { type: "text", text: "Identify this card as precisely as possible. Return ONLY a JSON object with these exact keys: cardName, player, year, brand, set, cardNumber, sport, parallel, serialNumber, isRookie, isAutograph, isPatch, gradeCompany, gradeValue, signal, confidence, summary.\n\nTHE SINGLE MOST IMPORTANT FIELD IS player. Never leave it empty.\n- On a sports card it is the athlete's name.\n- ON A POKEMON OR TCG CARD IT IS THE CREATURE'S NAME, including its suffix exactly as printed: 'Coalossal VMAX', 'Charizard V', 'Umbreon VMAX', 'Pikachu ex', 'Mewtwo GX'. Set sport to 'Pokemon' and brand to 'Pokemon'. Without the name every price lookup fails, so read it off the top of the card even if the rest of the card is unclear.\n\nCRITICAL — PARALLEL IDENTIFICATION. Parallels change a card's value by 10x or more, so look carefully before concluding a card is base:\n- Border color is the main tell. Panini Prizm/Select/Optic parallels are named by color: Silver, Red, Blue, Green, Orange, Purple, Gold, Black, Pink, Camo, Mojo, Wave, Hyper, Disco, Shimmer, Ice.\n- Topps Chrome parallels: Refractor, X-Fractor, Prism, Atomic, Sepia, Gold, Orange, Red, SuperFractor, Negative, Speckle.\n- POKEMON: the variant matters as much as any colour parallel. Report it in the parallel field. Vintage: 1st Edition (look for the black stamp to the left of the artwork), Shadowless (no drop shadow on the right of the art box). Any era: Reverse Holo (the CARD BODY is foil, the artwork is not), Full Art, Alt Art, Rainbow Rare, Gold Secret Rare, Illustration Rare. Do NOT write Unlimited or Regular \u2014 that is the base printing, so leave parallel empty.\n- Look for rainbow/foil sheen, cracked-ice texture, sparkle, or a colored border that differs from the base design.\n- Look for serial numbering printed on the front or back, usually small, formatted like 25/99 or /99. Report it exactly as printed in serialNumber. POKEMON CARD NUMBERS ARE NOT SERIAL NUMBERING: 074/073, 4/102 and SV107/SV122 are the card's number within its set. Put those in cardNumber and leave serialNumber EMPTY.\n- '1/1' or 'One of One' is critical — always report it.\n- If you see a colored border or foil pattern but cannot name the exact parallel, use the color plus the word Parallel, e.g. 'Blue Parallel'.\n- Use an empty string for parallel ONLY if the card is clearly a plain base card.\n\nSET FIELD RULES — IMPORTANT:\n- The 'set' field must be the actual product/subset name as it would appear in an eBay listing title, for example 'Update Series', 'Draft Picks', 'Downtown', 'Kaboom'.\n- If the card is just the base set of the product, return an EMPTY STRING for set. Never return 'Base', 'Base Set', 'Base Rookie', or 'Common' — those words do not appear in listing titles and break the price search.\n\nOTHER RULES:\n- If a back image is provided, TRUST THE BACK for card number, set name, and copyright year — printed text beats inferring from the front design.\n- If the card is in a graded slab, read the label for company, grade, year, player, set, and card number.\n- isRookie, isAutograph, isPatch must be true or false booleans.\n- signal must be one of: GRADE, WATCH, SELL RAW, HOT, VERIFY.\n- confidence must be High, Medium, or Low. Use Low if the image is blurry or you are unsure about the parallel.\n- Never guess a dollar value. Never include price fields." },
         ...images
       ]}
     ],
