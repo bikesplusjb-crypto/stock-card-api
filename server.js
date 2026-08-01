@@ -434,11 +434,17 @@ function gradeBreakdown(gradedItems) {
 
 /* How far apart are the listings? A typical ask of $19 with a high ask
    of $300 means the search is matching several different cards, not one.
-   Worth telling the user rather than quietly reporting the median. */
-/* 4x between the typical ask and the trimmed high is enough to mean the
+   Worth telling the user rather than quietly reporting the median.
+
+   4x between the typical ask and the trimmed high is enough to mean the
    search is catching more than one card. Two real examples set this line:
    "topps finest ohtani" ran 15x, "topps chrome judge" ran 4.2x, and both
-   were mixing base cards with autos and parallels. */
+   were mixing base cards with autos and parallels.
+
+   NOTE: the scanner frontend runs its own spread check against SOLD
+   prices at a 3x threshold. The two are independent on purpose — this
+   one measures asking prices, that one measures completed sales — but
+   if you tune one, look at the other. */
 const WIDE_SPREAD_AT = 4;
 
 function spreadRatio(sortedPrices) {
@@ -572,6 +578,45 @@ function serialDenominator(ai) {
   return "/" + denom;
 }
 
+function titleHasParallel(title, terms) {
+  if (!terms.length) return false;
+  const t = " " + String(title || "").toLowerCase() + " ";
+  return terms.every(term => t.includes(term));
+}
+
+/* Serial matching has to respect digit boundaries.
+
+   The old substring test was wrong in both directions:
+     "/9"  matched  "/99" and "/999"
+     "1/1" matched  "1/100"  (the string "1/100" contains "1/1")
+
+   A 1/1 filter that quietly admits every /100 listing produces exactly
+   the kind of wide spread the frontend then has to apologise for. The
+   digit after the denominator must not be another digit. */
+function titleHasSerial(title, denom) {
+  if (!denom) return false;
+  const t = String(title || "").replace(/\s+/g, "").toLowerCase();
+
+  if (denom === "1/1") {
+    // Not preceded or followed by another digit: "1/1" yes, "1/100" no,
+    // "11/1" no.
+    return /(^|[^0-9])1\/1([^0-9]|$)/.test(t);
+  }
+
+  const digits = denom.replace(/[^0-9]/g, "");
+  if (!digits) return false;
+  return new RegExp("/" + digits + "([^0-9]|$)").test(t);
+}
+
+function parallelTerms(ai) {
+  const par = cleanVal(ai.parallel);
+  if (!par || GENERIC_SET.test(par)) return [];
+  return par.toLowerCase()
+    .replace(/[^a-z0-9\- ]/g, " ")
+    .split(/\s+/)
+    .filter(w => w.length > 2 && w !== "parallel");
+}
+
 function buildQueryTiers(ai) {
   const year   = cleanVal(ai.year);
   const brand  = cleanVal(ai.brand);
@@ -593,26 +638,6 @@ function buildQueryTiers(ai) {
   if (core && core !== tight) tiers.push({ tier: "core", query: core });
   if (loose && loose !== core && loose !== tight) tiers.push({ tier: "loose", query: loose });
   return tiers;
-}
-
-function parallelTerms(ai) {
-  const par = cleanVal(ai.parallel);
-  if (!par || GENERIC_SET.test(par)) return [];
-  return par.toLowerCase()
-    .replace(/[^a-z0-9\- ]/g, " ")
-    .split(/\s+/)
-    .filter(w => w.length > 2 && w !== "parallel");
-}
-
-function titleHasParallel(title, terms) {
-  if (!terms.length) return false;
-  const t = " " + String(title || "").toLowerCase() + " ";
-  return terms.every(term => t.includes(term));
-}
-
-function titleHasSerial(title, denom) {
-  if (!denom) return false;
-  return String(title || "").replace(/\s+/g, "").toLowerCase().includes(denom);
 }
 
 function titleLooksParallel(title, brandName) {
@@ -801,6 +826,7 @@ function summarizeListings(listings, cleanQuery, extra) {
   const rawGroup    = listings.filter(x => !x.graded);
   const gradedGroup = listings.filter(x =>  x.graded);
   const spread = spreadRatio(prices);
+  const wide   = spread >= WIDE_SPREAD_AT;
 
   const base = {
     query:          cleanQuery,
@@ -809,7 +835,7 @@ function summarizeListings(listings, cleanQuery, extra) {
     highPrice:      range.high,
     listingCount:   listings.length,
     spreadRatio:    Number(spread.toFixed(1)),
-    wideSpread:     spread >= WIDE_SPREAD_AT,
+    wideSpread:     wide,
     image:          (listings.find(x => x.image) || {}).image || "",
     priceSource:    listings.length ? "eBay active card listings (median)" : "No clean card listings found",
     raw:            summarizeGroup(rawGroup),
@@ -818,12 +844,23 @@ function summarizeListings(listings, cleanQuery, extra) {
     listings
   };
 
-  // Only set a note if the caller hasn't already written a better one.
-  if (base.wideSpread && !(extra && extra.priceNote)) {
-    base.matchQuality = "loose";
-    base.priceNote =
+  /* The spread warning used to be skipped entirely whenever the caller
+     supplied its own priceNote — and getCardMarketForCard ALWAYS supplies
+     one. So every scanned card silently lost this warning while typed
+     searches kept it, for the same underlying data.
+
+     Now the warning always gets written to its own field. priceNote still
+     defers to the caller's more specific note (which explains WHICH
+     listings were priced), so nothing is overwritten and no scan loses the
+     signal. */
+  if (wide) {
+    base.spreadNote =
       "These listings vary a lot — the search is probably matching several " +
       "different cards. Edit the search below to narrow it down.";
+    if (!(extra && extra.priceNote)) {
+      base.matchQuality = "loose";
+      base.priceNote = base.spreadNote;
+    }
   }
 
   return Object.assign(base, extra || {});
@@ -835,7 +872,7 @@ const EMPTY_MARKET = (q, source) => ({
   raw: { count:0, median:0, low:0, high:0, thin:false },
   graded: { count:0, median:0, low:0, high:0, thin:false },
   gradeBreakdown: [], listings: [],
-  spreadRatio: 0, wideSpread: false
+  spreadRatio: 0, wideSpread: false, spreadNote: ""
 });
 
 // Plain text-query lookup (used by /api/card-market, /api/card-price,
@@ -921,8 +958,23 @@ const CARDAPI_LOOKBACK = Number(process.env.CARDAPI_LOOKBACK_DAYS || 14); // Sta
 const CARDAPI_LIMIT    = Number(process.env.CARDAPI_LIMIT || 100);
 const CACHE_TTL_HOURS  = Number(process.env.SOLD_CACHE_TTL_HOURS || 12);
 
-function cacheKeyFor(query) {
-  return normalizeCardQuery(query).toLowerCase().replace(/\s+/g, " ").trim().slice(0, 300);
+/* Refinement queries — the scanner's "PSA 10 / Raw only" chips — cost a
+   full records pull each, on top of the original scan. One card explored
+   through three chips was spending 400 records against a 10,000/day
+   budget instead of 100, and that cost scales with exactly the engagement
+   we're trying to grow.
+
+   A median off 50 sales is not meaningfully worse than a median off 100,
+   so refinements ask for half. The frontend flags them with compact=1. */
+const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
+
+/* The cache key must carry the limit. Without it a 50-record compact pull
+   gets stored under the same key as a full lookup and is then served back
+   as though it were one. */
+function cacheKeyFor(query, limit) {
+  const base = normalizeCardQuery(query).toLowerCase().replace(/\s+/g, " ").trim().slice(0, 280);
+  const n = Number(limit || CARDAPI_LIMIT);
+  return n === CARDAPI_LIMIT ? base : base + "#" + n;
 }
 
 function daysAgoISO(n) {
@@ -951,7 +1003,7 @@ function soldGradeBreakdown(records) {
     }));
 }
 
-function summarizeSold(records, query) {
+function summarizeSold(records, query, limitUsed) {
   const clean = records
     .map(r => ({
       price:       safeNumber(r.price, 0),
@@ -973,7 +1025,8 @@ function summarizeSold(records, query) {
       soldCount: 0, soldMedian: 0, soldLow: 0, soldHigh: 0,
       soldRaw: { count: 0, median: 0 }, soldGraded: { count: 0, median: 0 },
       soldGradeBreakdown: [], bestOfferCount: 0, lastSaleDate: null,
-      sales: [], query: query, lookbackDays: CARDAPI_LOOKBACK
+      sales: [], query: query, lookbackDays: CARDAPI_LOOKBACK,
+      limitUsed: limitUsed || CARDAPI_LIMIT
     };
   }
 
@@ -1000,6 +1053,10 @@ function summarizeSold(records, query) {
     soldBasis:     useRaw ? "raw" : "all",
     soldMedianAll: median(prices),
     soldCountUsed: headline.length,
+    /* The frontend prints "100+" when the count hits the limit, because a
+       count sitting exactly at the ceiling is a ceiling and not a total.
+       It needs to know what the ceiling actually was. */
+    limitUsed:     limitUsed || CARDAPI_LIMIT,
     soldRaw:    { count: raw.length,    median: median(rawP) },
     soldGraded: { count: graded.length, median: median(grP) },
     soldGradeBreakdown: soldGradeBreakdown(clean),
@@ -1059,14 +1116,16 @@ async function recordPriceHistory(key, query, sold, askMedian) {
   } catch (e) {}
 }
 
-async function fetchSoldComps(query) {
+async function fetchSoldComps(query, limit) {
   if (!CARDAPI_KEY) return null;
   const clean = normalizeCardQuery(query);
   if (!clean || clean.length < 4) return null;   // their q needs 4+ chars
 
+  const useLimit = Number(limit || CARDAPI_LIMIT);
+
   const params = new URLSearchParams({
     q:         clean,
-    limit:     String(CARDAPI_LIMIT),
+    limit:     String(useLimit),
     sort:      "date_desc",
     date_from: daysAgoISO(CARDAPI_LOOKBACK)
   });
@@ -1086,7 +1145,7 @@ async function fetchSoldComps(query) {
     const remaining = r.headers.get("x-ratelimit-remaining");
     const body = await r.json();
     const recs = Array.isArray(body.data) ? body.data : [];
-    const out  = summarizeSold(recs, clean);
+    const out  = summarizeSold(recs, clean, useLimit);
     out.recordsUsed = recs.length;
     out.budgetLeft  = remaining != null ? Number(remaining) : null;
     return out;
@@ -1096,22 +1155,27 @@ async function fetchSoldComps(query) {
   }
 }
 
-// Cache-first sold lookup. askMedian is passed in only so the history
-// row can store the ask and the sold side from the same moment.
-async function getSoldComps(query, askMedian) {
+/* Cache-first sold lookup. askMedian is passed in only so the history
+   row can store the ask and the sold side from the same moment.
+   compact=true halves the record spend — used for refinement chips. */
+async function getSoldComps(query, askMedian, compact) {
   if (!CARDAPI_KEY) return null;
-  const key = cacheKeyFor(query);
+  const limit = compact ? CARDAPI_LIMIT_COMPACT : CARDAPI_LIMIT;
+  const key = cacheKeyFor(query, limit);
   if (!key) return null;
 
   const hit = await readSoldCache(key);
   if (hit) { hit.cached = true; return hit; }
 
-  const fresh = await fetchSoldComps(query);
+  const fresh = await fetchSoldComps(query, limit);
   if (!fresh || fresh.rateLimited) return fresh;
 
   fresh.cached = false;
   await writeSoldCache(key, fresh.query, fresh);
-  await recordPriceHistory(key, fresh.query, fresh, askMedian);
+  /* Only full pulls write price history. A compact refinement is a
+     different slice of the market (one grade, or raw only) and would
+     corrupt the daily series for the card as a whole. */
+  if (!compact) await recordPriceHistory(key, fresh.query, fresh, askMedian);
   return fresh;
 }
 
@@ -1374,9 +1438,12 @@ app.get("/api/card-market", async (req, res) => {
     const query = req.query.query || req.query.cardName;
     if (!query) return res.status(400).json({ success: false, error: "Query required" });
 
+    // compact=1 is sent by the scanner's refinement chips — half the records.
+    const compact = req.query.compact === "1" || req.query.compact === "true";
+
     const market = await getEbayCardMarket(query);
     const clean  = normalizeCardQuery(query);
-    const sold   = await getSoldComps(clean, market.avgPrice);
+    const sold   = await getSoldComps(clean, market.avgPrice, compact);
 
     res.json({
       success:           true,
@@ -1389,11 +1456,12 @@ app.get("/api/card-market", async (req, res) => {
       lowPrice:          market.lowPrice,
       highPrice:         market.highPrice,
       listingCount:      market.listingCount,
-      soldCount:         0,
+      soldCount:         (sold && sold.soldCount) || 0,
       image:             market.image,
       priceSource:       market.priceSource,
       spreadRatio:       market.spreadRatio,
       wideSpread:        market.wideSpread,
+      spreadNote:        market.spreadNote || "",
       matchQuality:      market.matchQuality || (market.listingCount ? "exact" : "none"),
       priceNote:         market.priceNote  || (market.listingCount ? "" : "No clean card listings found."),
       raw:               market.raw,
@@ -1426,11 +1494,12 @@ app.get("/api/card-price", async (req, res) => {
       lowPrice:          market.lowPrice,
       highPrice:         market.highPrice,
       listingCount:      market.listingCount,
-      soldCount:         0,
+      soldCount:         0,   // this endpoint does not fetch sold data
       image:             market.image,
       priceSource:       market.priceSource,
       spreadRatio:       market.spreadRatio,
       wideSpread:        market.wideSpread,
+      spreadNote:        market.spreadNote || "",
       matchQuality:      market.matchQuality || (market.listingCount ? "exact" : "none"),
       priceNote:         market.priceNote || "",
       raw:               market.raw,
@@ -1465,6 +1534,7 @@ app.post(
 
       console.log(
         "[scan] " + cleanCardName +
+        " | back=" + (back ? "yes" : "no") +
         " | parallel=" + (ai.parallel || "-") +
         " | serial=" + (ai.serialNumber || "-") +
         " | q=" + searchQuery +
@@ -1490,12 +1560,14 @@ app.post(
         isRookie:          !!ai.isRookie,
         isAutograph:       !!ai.isAutograph,
         isPatch:           !!ai.isPatch,
+        usedBack:          !!back,
         searchQuery:       searchQuery,
         sold:              sold || null,
         askVsSold:         askVsSold(market.avgPrice, sold),
         matchQuality:      market.matchQuality || "exact",
         tierUsed:          market.tierUsed     || "",
         priceNote:         market.priceNote    || "",
+        spreadNote:        market.spreadNote   || "",
         signal:            ai.signal     || "VERIFY",
         confidence:        ai.confidence || "Medium",
         summary:           ai.summary    || "AI scan complete. Verify exact version, condition, and comps.",
@@ -1504,7 +1576,7 @@ app.post(
         lowPrice:          market.lowPrice,
         highPrice:         market.highPrice,
         listingCount:      market.listingCount,
-        soldCount:         0,
+        soldCount:         (sold && sold.soldCount) || 0,
         image:             market.image,
         priceSource:       market.priceSource,
         spreadRatio:       market.spreadRatio,
@@ -1535,13 +1607,14 @@ app.get("/api/sold-comps", async (req, res) => {
       return res.json({ success: true, available: false,
         error: "Sold data not configured", sold: null, askVsSold: null });
     }
-    const market = await getEbayCardMarket(query);
-    const sold   = await getSoldComps(query, market.avgPrice);
+    const compact = req.query.compact === "1" || req.query.compact === "true";
+    const market  = await getEbayCardMarket(query);
+    const sold    = await getSoldComps(query, market.avgPrice, compact);
     res.json({
       success:   true,
       available: !!(sold && !sold.rateLimited),
       query:     normalizeCardQuery(query),
-      cacheKey:  cacheKeyFor(query),
+      cacheKey:  cacheKeyFor(query, compact ? CARDAPI_LIMIT_COMPACT : CARDAPI_LIMIT),
       askMedian: market.avgPrice,
       sold:      sold || null,
       askVsSold: askVsSold(market.avgPrice, sold)
@@ -1590,8 +1663,10 @@ app.get("/api/cardapi-status", async (req, res) => {
       status:     r.status,
       limit:      r.headers.get("x-ratelimit-limit"),
       remaining:  r.headers.get("x-ratelimit-remaining"),
-      lookbackDays: CARDAPI_LOOKBACK,
-      cacheTtlHours: CACHE_TTL_HOURS
+      lookbackDays:  CARDAPI_LOOKBACK,
+      cacheTtlHours: CACHE_TTL_HOURS,
+      recordLimit:        CARDAPI_LIMIT,
+      recordLimitCompact: CARDAPI_LIMIT_COMPACT
     });
   } catch (e) {
     res.json({ success: false, configured: true, error: e.message });
