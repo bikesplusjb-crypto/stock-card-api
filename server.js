@@ -1262,20 +1262,79 @@ async function getSoldComps(query, askMedian, compact) {
   return fresh;
 }
 
-/* Ask vs sold — the spread nobody else shows. Sellers ask one number,
-   buyers pay another; the gap is the whole reason to check comps. */
-function askVsSold(askMedian, sold) {
-  const ask = safeNumber(askMedian, 0);
-  if (!sold || !sold.soldCount || !ask) return null;
-  const soldMed = safeNumber(sold.soldMedian, 0);
-  if (!soldMed) return null;
+/* Ask vs sold — the spread nobody else shows.
+
+   This has to compare LIKE WITH LIKE, and the first version didn't.
+
+   Real failure it produced: a 2017 Bowman Chrome Mega Ohtani came back
+   with a sold median of $3,000 and a typical ask of $20, and the page
+   announced "asking prices are 99% BELOW recent sales — there may be a
+   deal listed right now." There was no deal. The 5 sales were graded
+   slabs; the 100 listings were 59 raw cards at $15 and 41 slabs at
+   $4,830. Two different populations, one meaningless ratio, and the
+   scanner sent people hunting for a $3,000 card at $20.
+
+   So: match the sold basis to the matching ask group. Raw sales get
+   compared to raw listings, graded sales to graded listings. Only fall
+   back to the blended medians when neither side splits cleanly, and even
+   then refuse to call it a deal if the gap is too large to be real. */
+const IMPLAUSIBLE_GAP_PCT = 65;
+
+function askVsSold(market, sold) {
+  if (!sold || !sold.soldCount) return null;
+
+  const askRaw    = (market && market.raw)    || { count: 0, median: 0 };
+  const askGraded = (market && market.graded) || { count: 0, median: 0 };
+  const soldRaw    = sold.soldRaw    || { count: 0, median: 0 };
+  const soldGraded = sold.soldGraded || { count: 0, median: 0 };
+
+  let basis = null, ask = 0, soldMed = 0, label = '';
+
+  // Whichever side the sold data actually describes, match it.
+  if (soldRaw.count >= MIN_GROUP && askRaw.count >= MIN_GROUP &&
+      soldRaw.count >= soldGraded.count) {
+    basis = 'raw'; ask = askRaw.median; soldMed = soldRaw.median; label = 'Raw copies: ';
+  } else if (soldGraded.count >= MIN_GROUP && askGraded.count >= MIN_GROUP &&
+             soldGraded.count > soldRaw.count) {
+    basis = 'graded'; ask = askGraded.median; soldMed = soldGraded.median; label = 'Graded slabs: ';
+  } else {
+    basis = 'all';
+    ask = safeNumber(market && market.avgPrice, 0);
+    soldMed = safeNumber(sold.soldMedian, 0);
+  }
+
+  ask = safeNumber(ask, 0);
+  soldMed = safeNumber(soldMed, 0);
+  if (!ask || !soldMed) return null;
+
   const diff = ask - soldMed;
   const pct  = Math.round((diff / soldMed) * 100);
+
+  /* A gap this wide is not a market signal, it is a sign the two sides
+     are describing different cards. Say that instead of inventing an
+     opportunity that isn't there. */
+  const mismatch = (basis === 'all' && Math.abs(pct) >= IMPLAUSIBLE_GAP_PCT);
+
   let note;
-  if (pct >= 10)       note = "Sellers are asking " + pct + "% over what buyers actually pay. Don't pay list price.";
-  else if (pct <= -10) note = "Asking prices are " + Math.abs(pct) + "% BELOW recent sales — there may be a deal listed right now.";
-  else                 note = "Asking prices are close to what buyers actually pay.";
-  return { ask: ask, sold: soldMed, diff: Math.round(diff), pct: pct, note: note };
+  if (mismatch) {
+    note = 'Asking prices and recent sales are too far apart to compare — '
+         + 'the listings and the sales look like different versions of this card. '
+         + 'Narrow the search before trusting either number.';
+  } else if (pct >= 10) {
+    note = label + 'sellers are asking ' + pct + '% over what buyers actually pay. Don\'t pay list price.';
+  } else if (pct <= -10) {
+    note = label + 'asking prices are ' + Math.abs(pct) + '% BELOW recent sales — there may be a deal listed right now.';
+  } else {
+    note = label + 'asking prices are close to what buyers actually pay.';
+  }
+  if (label && note) note = note.charAt(0).toUpperCase() + note.slice(1);
+
+  return {
+    ask: ask, sold: soldMed, diff: Math.round(diff), pct: pct,
+    basis: basis, mismatch: mismatch, note: note,
+    askCount:  basis === 'raw' ? askRaw.count  : basis === 'graded' ? askGraded.count  : (market && market.listingCount) || 0,
+    soldCount: basis === 'raw' ? soldRaw.count : basis === 'graded' ? soldGraded.count : sold.soldCount
+  };
 }
 
 // ── OpenAI scan ────────────────────────────────────────────────
@@ -1533,7 +1592,7 @@ app.get("/api/card-market", async (req, res) => {
       cardName:          clean,
       searchQuery:       clean,
       sold:              sold || null,
-      askVsSold:         askVsSold(market.avgPrice, sold),
+      askVsSold:         askVsSold(market, sold),
       avgPrice:          market.avgPrice,
       avgSoldPrice:      market.avgPrice,
       lowPrice:          market.lowPrice,
@@ -1646,7 +1705,7 @@ app.post(
         usedBack:          !!back,
         searchQuery:       searchQuery,
         sold:              sold || null,
-        askVsSold:         askVsSold(market.avgPrice, sold),
+        askVsSold:         askVsSold(market, sold),
         matchQuality:      market.matchQuality || "exact",
         tierUsed:          market.tierUsed     || "",
         priceNote:         market.priceNote    || "",
@@ -1700,7 +1759,7 @@ app.get("/api/sold-comps", async (req, res) => {
       cacheKey:  cacheKeyFor(query, compact ? CARDAPI_LIMIT_COMPACT : CARDAPI_LIMIT),
       askMedian: market.avgPrice,
       sold:      sold || null,
-      askVsSold: askVsSold(market.avgPrice, sold)
+      askVsSold: askVsSold(market, sold)
     });
   } catch (error) {
     res.status(500).json({ success: false, error: "Sold comps lookup failed", details: error.message });
