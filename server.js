@@ -732,6 +732,29 @@ function titleLooksParallel(title, brandName) {
   return PARALLEL_WORDS.some(w => t.includes(" " + w));
 }
 
+/* Is this SOLD record a base card?
+
+   The sold side used to answer this with "is it ungraded?", which is a
+   different question. A Mother's Day Pink /50 that sold for $200 is not
+   in a slab, so it counted as a raw base sale — along with a Black /67
+   and two Gold /2018s. Four numbered parallels averaged in with four
+   base cards pushed the raw median from $2 to $10, and the page then
+   announced a deal on a $2 common that nobody could act on.
+
+   print_run comes back in the API response and always did. The filter
+   simply never looked at it. The title check is the backstop for
+   parallels that carry no serial numbering at all (Refractors, Reverse
+   Holos, Silver Prizms), and it reuses the same word lists and the same
+   Pokemon-safe slash-number logic the ask side has used for months.
+
+   Brand is passed as "" on purpose: PARALLEL_WORDS deliberately excludes
+   product names, so there is nothing to strip. */
+function looksBaseSale(r) {
+  if (r.printRun != null && r.printRun > 0) return false;
+  if (titleLooksParallel(r.title, "")) return false;
+  return true;
+}
+
 function selectListings(ai, byTier) {
   const terms = parallelTerms(ai);
   const denom = serialDenominator(ai);
@@ -1114,8 +1137,34 @@ function summarizeSold(records, query, limitUsed) {
   }
 
   const prices = clean.map(r => r.price).sort((a, b) => a - b);
-  const graded = clean.filter(r => r.grader && r.grade);
-  const raw    = clean.filter(r => !r.grader);
+
+  /* If the card being priced IS a parallel, stripping parallels would
+     leave nothing to price it from. Only base-card lookups get filtered.
+     The query carries the parallel terms, so it answers this directly. */
+  const targetIsParallel = titleLooksParallel(query, "");
+
+  /* Base-only applies ONLY when enough base sales survive it. Below the
+     floor the sample is noise, so it falls back to every ungraded sale —
+     the same fallback pattern selectListings uses on the ask side. */
+  const narrow = function (group) {
+    if (targetIsParallel) return group;
+    const base = group.filter(looksBaseSale);
+    return base.length >= MIN_GROUP ? base : group;
+  };
+
+  const gradedAll = clean.filter(r => r.grader && r.grade);
+  const rawAll    = clean.filter(r => !r.grader);
+
+  const raw    = narrow(rawAll);
+  const graded = narrow(gradedAll);
+
+  /* The grade ladder needs the same treatment. A PSA 10 of a Gold /50
+     landing on the PSA 10 rung of a base card is what makes the scanner
+     tell somebody to spend $25 grading a common. */
+  const ladderSrc = narrow(clean);
+
+  const rawBasis = (raw.length !== rawAll.length) ? "base" : "ungraded";
+
   const rawP   = raw.map(r => r.price).sort((a, b) => a - b);
   const grP    = graded.map(r => r.price).sort((a, b) => a - b);
   const dates  = clean.map(r => r.saleDate).filter(Boolean).sort();
@@ -1142,7 +1191,8 @@ function summarizeSold(records, query, limitUsed) {
     limitUsed:     limitUsed || CARDAPI_LIMIT,
     soldRaw:    { count: raw.length,    median: median(rawP) },
     soldGraded: { count: graded.length, median: median(grP) },
-    soldGradeBreakdown: soldGradeBreakdown(clean),
+    soldRawBasis:       rawBasis,
+    soldGradeBreakdown: soldGradeBreakdown(ladderSrc),
     bestOfferCount: clean.filter(r => r.listingType === "best_offer").length,
     lastSaleDate:   dates.length ? dates[dates.length - 1] : null,
     sales:          clean.slice(0, 12),
