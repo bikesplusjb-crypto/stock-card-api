@@ -2646,6 +2646,20 @@ const CATALOG_BASE      = "https://www.thecardapi.com/api/v1/catalog";
 const CATALOG_PAGE_SIZE = 5;      // records per lookup — see note 1 above
 const CATALOG_TIMEOUT   = 9000;
 
+/* Bump this whenever the lookup gets smarter.
+
+   A permanent cache and improving logic are a bad pair without it. The
+   first version searched on text alone, so "1986 Topps" matched five
+   2021 retro inserts named "1986 Topps Baseball" — and that wrong
+   answer was then cached forever. Adding a year filter fixed the logic
+   and changed nothing, because every affected query was already
+   answered.
+
+   A version stamp means better logic automatically retires worse
+   answers. Old rows are ignored rather than deleted, so a rollback
+   still has its cache. */
+const CATALOG_LOGIC_VERSION = 3;
+
 function normaliseSetQuery(q) {
   return String(q || "")
     .toLowerCase()
@@ -2677,7 +2691,13 @@ async function catalogFetch(pathAndQuery) {
 
 app.get("/api/set-lookup", async (req, res) => {
   const raw = String(req.query.q || "").trim();
-  const q   = normaliseSetQuery(raw);
+  /* Sport is part of the question, so it is part of the cache key.
+     "1986 Topps" is 792 cards in baseball and 396 in football — same
+     name, same year, same brand, different set. Caching one answer for
+     both would hand a football collector a target they can never
+     reach. */
+  const sport = String(req.query.sport || "").trim();
+  const q     = normaliseSetQuery(raw + (sport ? " :" + sport : ""));
   if (q.length < 3) {
     return res.json({ success: true, cached: false, sets: [], note: "Give us a bit more to go on." });
   }
@@ -2687,8 +2707,10 @@ app.get("/api/set-lookup", async (req, res) => {
   if (supabaseAdmin) {
     try {
       const hit = await supabaseAdmin
-        .from("catalog_set_queries").select("ucid,found").eq("q", q).maybeSingle();
-      if (hit.data) {
+        .from("catalog_set_queries").select("ucid,found,logic_version").eq("q", q).maybeSingle();
+      /* An answer from an older version of the lookup is not trusted —
+         it was produced by logic we have since decided was wrong. */
+      if (hit.data && Number(hit.data.logic_version || 0) >= CATALOG_LOGIC_VERSION) {
         if (!hit.data.found) {
           return res.json({ success: true, cached: true, sets: [],
                             note: "No matching set in the catalog." });
@@ -2725,6 +2747,7 @@ app.get("/api/set-lookup", async (req, res) => {
 
     const params = new URLSearchParams({ q: raw, limit: String(CATALOG_PAGE_SIZE) });
     if (wantYear) params.set("year", String(wantYear));
+    if (sport)    params.set("sport", sport);
 
     const { body, remaining } = await catalogFetch("/sets?" + params.toString());
     const rows = Array.isArray(body && body.data) ? body.data : [];
@@ -2749,6 +2772,10 @@ app.get("/api/set-lookup", async (req, res) => {
     function score(x) {
       let n = 0;
       if (wantYear && x.year === wantYear) n += 4;
+      /* Weighted above the base-set bonus: a football collector wants
+         the 396-card football set even if a baseball set looks more
+         canonical. */
+      if (sport && x.sport && x.sport.toLowerCase() === sport.toLowerCase()) n += 3;
       if (!x.parent_name) n += 2;
       if (x.card_count) n += 1;
       return n;
@@ -2785,6 +2812,7 @@ app.get("/api/set-lookup", async (req, res) => {
           q: q,
           ucid: sets.length ? sets[0].ucid : null,
           found: sets.length > 0,
+          logic_version: CATALOG_LOGIC_VERSION,
           fetched_at: new Date().toISOString()
         }, { onConflict: "q" });
       } catch (e) {
@@ -2792,6 +2820,9 @@ app.get("/api/set-lookup", async (req, res) => {
       }
     }
 
+    /* A set size that is wrong stays wrong until the browser forgets
+       it, and nobody knows to hard-refresh a JSON endpoint. */
+    res.set("Cache-Control", "no-store");
     res.json({
       success: true,
       cached: false,
