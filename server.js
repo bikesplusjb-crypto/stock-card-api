@@ -477,6 +477,122 @@ function normalizeCardQuery(query) {
   return q;
 }
 
+/* ============================================================
+   PARSE A TYPED QUERY INTO FIELDS
+
+   A photo scan returns year, brand, set, player, card number and
+   parallel because the AI reads them off the card. A typed search runs
+   no AI, so it returned a name and nothing else — and anything saved
+   from the search box landed in the binder with six empty columns,
+   unsortable and ungroupable.
+
+   This is a parser, not a model. It recognises the shape of a
+   well-formed query — "2018 Topps Update Shohei Ohtani RC" — and gives
+   up quietly on anything else rather than guessing. A null is honest;
+   a wrong player name is worse than no player name, because it will be
+   sorted and grouped as if it were true.
+
+   Deliberately NOT attempted: card number. In a typed query "269" could
+   be the number, part of a year, or a serial. The scan path gets it from
+   the printed card; here it stays null.
+   ============================================================ */
+
+/* Longest first, so "Topps Chrome" wins before "Topps" can match it. */
+const KNOWN_BRANDS = [
+  "Topps Chrome", "Topps Finest", "Topps Heritage", "Topps Update",
+  "Bowman Chrome", "Bowman Draft", "Bowman Sterling",
+  "Panini Prizm", "Panini Select", "Panini Mosaic", "Panini Optic",
+  "Panini Donruss", "Panini Contenders", "Panini Immaculate",
+  "Upper Deck", "Fleer Ultra", "Score Select",
+  "Topps", "Bowman", "Panini", "Donruss", "Fleer", "Score", "Leaf",
+  "Prizm", "Mosaic", "Optic", "Select", "Chrome", "Finest", "Heritage",
+  "Stadium Club", "Allen & Ginter", "Gypsy Queen", "Pokemon", "Pok\u00e9mon"
+];
+
+/* Set/subset words that follow a brand. Only ones common enough to be
+   worth the risk of a false positive. */
+const KNOWN_SETS = [
+  "Update Series", "Update", "Chrome", "Refractor", "Heritage", "Finest",
+  "Stadium Club", "Opening Day", "Allen & Ginter", "Gypsy Queen",
+  "Base Set", "Jungle", "Fossil", "Team Rocket", "Neo Genesis",
+  "Evolving Skies", "Hidden Fates", "Rebel Clash", "Darkness Ablaze",
+  "Champions Path", "Obsidian Flames", "Sword & Shield", "Silver Tempest"
+];
+
+/* Words that are never part of a player's name. Grades, conditions,
+   marketing terms and the rookie flag all end up in queries. */
+const NOT_A_NAME = new RegExp(
+  "\\b(rc|rookie|card|cards|psa|bgs|sgc|cgc|tag|ace|graded|slab|slabbed|" +
+  "gem|mint|nm|lot|reprint|auto|autograph|patch|parallel|refractor|holo|" +
+  "numbered|serial|sp|ssp|variation|insert|base|the)\\b", "gi");
+
+function parseCardQuery(query) {
+  const raw = String(query || "").replace(/\s+/g, " ").trim();
+  const out = { year: null, brand: null, set: null, player: null, parallel: null };
+  if (!raw) return out;
+
+  let rest = raw;
+
+  /* Year: a standalone 4-digit number in a plausible range. Bounded so a
+     card number like "1987" in "#1987" or a price doesn't become a year —
+     the word boundary and the range do most of that work. */
+  const ym = rest.match(/\b(18[5-9]\d|19\d\d|20[0-4]\d)\b/);
+  if (ym) {
+    out.year = parseInt(ym[1], 10);
+    rest = rest.replace(ym[0], " ");
+  }
+
+  /* Brand, longest match first. */
+  for (const b of KNOWN_BRANDS) {
+    const re = new RegExp("\\b" + b.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "i");
+    if (re.test(rest)) {
+      out.brand = b;
+      rest = rest.replace(re, " ");
+      break;
+    }
+  }
+
+  /* Set, from what's left. */
+  for (const st of KNOWN_SETS) {
+    const re = new RegExp("\\b" + st.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "i");
+    if (re.test(rest)) {
+      out.set = st;
+      rest = rest.replace(re, " ");
+      break;
+    }
+  }
+
+  /* Parallel: reuse the same word lists the ask and sold filters use, so
+     "silver prizm" means the same thing everywhere in this file. */
+  for (const w of PARALLEL_WORDS) {
+    const re = new RegExp("\\b" + w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "i");
+    if (re.test(rest)) {
+      out.parallel = w.replace(/\b\w/g, c => c.toUpperCase());
+      rest = rest.replace(re, " ");
+      break;
+    }
+  }
+
+  /* Whatever survives, minus grades, card numbers and filler, is the
+     player. Two words or fewer that are all noise gives nothing rather
+     than a fragment. */
+  let name = rest
+    .replace(NOT_A_NAME, " ")
+    .replace(/#\s*[\w/-]+/g, " ")      // #US285, #4/102
+    .replace(/\b\d+(\.\d+)?\b/g, " ") // stray numbers and grades
+    .replace(/[^A-Za-z\u00C0-\u024F.'\- ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  /* A single letter or an initial isn't a name. Two characters is the
+     floor — "Ed" exists, "E" does not. */
+  if (name.length >= 2 && /[A-Za-z]{2}/.test(name)) {
+    out.player = name.split(" ").slice(0, 4).join(" ");
+  }
+
+  return out;
+}
+
 function isLikelyCardListing(title) {
   const t = String(title || "").toLowerCase();
   const positive = [
@@ -514,6 +630,22 @@ function isLikelyCardListing(title) {
 ═══════════════════════════════════════════════════════════════ */
 
 const GENERIC_SET = /^(base|base set|base rookie|base series|base card|common|rookie|rookies|n\/a|none|unknown|-)$/i;
+
+/* Pokemon needs a much shorter version of that list.
+
+   On a sports card "Base Set" is a description, not a product, and no
+   seller types it, so stripping it is correct. In Pokemon, Base Set is
+   the NAME of the 1999 set and the most searched set in the hobby.
+   Running it through GENERIC_SET turned a 1999 Base Set Charizard into
+   "pokemon Charizard 4/102" and blended the original with thirty years
+   of reprints. Jungle, Fossil and Team Rocket read as generic for the
+   same reason: real set names that sound like descriptions.
+
+   So for Pokemon only genuinely empty values get stripped. */
+const GENERIC_SET_POKEMON = /^(n\/a|none|unknown|-|null)$/i;
+function setJunkFor(ai) {
+  return isPokemon(ai) ? GENERIC_SET_POKEMON : GENERIC_SET;
+}
 const JUNK_VALUE  = /^(unknown|n\/a|none|-|null|)$/i;
 
 // Brand/product names are deliberately EXCLUDED (Prizm, Chrome, Select,
@@ -658,20 +790,28 @@ function buildQueryTiers(ai) {
   const brand  = cleanVal(ai.brand);
   const player = cleanVal(ai.player);
   const setRaw = cleanVal(ai.set);
-  const set    = GENERIC_SET.test(setRaw) ? "" : trimOverlap(setRaw, brand);
+  const poke   = isPokemon(ai);
+  const set    = setJunkFor(ai).test(setRaw) ? "" : trimOverlap(setRaw, brand);
   const parRaw = cleanVal(ai.parallel);
   const par    = GENERIC_SET.test(parRaw) ? "" : parRaw;
   const num    = cardNumberToken(ai);
   const grade  = (cleanVal(ai.gradeCompany) && cleanVal(ai.gradeValue))
                  ? cleanVal(ai.gradeCompany) + " " + cleanVal(ai.gradeValue) : "";
 
+  /* A Japanese card and its English twin are different cards at very
+     different prices, and they were being blended into one number.
+     Sellers reliably put "Japanese" in the title; almost nobody writes
+     "English", so only the Japanese case becomes a keyword. English
+     stays implicit, which is also what the ask side already assumes. */
+  const lang = /^(jap|jpn)/i.test(cleanVal(ai.language)) ? "Japanese" : "";
+
   let tight, core, loose;
-  if (isPokemon(ai)) {
+  if (poke) {
     // "pokemon" is forced in so eBay lands in the right category, and the
     // variant is deliberately left out of the keywords.
-    tight = joinParts(["pokemon", player, set, num, grade]);
-    core  = joinParts(["pokemon", player, num, grade]);
-    loose = joinParts(["pokemon", player]);
+    tight = joinParts(["pokemon", lang, player, set, num, grade]);
+    core  = joinParts(["pokemon", lang, player, num, grade]);
+    loose = joinParts(["pokemon", lang, player]);
   } else {
     tight = joinParts([year, brand, set, player, par, num, grade]);
     core  = joinParts([year, brand, player, num, grade]);
@@ -834,13 +974,15 @@ function selectListings(ai, byTier) {
 function buildDisplayName(ai) {
   const brand  = cleanVal(ai.brand);
   const setRaw = cleanVal(ai.set);
-  const set    = GENERIC_SET.test(setRaw) ? "" : trimOverlap(setRaw, brand);
+  const set    = setJunkFor(ai).test(setRaw) ? "" : trimOverlap(setRaw, brand);
   let n = joinParts([cleanVal(ai.year), brand, set, cleanVal(ai.player)]);
   const par = cleanVal(ai.parallel);
   if (par && !GENERIC_SET.test(par)) n += " " + par;
   const s = cleanVal(ai.serialNumber);
   if (s && /\d+\s*\/\s*\d+/.test(s)) n += " " + s.replace(/\s+/g, "");
-  if (ai.isRookie) n += " RC";
+  /* Pokemon has no rookies. "RC" on a Charizard is wrong on its face and
+     it also rides into the eBay keywords through the display name. */
+  if (ai.isRookie && !isPokemon(ai)) n += " RC";
   return n.trim() || cleanVal(ai.cardName) || "Unknown Trading Card";
 }
 
@@ -1407,7 +1549,7 @@ async function scanWithOpenAI(frontFile, backFile) {
     messages: [
       { role: "system", content: "You are an expert trading card identifier. You examine photos of sports cards, Pokemon cards, TCG cards, graded slabs, and sealed product. You return ONLY valid JSON with no markdown, no code fences, and no commentary. You never estimate dollar values." },
       { role: "user", content: [
-        { type: "text", text: "Identify this card as precisely as possible. Return ONLY a JSON object with these exact keys: cardName, player, year, brand, set, cardNumber, sport, parallel, serialNumber, isRookie, isAutograph, isPatch, gradeCompany, gradeValue, signal, confidence, summary.\n\nTHE SINGLE MOST IMPORTANT FIELD IS player. Never leave it empty.\n- On a sports card it is the athlete's name.\n- ON A POKEMON OR TCG CARD IT IS THE CREATURE'S NAME, including its suffix exactly as printed: 'Coalossal VMAX', 'Charizard V', 'Umbreon VMAX', 'Pikachu ex', 'Mewtwo GX'. Set sport to 'Pokemon' and brand to 'Pokemon'. Without the name every price lookup fails, so read it off the top of the card even if the rest of the card is unclear.\n\nCRITICAL — PARALLEL IDENTIFICATION. Parallels change a card's value by 10x or more, so look carefully before concluding a card is base:\n- Border color is the main tell. Panini Prizm/Select/Optic parallels are named by color: Silver, Red, Blue, Green, Orange, Purple, Gold, Black, Pink, Camo, Mojo, Wave, Hyper, Disco, Shimmer, Ice.\n- Topps Chrome parallels: Refractor, X-Fractor, Prism, Atomic, Sepia, Gold, Orange, Red, SuperFractor, Negative, Speckle.\n- POKEMON: the variant matters as much as any colour parallel. Report it in the parallel field. Vintage: 1st Edition (look for the black stamp to the left of the artwork), Shadowless (no drop shadow on the right of the art box). Any era: Reverse Holo (the CARD BODY is foil, the artwork is not), Full Art, Alt Art, Rainbow Rare, Gold Secret Rare, Illustration Rare. Do NOT write Unlimited or Regular \u2014 that is the base printing, so leave parallel empty.\n- Look for rainbow/foil sheen, cracked-ice texture, sparkle, or a colored border that differs from the base design.\n- Look for serial numbering printed on the front or back, usually small, formatted like 25/99 or /99. Report it exactly as printed in serialNumber. POKEMON CARD NUMBERS ARE NOT SERIAL NUMBERING: 074/073, 4/102 and SV107/SV122 are the card's number within its set. Put those in cardNumber and leave serialNumber EMPTY.\n- '1/1' or 'One of One' is critical — always report it.\n- If you see a colored border or foil pattern but cannot name the exact parallel, use the color plus the word Parallel, e.g. 'Blue Parallel'.\n- Use an empty string for parallel ONLY if the card is clearly a plain base card.\n\nSET FIELD RULES — IMPORTANT:\n- The 'set' field must be the actual product/subset name as it would appear in an eBay listing title, for example 'Update Series', 'Draft Picks', 'Downtown', 'Kaboom'.\n- If the card is just the base set of the product, return an EMPTY STRING for set. Never return 'Base', 'Base Set', 'Base Rookie', or 'Common' — those words do not appear in listing titles and break the price search.\n\nOTHER RULES:\n- If a back image is provided, TRUST THE BACK for card number, set name, and copyright year — printed text beats inferring from the front design.\n- If the card is in a graded slab, read the label for company, grade, year, player, set, and card number.\n- isRookie, isAutograph, isPatch must be true or false booleans.\n- signal must be one of: GRADE, WATCH, SELL RAW, HOT, VERIFY.\n- confidence must be High, Medium, or Low. Use Low if the image is blurry or you are unsure about the parallel.\n- Never guess a dollar value. Never include price fields." },
+        { type: "text", text: "Identify this card as precisely as possible. Return ONLY a JSON object with these exact keys: cardName, player, year, brand, set, cardNumber, sport, parallel, serialNumber, language, isRookie, isAutograph, isPatch, gradeCompany, gradeValue, signal, confidence, summary.\n\nTHE SINGLE MOST IMPORTANT FIELD IS player. Never leave it empty.\n- On a sports card it is the athlete's name.\n- ON A POKEMON OR TCG CARD IT IS THE CREATURE'S NAME, including its suffix exactly as printed: 'Coalossal VMAX', 'Charizard V', 'Umbreon VMAX', 'Pikachu ex', 'Mewtwo GX'. Set sport to 'Pokemon' and brand to 'Pokemon'. Without the name every price lookup fails, so read it off the top of the card even if the rest of the card is unclear.\n\nCRITICAL — PARALLEL IDENTIFICATION. Parallels change a card's value by 10x or more, so look carefully before concluding a card is base:\n- Border color is the main tell. Panini Prizm/Select/Optic parallels are named by color: Silver, Red, Blue, Green, Orange, Purple, Gold, Black, Pink, Camo, Mojo, Wave, Hyper, Disco, Shimmer, Ice.\n- Topps Chrome parallels: Refractor, X-Fractor, Prism, Atomic, Sepia, Gold, Orange, Red, SuperFractor, Negative, Speckle.\n- POKEMON: the variant matters as much as any colour parallel. Report it in the parallel field. Vintage: 1st Edition (look for the black stamp to the left of the artwork), Shadowless (no drop shadow on the right of the art box). Any era: Reverse Holo (the CARD BODY is foil, the artwork is not), Full Art, Alt Art, Rainbow Rare, Gold Secret Rare, Illustration Rare. Do NOT write Unlimited or Regular \u2014 that is the base printing, so leave parallel empty.\n- Look for rainbow/foil sheen, cracked-ice texture, sparkle, or a colored border that differs from the base design.\n- Look for serial numbering printed on the front or back, usually small, formatted like 25/99 or /99. Report it exactly as printed in serialNumber. POKEMON CARD NUMBERS ARE NOT SERIAL NUMBERING: 074/073, 4/102 and SV107/SV122 are the card's number within its set. Put those in cardNumber and leave serialNumber EMPTY.\n- '1/1' or 'One of One' is critical — always report it.\n- If you see a colored border or foil pattern but cannot name the exact parallel, use the color plus the word Parallel, e.g. 'Blue Parallel'.\n- Use an empty string for parallel ONLY if the card is clearly a plain base card.\n\nSET FIELD RULES — IMPORTANT:\n- The 'set' field must be the actual product/subset name as it would appear in an eBay listing title, for example 'Update Series', 'Draft Picks', 'Downtown', 'Kaboom'.\n- If the card is just the base set of the product, return an EMPTY STRING for set. Never return 'Base', 'Base Set', 'Base Rookie', or 'Common' — those words do not appear in listing titles and break the price search.\n- POKEMON IS THE EXCEPTION TO THAT RULE. Pokemon set names are real products and must ALWAYS be returned in full, even when they sound generic: 'Base Set', 'Jungle', 'Fossil', 'Team Rocket', 'Neo Genesis', 'Evolving Skies', 'Champions Path', 'Darkness Ablaze', 'Rebel Clash', 'Hidden Fates', 'Obsidian Flames', '151'. Use the set symbol and the card number to identify it. Never return an empty set for a Pokemon card if you can name the set at all.\n\nLANGUAGE:\n- Return 'Japanese' if the card text is Japanese, or 'Chinese' or 'Korean' where those apply. Otherwise return 'English'.\n- Japanese Pokemon cards trade as a separate market at different prices, so getting this wrong misprices the card badly. They are a slightly different size, carry Japanese characters in the name and attack text, and usually print the card number without a set total.\n\nOTHER RULES:\n- If a back image is provided, TRUST THE BACK for card number, set name, and copyright year — printed text beats inferring from the front design.\n- If the card is in a graded slab, read the label for company, grade, year, player, set, and card number.\n- isRookie, isAutograph, isPatch must be true or false booleans.\n- signal must be one of: GRADE, WATCH, SELL RAW, HOT, VERIFY.\n- confidence must be High, Medium, or Low. Use Low if the image is blurry or you are unsure about the parallel.\n- Never guess a dollar value. Never include price fields." },
         ...images
       ]}
     ],
@@ -1661,7 +1803,19 @@ app.get("/api/card-market", async (req, res) => {
       gradeBreakdown:    market.gradeBreakdown,
       listings:          market.listings,
       soldCompsUrl:      ebayUrl(clean, true),
-      activeListingsUrl: ebayUrl(clean, false)
+      activeListingsUrl: ebayUrl(clean, false),
+
+      /* Structured fields, so a card saved from the SEARCH box lands in
+         the binder as sortable data rather than one opaque string. The
+         scan path gets these from the AI reading the card; here they are
+         parsed out of what the user typed.
+
+         Spread flat rather than nested so the frontend reads them the
+         same way on both paths — the save code shouldn't have to know
+         which one it came from. Anything the parser isn't sure of comes
+         back null, and a null is honest: a wrong player name is worse
+         than no player name, because it gets sorted as if it were true. */
+      ...parseCardQuery(clean)
     });
   } catch (error) {
     res.status(500).json({ success: false, error: "Card market lookup failed", details: error.message });
