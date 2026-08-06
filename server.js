@@ -540,10 +540,62 @@ const NOT_A_NAME = new RegExp(
   "gem|mint|nm|lot|reprint|auto|autograph|patch|parallel|refractor|holo|" +
   "numbered|serial|sp|ssp|variation|insert|base|the)\\b", "gi");
 
+/* Brands and product lines that only ever appear in one sport.
+
+   A typed search has no AI behind it, so sport was always null — and on
+   a desktop, typing is the only way in. That left every desktop search
+   unable to tell 1986 Topps Baseball (792 cards) from 1986 Topps
+   Football (396).
+
+   Only entries where there is genuinely no ambiguity are listed. Topps,
+   Panini, Chrome and Prizm are all deliberately ABSENT: they each print
+   several sports, and a confident wrong sport is worse than none —
+   it would silently hand somebody the wrong set size and look
+   authoritative doing it. Roughly a third of searches get an answer;
+   the rest stay honestly blank. */
+const SPORT_BY_TERM = [
+  // Baseball-only products
+  ["bowman",           "Baseball"],
+  ["heritage",         "Baseball"],
+  ["allen & ginter",   "Baseball"],
+  ["allen and ginter", "Baseball"],
+  ["gypsy queen",      "Baseball"],
+  ["stadium club",     "Baseball"],
+  ["topps now",        "Baseball"],
+  // Trading card games
+  ["pokemon",          "Pokemon"],
+  ["pok\u00e9mon",      "Pokemon"],
+  ["magic the gathering", "Gaming (TCG)"],
+  ["yugioh",           "Gaming (TCG)"],
+  ["yu-gi-oh",         "Gaming (TCG)"],
+  // Sport named outright — people often type it
+  ["baseball",         "Baseball"],
+  ["basketball",       "Basketball"],
+  ["football",         "Football"],
+  ["hockey",           "Hockey"],
+  ["soccer",           "Soccer"],
+  ["wwe",              "Wrestling"],
+  ["ufc",              "MMA"],
+  ["formula 1",        "Racing"],
+  ["nascar",           "Racing"]
+];
+
+function sportFromQuery(text) {
+  const t = " " + String(text || "").toLowerCase() + " ";
+  for (const pair of SPORT_BY_TERM) {
+    if (t.indexOf(" " + pair[0]) > -1) return pair[1];
+  }
+  return null;
+}
+
 function parseCardQuery(query) {
   const raw = String(query || "").replace(/\s+/g, " ").trim();
-  const out = { year: null, brand: null, set: null, player: null, parallel: null };
+  const out = { year: null, brand: null, set: null, player: null, parallel: null, sport: null };
   if (!raw) return out;
+
+  /* Read the sport off the WHOLE query before anything is stripped out,
+     because the word that identifies it is often also the brand. */
+  out.sport = sportFromQuery(raw);
 
   let rest = raw;
 
