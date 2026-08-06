@@ -1844,6 +1844,83 @@ app.get("/api/card-market", async (req, res) => {
   }
 });
 
+/* ── /api/parse-bulk ────────────────────────────────────────────
+   Turns a pasted list into structured rows.
+
+   Lives on the server so there is ONE parser. The obvious alternative
+   was a copy in the browser for instant preview, and a copy is how two
+   implementations quietly stop agreeing — which is exactly the bug that
+   put "Topps Chrome" in the brand column on one path and "Topps" plus
+   "Chrome" on the other.
+
+   Costs nothing to run: no AI, no eBay, no thecardapi. It is string work
+   on text the user already typed, which is the whole point. Somebody with
+   a thousand cards can get them in without spending a thousand vision
+   calls, then price them later a batch at a time.
+   ──────────────────────────────────────────────────────────────── */
+const BULK_MAX_LINES = 200;
+
+app.post("/api/parse-bulk", (req, res) => {
+  try {
+    let lines = req.body && req.body.lines;
+
+    // Accept an array or one blob of text — a paste is a blob.
+    if (typeof lines === "string") lines = lines.split(/\r?\n/);
+    if (!Array.isArray(lines)) {
+      return res.status(400).json({ success: false, error: "Send lines as an array or a string" });
+    }
+
+    const cleaned = lines
+      .map(l => String(l || "").replace(/\s+/g, " ").trim())
+      /* Drop the scaffolding people paste along with the cards: bullets
+         and leading list numbers. In "12. 2018 Topps Ohtani" the 12 is
+         not part of the card's name. */
+      .map(l => l.replace(/^[-*\u2022]\s*/, "").replace(/^\d{1,3}[.)]\s+/, ""))
+      .filter(l => l.length > 1);
+
+    const overflow = Math.max(0, cleaned.length - BULK_MAX_LINES);
+    const use = cleaned.slice(0, BULK_MAX_LINES);
+
+    /* The same text twice in one paste is nearly always a duplicated
+       line rather than two copies of a card. Flag it, don't drop it —
+       the person deciding is better placed than we are. */
+    const seen = {};
+    const rows = use.map((line, idx) => {
+      const key = line.toLowerCase();
+      const dupe = !!seen[key];
+      seen[key] = true;
+      const p = parseCardQuery(line);
+      return {
+        index:      idx,
+        line:       line,
+        cardName:   line.slice(0, 200),
+        year:       p.year,
+        brand:      p.brand,
+        set:        p.set,
+        player:     p.player,
+        parallel:   p.parallel,
+        duplicate:  dupe,
+        /* How much the parser actually recognised, so the UI can show
+           which lines are worth a second look before they are saved. */
+        confidence: [p.year, p.brand, p.player].filter(Boolean).length
+      };
+    });
+
+    res.json({
+      success: true,
+      count:   rows.length,
+      skipped: overflow,
+      max:     BULK_MAX_LINES,
+      note:    overflow
+        ? ("Only the first " + BULK_MAX_LINES + " lines were read. Paste the rest separately.")
+        : "",
+      rows: rows
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: "Could not read that list", details: error.message });
+  }
+});
+
 // ── /api/card-price ────────────────────────────────────────────
 app.get("/api/card-price", async (req, res) => {
   try {
@@ -2270,82 +2347,6 @@ app.get("/api/price-history", async (req, res) => {
 });
 
 // ── /api/cardapi-status ────────────────────────────────────────
-/* ── /api/parse-cards ───────────────────────────────────────────
-   Turn a pasted list of card names into structured rows.
-
-   The whole point of bulk entry is getting a real collection in without
-   paying for it. So this calls NOTHING — no AI, no eBay, no thecardapi.
-   It is the same parser the search box uses, run over many lines at
-   once, and it costs a few milliseconds of CPU.
-
-   Cards land unpriced. Pricing is the expensive half and it happens
-   later, in batches, the way the Show Log already prices cards logged
-   with no signal. Someone with 800 cards can get them all in tonight and
-   price the ones that matter over the following week.
-
-   Lives on the server rather than in the binder so the parser has one
-   home. A copy in the frontend would drift from this one within a month,
-   and then a typed search and a pasted line would disagree about the
-   same card.
-   ────────────────────────────────────────────────────────────── */
-const BULK_MAX_LINES = 200;
-
-app.post("/api/parse-cards", (req, res) => {
-  try {
-    const body = req.body || {};
-    let lines = [];
-
-    if (Array.isArray(body.lines)) lines = body.lines;
-    else if (typeof body.text === "string") lines = body.text.split(/\r?\n/);
-
-    /* Trim, drop blanks, and de-duplicate case-insensitively. A pasted
-       list is usually somebody's spreadsheet column, and those come with
-       repeats. */
-    const seen = Object.create(null);
-    const clean = [];
-    for (const raw of lines) {
-      const line = String(raw == null ? "" : raw).replace(/\s+/g, " ").trim();
-      if (!line) continue;
-      const key = line.toLowerCase();
-      if (seen[key]) continue;
-      seen[key] = 1;
-      clean.push(line.slice(0, 200));
-      if (clean.length >= BULK_MAX_LINES) break;
-    }
-
-    if (!clean.length) {
-      return res.json({ success: true, count: 0, cards: [], truncated: false, maxLines: BULK_MAX_LINES });
-    }
-
-    const cards = clean.map(name => {
-      const parsed = parseCardQuery(name);
-      /* Flag rows the parser is unsure about so the preview can highlight
-         them BEFORE anything is written. A wrong row caught here costs a
-         keystroke; caught later it costs a delete and a re-add. */
-      const thin = !parsed.year && !parsed.brand;
-      return {
-        card_name: name,
-        year:      parsed.year,
-        brand:     parsed.brand,
-        set_name:  parsed.set,
-        player:    parsed.player,
-        parallel:  parsed.parallel,
-        thin:      thin
-      };
-    });
-
-    res.json({
-      success:   true,
-      count:     cards.length,
-      truncated: lines.filter(l => String(l||"").trim()).length > BULK_MAX_LINES,
-      maxLines:  BULK_MAX_LINES,
-      cards:     cards
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, error: "Could not read that list", details: error.message });
-  }
-});
-
 app.get("/api/cardapi-status", async (req, res) => {
   if (!CARDAPI_KEY) return res.json({ success: true, configured: false });
   try {
