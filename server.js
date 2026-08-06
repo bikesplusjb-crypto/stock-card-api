@@ -2891,6 +2891,185 @@ app.get("/api/set-lookup", async (req, res) => {
   }
 });
 
+/* ── CHECKLISTS: WHICH CARDS ARE IN THIS SET ────────────────────
+
+   A count says "115 cards". A checklist says which 115, and that turns
+   "you're 2% done" into "here are the 113 you still need" — the thing
+   collectors actually want.
+
+   The constraint is the same one that shapes everything else here: a
+   checklist costs one catalog record per card, against 500 a day. A
+   792-card set is more than a full day's allowance, and fetching on
+   demand would spend the budget re-answering a question whose answer
+   never changes.
+
+   So it is built once and kept:
+
+   - Pulled a page at a time, up to a daily ceiling, and RESUMED
+     tomorrow if the set is large. Progress is recorded, so a half-built
+     checklist is never mistaken for a complete one — "you're missing
+     400 cards" would otherwise be a confident lie.
+
+   - Stored shared, not per user. What is in 1986 Topps is not private.
+     The first collector to ask pays the records; everybody after reads
+     Supabase for nothing.
+
+   - Matched on card number, normalised. That is the only field that
+     reliably identifies a card within its set, and it is why photo
+     scans work well here and typed searches do not — a typed query
+     never yields a card number worth trusting.
+   ─────────────────────────────────────────────────────────────── */
+const CHECKLIST_PAGE      = 100;   // catalog max per request
+const CHECKLIST_MAX_PAGES = 4;     // 400 records — leaves room for lookups
+
+/* "#027", "27" and "27 " are the same card. Pokemon's "4/102" is not a
+   fraction and must survive intact. */
+function normCardNumber(v) {
+  return String(v == null ? "" : v)
+    .trim().toLowerCase()
+    .replace(/^#+/, "")
+    .replace(/^0+(?=\d)/, "");
+}
+
+async function buildChecklist(setUcid, setName, expectedTotal) {
+  if (!supabaseAdmin) return { ok: false, reason: "no database" };
+
+  let prog = null;
+  try {
+    const r = await supabaseAdmin.from("catalog_checklist_progress")
+      .select("*").eq("set_ucid", setUcid).maybeSingle();
+    prog = r.data;
+  } catch (e) { /* treat as first run */ }
+
+  if (prog && prog.complete) return { ok: true, complete: true, count: prog.fetched_count };
+
+  let page    = prog ? prog.next_page : 1;
+  let fetched = prog ? prog.fetched_count : 0;
+  let pages   = 0;
+  let done    = false;
+  let total   = (prog && prog.expected_total) || expectedTotal || null;
+
+  while (pages < CHECKLIST_MAX_PAGES) {
+    const params = new URLSearchParams({
+      set_id: setUcid, page: String(page), limit: String(CHECKLIST_PAGE)
+    });
+    let body;
+    try {
+      const r = await catalogFetch("/?" + params.toString());
+      body = r.body;
+    } catch (e) {
+      /* Out of allowance, or the catalog is down. Keep what we have and
+         resume tomorrow rather than losing the partial set. */
+      await saveProgress(setUcid, setName, total, fetched, page, false, e.message);
+      return { ok: true, complete: false, count: fetched, total: total, paused: e.message };
+    }
+
+    const rows = Array.isArray(body && body.data) ? body.data : [];
+    if (body && body.pagination && body.pagination.total) total = Number(body.pagination.total);
+
+    if (!rows.length) { done = true; break; }
+
+    const cards = rows.map(r => ({
+      ucid:        r.ucid,
+      set_ucid:    setUcid,
+      card_number: r.card_number != null ? String(r.card_number) : null,
+      subject:     r.subject || null,
+      is_rookie:   r.is_rookie === true,
+      print_run:   r.print_run != null ? Number(r.print_run) : null,
+      image_url:   r.image_url_front || null,
+      fetched_at:  new Date().toISOString()
+    })).filter(c => c.ucid);
+
+    if (cards.length) {
+      try {
+        await supabaseAdmin.from("catalog_cards").upsert(cards, { onConflict: "ucid" });
+      } catch (e) {
+        console.warn("[checklist] write failed:", e.message);
+      }
+    }
+
+    fetched += cards.length;
+    page += 1;
+    pages += 1;
+
+    if (rows.length < CHECKLIST_PAGE) { done = true; break; }
+    if (total && fetched >= total)    { done = true; break; }
+  }
+
+  await saveProgress(setUcid, setName, total, fetched, page, done, null);
+  return { ok: true, complete: done, count: fetched, total: total };
+}
+
+async function saveProgress(setUcid, setName, total, fetched, nextPage, complete, err) {
+  if (!supabaseAdmin) return;
+  try {
+    await supabaseAdmin.from("catalog_checklist_progress").upsert({
+      set_ucid:       setUcid,
+      set_name:       setName || null,
+      expected_total: total || null,
+      fetched_count:  fetched,
+      next_page:      nextPage,
+      complete:       !!complete,
+      last_error:     err || null,
+      updated_at:     new Date().toISOString()
+    }, { onConflict: "set_ucid" });
+  } catch (e) { console.warn("[checklist] progress write failed:", e.message); }
+}
+
+/* GET /api/set-checklist?ucid=UC-...&have=27,101,US285
+   Returns what is missing. `have` is the caller's card numbers — the
+   diff happens here so the browser never downloads a whole set. */
+app.get("/api/set-checklist", async (req, res) => {
+  const ucid = String(req.query.ucid || "").trim();
+  const name = String(req.query.name || "").trim();
+  if (!ucid) return res.status(400).json({ success: false, error: "ucid required" });
+
+  const have = new Set(
+    String(req.query.have || "").split(",").map(normCardNumber).filter(Boolean)
+  );
+
+  try {
+    const built = await buildChecklist(ucid, name, Number(req.query.total) || null);
+
+    let cards = [];
+    if (supabaseAdmin) {
+      const r = await supabaseAdmin.from("catalog_cards")
+        .select("card_number,subject,is_rookie,print_run")
+        .eq("set_ucid", ucid)
+        .order("card_number");
+      if (!r.error) cards = r.data || [];
+    }
+
+    const missing = cards.filter(c => !have.has(normCardNumber(c.card_number)));
+
+    res.set("Cache-Control", "no-store");
+    res.json({
+      success:  true,
+      complete: !!built.complete,
+      /* Stated plainly when the list is partial. A missing-card list
+         built from half a checklist is worse than none — it names cards
+         somebody may already own and omits ones they need. */
+      note: built.complete ? "" :
+        ("Still building this checklist \u2014 " + (built.count || 0) +
+         (built.total ? " of " + built.total : "") +
+         " cards so far. Come back tomorrow for the rest."),
+      known:   cards.length,
+      total:   built.total || null,
+      haveCount: have.size,
+      missing: missing.slice(0, 500).map(c => ({
+        card_number: c.card_number,
+        subject:     c.subject,
+        is_rookie:   c.is_rookie === true,
+        print_run:   c.print_run
+      })),
+      missingCount: missing.length
+    });
+  } catch (error) {
+    console.warn("[checklist] failed:", error.message);
+    res.json({ success: false, error: error.message });
+  }
+});
+
 // ── WATCHLIST DAILY PRICE REFRESH ──────────────────────────────
 const cron = require("node-cron");
 const { createClient } = require("@supabase/supabase-js");
