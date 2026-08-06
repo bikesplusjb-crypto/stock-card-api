@@ -2712,22 +2712,65 @@ app.get("/api/set-lookup", async (req, res) => {
   }
 
   try {
+    /* Pull the year out and send it as a filter.
+
+       Without it, searching "1986 Topps" came back with five 2021
+       products — Topps' 35th-anniversary retro inserts, which are
+       literally NAMED "1986 Topps Baseball". Substring matching cannot
+       tell those apart from the actual 1986 set, and the real one was
+       nowhere in the results. The year is right there in the query; not
+       using it was leaving the answer on the table. */
+    const ym = raw.match(/\b(18[5-9]\d|19\d\d|20[0-4]\d)\b/);
+    const wantYear = ym ? Number(ym[1]) : null;
+
     const params = new URLSearchParams({ q: raw, limit: String(CATALOG_PAGE_SIZE) });
+    if (wantYear) params.set("year", String(wantYear));
+
     const { body, remaining } = await catalogFetch("/sets?" + params.toString());
     const rows = Array.isArray(body && body.data) ? body.data : [];
 
-    const sets = rows.map(r => ({
+    let sets = rows.map(r => ({
       ucid:        r.ucid || r.set_ucid || null,
       set_name:    r.set_name || r.name || "",
       year:        r.year != null ? Number(r.year) : null,
       sport:       r.sport || null,
-      /* The docs describe this endpoint as returning card counts; the
-         field name is read defensively because a rename upstream should
-         degrade to "we don't know" rather than to a wrong number. */
       card_count:  Number(r.card_count || r.total_cards || r.cards || 0) || null,
-      parent_name: r.parent_set_name || null,
+      /* An insert or parallel carries its parent product. A set with no
+         parent is a base set in its own right, which is almost always
+         what somebody means when they name a set they're building. */
+      parent_name: r.parent_set_name || r.parent_name || null,
       slug:        r.slug || null
     })).filter(x => x.ucid && x.set_name);
+
+    /* Rank rather than filter, because a hard filter can leave nothing.
+       Best first: right year and no parent beats right year alone,
+       which beats a name match with the wrong year attached. */
+    sets.sort((a, b) => score(b) - score(a));
+    function score(x) {
+      let n = 0;
+      if (wantYear && x.year === wantYear) n += 4;
+      if (!x.parent_name) n += 2;
+      if (x.card_count) n += 1;
+      return n;
+    }
+
+    /* The list endpoint does not carry card counts — that is what
+       /sets/{ucid} is for. One extra record buys the only number this
+       whole feature needs, and only for the single best match. */
+    if (sets.length && !sets[0].card_count) {
+      try {
+        const detail = await catalogFetch("/sets/" + encodeURIComponent(sets[0].ucid));
+        const d = (detail.body && (detail.body.data || detail.body)) || {};
+        const count = Number(
+          d.card_count || d.total_cards || d.cards || d.count ||
+          (d.pagination && d.pagination.total) || 0
+        );
+        if (count > 0) sets[0].card_count = count;
+        if (d.year != null && !sets[0].year) sets[0].year = Number(d.year);
+      } catch (e) {
+        console.warn("[catalog] set detail failed:", e.message);
+      }
+    }
 
     /* Write through, including the miss. */
     if (supabaseAdmin) {
