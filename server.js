@@ -659,11 +659,46 @@ function looksLikeSetCode(v) {
   return /^[A-Za-z]{2,4}$/.test(String(v || "").trim());
 }
 
-function expandPokemonSet(setValue, ai) {
-  const v = String(setValue || "").trim();
-  if (!v || !looksLikeSetCode(v)) return v;
-  if (!isPokemon(ai)) return v;                     // sports abbreviations mean other things
-  return POKEMON_SET_CODES[v.toUpperCase()] || v;   // unknown code passes through
+/* Decide the set from two inputs the model reports separately: the code
+   it READ off the card, and the name it BELIEVES that code means.
+
+   The first version asked the model to expand codes itself, which went
+   badly in the way these things always do. Told to expand "whenever you
+   can", it met an unfamiliar code and reached for the nearest one it
+   knew: PFL came back as "Obsidian Flames" (that is OBF) and ASC as
+   "Astral Radiance" (that is ASR). It then moved the YEAR to match the
+   wrong set, so a 2025 card was recorded as 2022.
+
+   A confidently wrong set name is worse than an unresolved code. The
+   code was honest about being unknown; the name pulls comps for a
+   different card and looks authoritative doing it.
+
+   So the model is no longer the authority on this. A code we can name
+   gets the name from the table. A code we cannot name stays a code —
+   accurate, searchable, and obviously unresolved to anyone looking at
+   it. The model's guess is only used when it did not report a code at
+   all, which is the case for every sports card and for older Pokemon
+   sets that never printed one. */
+function resolvePokemonSet(ai) {
+  const code  = String((ai && ai.setCode) || "").trim();
+  const named = String((ai && ai.set) || "").trim();
+
+  if (!isPokemon(ai)) return named;      // sports abbreviations mean other things
+
+  // The model put a code in the set field itself — older behaviour, still handle it.
+  const codeInSet = looksLikeSetCode(named) ? named : "";
+  const readCode  = code || codeInSet;
+
+  if (readCode) {
+    const known = POKEMON_SET_CODES[readCode.toUpperCase()];
+    if (known) return known;
+    /* Unknown code. Keep it rather than accepting a name the model may
+       have invented to fill the gap — and if the name IS the code, that
+       is what we return anyway. */
+    return readCode.toUpperCase();
+  }
+
+  return named;
 }
 
 function isLikelyCardListing(title) {
@@ -1622,7 +1657,7 @@ async function scanWithOpenAI(frontFile, backFile) {
     messages: [
       { role: "system", content: "You are an expert trading card identifier. You examine photos of sports cards, Pokemon cards, TCG cards, graded slabs, and sealed product. You return ONLY valid JSON with no markdown, no code fences, and no commentary. You never estimate dollar values." },
       { role: "user", content: [
-        { type: "text", text: "Identify this card as precisely as possible. Return ONLY a JSON object with these exact keys: cardName, player, year, brand, set, cardNumber, sport, parallel, serialNumber, language, isRookie, isAutograph, isPatch, gradeCompany, gradeValue, signal, confidence, summary.\n\nTHE SINGLE MOST IMPORTANT FIELD IS player. Never leave it empty.\n- On a sports card it is the athlete's name.\n- ON A POKEMON OR TCG CARD IT IS THE CREATURE'S NAME, including its suffix exactly as printed: 'Coalossal VMAX', 'Charizard V', 'Umbreon VMAX', 'Pikachu ex', 'Mewtwo GX'. Set sport to 'Pokemon' and brand to 'Pokemon'. Without the name every price lookup fails, so read it off the top of the card even if the rest of the card is unclear.\n\nCRITICAL — PARALLEL IDENTIFICATION. Parallels change a card's value by 10x or more, so look carefully before concluding a card is base:\n- Border color is the main tell. Panini Prizm/Select/Optic parallels are named by color: Silver, Red, Blue, Green, Orange, Purple, Gold, Black, Pink, Camo, Mojo, Wave, Hyper, Disco, Shimmer, Ice.\n- Topps Chrome parallels: Refractor, X-Fractor, Prism, Atomic, Sepia, Gold, Orange, Red, SuperFractor, Negative, Speckle.\n- POKEMON: the variant matters as much as any colour parallel. Report it in the parallel field. Vintage: 1st Edition (look for the black stamp to the left of the artwork), Shadowless (no drop shadow on the right of the art box). Any era: Reverse Holo (the CARD BODY is foil, the artwork is not), Full Art, Alt Art, Rainbow Rare, Gold Secret Rare, Illustration Rare. Do NOT write Unlimited or Regular \u2014 that is the base printing, so leave parallel empty.\n- Look for rainbow/foil sheen, cracked-ice texture, sparkle, or a colored border that differs from the base design.\n- Look for serial numbering printed on the front or back, usually small, formatted like 25/99 or /99. Report it exactly as printed in serialNumber. POKEMON CARD NUMBERS ARE NOT SERIAL NUMBERING: 074/073, 4/102 and SV107/SV122 are the card's number within its set. Put those in cardNumber and leave serialNumber EMPTY.\n- '1/1' or 'One of One' is critical — always report it.\n- If you see a colored border or foil pattern but cannot name the exact parallel, use the color plus the word Parallel, e.g. 'Blue Parallel'.\n- Use an empty string for parallel ONLY if the card is clearly a plain base card.\n\nSET FIELD RULES — IMPORTANT:\n- The 'set' field must be the actual product/subset name as it would appear in an eBay listing title, for example 'Update Series', 'Draft Picks', 'Downtown', 'Kaboom'.\n- If the card is just the base set of the product, return an EMPTY STRING for set. Never return 'Base', 'Base Set', 'Base Rookie', or 'Common' — those words do not appear in listing titles and break the price search.\n- POKEMON IS THE EXCEPTION TO THAT RULE. Pokemon set names are real products and must ALWAYS be returned in full, even when they sound generic: 'Base Set', 'Jungle', 'Fossil', 'Team Rocket', 'Neo Genesis', 'Evolving Skies', 'Champions Path', 'Darkness Ablaze', 'Rebel Clash', 'Hidden Fates', 'Obsidian Flames', '151'. Use the set symbol and the card number to identify it. Never return an empty set for a Pokemon card if you can name the set at all.\n- NEVER RETURN A SET CODE. Modern Pokemon cards print a 3-letter abbreviation in the bottom corner next to the card number \u2014 SVI, PAL, OBF, EVS, SSP, PRE, MEW. That is a code, not a name. Expand it: 'EVS' is 'Evolving Skies', 'OBF' is 'Obsidian Flames', 'MEW' is '151', 'SSP' is 'Surging Sparks'. Nobody searches eBay for 'EVS', so returning the code breaks every price lookup and every checklist match. If you can read the code but genuinely do not know which set it belongs to, return the code rather than nothing \u2014 but expand it whenever you can.\n\nLANGUAGE:\n- Return 'Japanese' if the card text is Japanese, or 'Chinese' or 'Korean' where those apply. Otherwise return 'English'.\n- Japanese Pokemon cards trade as a separate market at different prices, so getting this wrong misprices the card badly. They are a slightly different size, carry Japanese characters in the name and attack text, and usually print the card number without a set total.\n\nOTHER RULES:\n- If a back image is provided, TRUST THE BACK for card number, set name, and copyright year — printed text beats inferring from the front design.\n- If the card is in a graded slab, read the label for company, grade, year, player, set, and card number.\n- isRookie, isAutograph, isPatch must be true or false booleans.\n- signal must be one of: GRADE, WATCH, SELL RAW, HOT, VERIFY.\n- confidence must be High, Medium, or Low. Use Low if the image is blurry or you are unsure about the parallel.\n- Never guess a dollar value. Never include price fields." },
+        { type: "text", text: "Identify this card as precisely as possible. Return ONLY a JSON object with these exact keys: cardName, player, year, brand, set, setCode, cardNumber, sport, parallel, serialNumber, language, isRookie, isAutograph, isPatch, gradeCompany, gradeValue, signal, confidence, summary.\n\nTHE SINGLE MOST IMPORTANT FIELD IS player. Never leave it empty.\n- On a sports card it is the athlete's name.\n- ON A POKEMON OR TCG CARD IT IS THE CREATURE'S NAME, including its suffix exactly as printed: 'Coalossal VMAX', 'Charizard V', 'Umbreon VMAX', 'Pikachu ex', 'Mewtwo GX'. Set sport to 'Pokemon' and brand to 'Pokemon'. Without the name every price lookup fails, so read it off the top of the card even if the rest of the card is unclear.\n\nCRITICAL — PARALLEL IDENTIFICATION. Parallels change a card's value by 10x or more, so look carefully before concluding a card is base:\n- Border color is the main tell. Panini Prizm/Select/Optic parallels are named by color: Silver, Red, Blue, Green, Orange, Purple, Gold, Black, Pink, Camo, Mojo, Wave, Hyper, Disco, Shimmer, Ice.\n- Topps Chrome parallels: Refractor, X-Fractor, Prism, Atomic, Sepia, Gold, Orange, Red, SuperFractor, Negative, Speckle.\n- POKEMON: the variant matters as much as any colour parallel. Report it in the parallel field. Vintage: 1st Edition (look for the black stamp to the left of the artwork), Shadowless (no drop shadow on the right of the art box). Any era: Reverse Holo (the CARD BODY is foil, the artwork is not), Full Art, Alt Art, Rainbow Rare, Gold Secret Rare, Illustration Rare. Do NOT write Unlimited or Regular \u2014 that is the base printing, so leave parallel empty.\n- Look for rainbow/foil sheen, cracked-ice texture, sparkle, or a colored border that differs from the base design.\n- Look for serial numbering printed on the front or back, usually small, formatted like 25/99 or /99. Report it exactly as printed in serialNumber. POKEMON CARD NUMBERS ARE NOT SERIAL NUMBERING: 074/073, 4/102 and SV107/SV122 are the card's number within its set. Put those in cardNumber and leave serialNumber EMPTY.\n- '1/1' or 'One of One' is critical — always report it.\n- If you see a colored border or foil pattern but cannot name the exact parallel, use the color plus the word Parallel, e.g. 'Blue Parallel'.\n- Use an empty string for parallel ONLY if the card is clearly a plain base card.\n\nSET FIELD RULES — IMPORTANT:\n- The 'set' field must be the actual product/subset name as it would appear in an eBay listing title, for example 'Update Series', 'Draft Picks', 'Downtown', 'Kaboom'.\n- If the card is just the base set of the product, return an EMPTY STRING for set. Never return 'Base', 'Base Set', 'Base Rookie', or 'Common' — those words do not appear in listing titles and break the price search.\n- POKEMON IS THE EXCEPTION TO THAT RULE. Pokemon set names are real products and must ALWAYS be returned in full, even when they sound generic: 'Base Set', 'Jungle', 'Fossil', 'Team Rocket', 'Neo Genesis', 'Evolving Skies', 'Champions Path', 'Darkness Ablaze', 'Rebel Clash', 'Hidden Fates', 'Obsidian Flames', '151'. Use the set symbol and the card number to identify it. Never return an empty set for a Pokemon card if you can name the set at all.\n- POKEMON SET CODES \u2014 REPORT WHAT IS PRINTED, SEPARATELY FROM WHAT YOU THINK IT MEANS. Modern Pokemon cards print a 2-4 letter code in the bottom corner beside the card number: SVI, PAL, OBF, EVS, SSP, MEW, ASC, PFL.\n  \u2022 Put the code EXACTLY as printed in setCode. This is something you can read \u2014 report it even if the set is unfamiliar.\n  \u2022 Put the set name in set ONLY IF YOU ARE CERTAIN which set that code belongs to. If you are not certain, LEAVE set EMPTY. Do not reach for the closest set you happen to know.\n  \u2022 A wrong set name is far worse than no set name. It pulls comps for a different card and looks authoritative doing it. 'I read PFL and I do not know that set' is a correct and useful answer; guessing 'Obsidian Flames' because OBF is similar is not.\n  \u2022 The year must match the set you name. If you are unsure of the set, do not adjust the year to fit a guess \u2014 read the copyright year off the card.\n\nLANGUAGE:\n- Return 'Japanese' if the card text is Japanese, or 'Chinese' or 'Korean' where those apply. Otherwise return 'English'.\n- Japanese Pokemon cards trade as a separate market at different prices, so getting this wrong misprices the card badly. They are a slightly different size, carry Japanese characters in the name and attack text, and usually print the card number without a set total.\n\nOTHER RULES:\n- If a back image is provided, TRUST THE BACK for card number, set name, and copyright year — printed text beats inferring from the front design.\n- If the card is in a graded slab, read the label for company, grade, year, player, set, and card number.\n- isRookie, isAutograph, isPatch must be true or false booleans.\n- signal must be one of: GRADE, WATCH, SELL RAW, HOT, VERIFY.\n- confidence must be High, Medium, or Low. Use Low if the image is blurry or you are unsure about the parallel.\n- Never guess a dollar value. Never include price fields." },
         ...images
       ]}
     ],
@@ -2047,11 +2082,11 @@ app.post(
         cardName:          cleanCardName || "Unknown Trading Card",
         player:            ai.player     || "Unknown",
         year:              ai.year       || "Unknown",
-        /* A three-letter code is not a set name. Expanded here rather
-           than trusted from the model alone, because the model gets it
-           right most of the time and "most" is not good enough for a
-           field that feeds price lookups and checklist matching. */
-        set:               expandPokemonSet(ai.set, ai) || "Unknown",
+        /* Resolved from the code the model READ, not the name it
+           inferred. See resolvePokemonSet — the model guessing at
+           unfamiliar codes was producing confidently wrong set names. */
+        set:               resolvePokemonSet(ai) || "Unknown",
+        setCode:           String(ai.setCode || "").trim().toUpperCase() || null,
         brand:             ai.brand      || "Unknown",
         cardNumber:        ai.cardNumber || "Unknown",
         sport:             ai.sport      || "Unknown",
