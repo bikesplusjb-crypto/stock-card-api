@@ -2270,6 +2270,82 @@ app.get("/api/price-history", async (req, res) => {
 });
 
 // ── /api/cardapi-status ────────────────────────────────────────
+/* ── /api/parse-cards ───────────────────────────────────────────
+   Turn a pasted list of card names into structured rows.
+
+   The whole point of bulk entry is getting a real collection in without
+   paying for it. So this calls NOTHING — no AI, no eBay, no thecardapi.
+   It is the same parser the search box uses, run over many lines at
+   once, and it costs a few milliseconds of CPU.
+
+   Cards land unpriced. Pricing is the expensive half and it happens
+   later, in batches, the way the Show Log already prices cards logged
+   with no signal. Someone with 800 cards can get them all in tonight and
+   price the ones that matter over the following week.
+
+   Lives on the server rather than in the binder so the parser has one
+   home. A copy in the frontend would drift from this one within a month,
+   and then a typed search and a pasted line would disagree about the
+   same card.
+   ────────────────────────────────────────────────────────────── */
+const BULK_MAX_LINES = 200;
+
+app.post("/api/parse-cards", (req, res) => {
+  try {
+    const body = req.body || {};
+    let lines = [];
+
+    if (Array.isArray(body.lines)) lines = body.lines;
+    else if (typeof body.text === "string") lines = body.text.split(/\r?\n/);
+
+    /* Trim, drop blanks, and de-duplicate case-insensitively. A pasted
+       list is usually somebody's spreadsheet column, and those come with
+       repeats. */
+    const seen = Object.create(null);
+    const clean = [];
+    for (const raw of lines) {
+      const line = String(raw == null ? "" : raw).replace(/\s+/g, " ").trim();
+      if (!line) continue;
+      const key = line.toLowerCase();
+      if (seen[key]) continue;
+      seen[key] = 1;
+      clean.push(line.slice(0, 200));
+      if (clean.length >= BULK_MAX_LINES) break;
+    }
+
+    if (!clean.length) {
+      return res.json({ success: true, count: 0, cards: [], truncated: false, maxLines: BULK_MAX_LINES });
+    }
+
+    const cards = clean.map(name => {
+      const parsed = parseCardQuery(name);
+      /* Flag rows the parser is unsure about so the preview can highlight
+         them BEFORE anything is written. A wrong row caught here costs a
+         keystroke; caught later it costs a delete and a re-add. */
+      const thin = !parsed.year && !parsed.brand;
+      return {
+        card_name: name,
+        year:      parsed.year,
+        brand:     parsed.brand,
+        set_name:  parsed.set,
+        player:    parsed.player,
+        parallel:  parsed.parallel,
+        thin:      thin
+      };
+    });
+
+    res.json({
+      success:   true,
+      count:     cards.length,
+      truncated: lines.filter(l => String(l||"").trim()).length > BULK_MAX_LINES,
+      maxLines:  BULK_MAX_LINES,
+      cards:     cards
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: "Could not read that list", details: error.message });
+  }
+});
+
 app.get("/api/cardapi-status", async (req, res) => {
   if (!CARDAPI_KEY) return res.json({ success: true, configured: false });
   try {
