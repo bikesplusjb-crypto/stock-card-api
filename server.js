@@ -2608,6 +2608,163 @@ app.get("/api/vs-market", async (req, res) => {
   }
 });
 
+/* ── CATALOG: HOW MANY CARDS ARE IN THIS SET? ───────────────────
+
+   Set completion needs exactly one number a collection cannot supply:
+   the size of the set. You cannot learn "792" from owning 780 — that is
+   precisely the number you do not have. Until now the person had to
+   type it.
+
+   The Catalog knows. But its allowance is the tightest budget in the
+   whole system: 500 records a day on Builder, and EVERY RECORD RETURNED
+   COUNTS AS ONE. A careless implementation would spend that before
+   lunch.
+
+   Three decisions follow from that:
+
+   1. Ask for the smallest useful page. Five candidate sets, not a
+      hundred. Five records per lookup means a hundred lookups a day,
+      which is far more than this will ever need.
+
+   2. Cache the answer permanently and share it across every user. A
+      set's card count does not change — 1952 Topps has the same number
+      of cards as it did last year. The first person to look it up pays
+      the records; everyone after reads Supabase for free.
+
+   3. Cache MISSES too. Without that, a set the Catalog does not carry
+      gets re-queried on every page load, draining the pool for nothing
+      and returning nothing each time.
+
+   The full checklist — which specific cards a set contains, and so
+   which ones are missing — is a separate and much more expensive
+   question: a 792-card set costs 792 records, more than a whole day on
+   Builder. That is deliberately not attempted here. This endpoint
+   answers "how many", which costs almost nothing and is most of what
+   people want.
+   ─────────────────────────────────────────────────────────────── */
+const CATALOG_BASE      = "https://www.thecardapi.com/api/v1/catalog";
+const CATALOG_PAGE_SIZE = 5;      // records per lookup — see note 1 above
+const CATALOG_TIMEOUT   = 9000;
+
+function normaliseSetQuery(q) {
+  return String(q || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+
+async function catalogFetch(pathAndQuery) {
+  if (!CARDAPI_KEY) throw new Error("no catalog key");
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), CATALOG_TIMEOUT);
+  try {
+    const r = await fetch(CATALOG_BASE + pathAndQuery, {
+      headers: { "x-api-key": CARDAPI_KEY },
+      signal: ctrl.signal
+    });
+    const remaining = r.headers.get("x-ratelimit-remaining");
+    if (r.status === 401 || r.status === 403) throw new Error("catalog not on this plan");
+    if (r.status === 429) throw new Error("catalog daily allowance used up");
+    if (!r.ok) throw new Error("catalog error " + r.status);
+    const body = await r.json();
+    return { body: body, remaining: remaining };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+app.get("/api/set-lookup", async (req, res) => {
+  const raw = String(req.query.q || "").trim();
+  const q   = normaliseSetQuery(raw);
+  if (q.length < 3) {
+    return res.json({ success: true, cached: false, sets: [], note: "Give us a bit more to go on." });
+  }
+
+  /* Cache first, always. This is the branch that runs almost every
+     time once the common sets have been seen once. */
+  if (supabaseAdmin) {
+    try {
+      const hit = await supabaseAdmin
+        .from("catalog_set_queries").select("ucid,found").eq("q", q).maybeSingle();
+      if (hit.data) {
+        if (!hit.data.found) {
+          return res.json({ success: true, cached: true, sets: [],
+                            note: "No matching set in the catalog." });
+        }
+        const set = await supabaseAdmin
+          .from("catalog_sets")
+          .select("ucid,set_name,year,sport,card_count,parent_name")
+          .eq("ucid", hit.data.ucid).maybeSingle();
+        if (set.data) {
+          return res.json({ success: true, cached: true, sets: [set.data] });
+        }
+      }
+    } catch (e) {
+      /* A cache that is down is a slow day, not a broken feature. */
+      console.warn("[catalog] cache read failed:", e.message);
+    }
+  }
+
+  if (!CARDAPI_KEY) {
+    return res.json({ success: true, cached: false, sets: [], note: "Catalog not configured." });
+  }
+
+  try {
+    const params = new URLSearchParams({ q: raw, limit: String(CATALOG_PAGE_SIZE) });
+    const { body, remaining } = await catalogFetch("/sets?" + params.toString());
+    const rows = Array.isArray(body && body.data) ? body.data : [];
+
+    const sets = rows.map(r => ({
+      ucid:        r.ucid || r.set_ucid || null,
+      set_name:    r.set_name || r.name || "",
+      year:        r.year != null ? Number(r.year) : null,
+      sport:       r.sport || null,
+      /* The docs describe this endpoint as returning card counts; the
+         field name is read defensively because a rename upstream should
+         degrade to "we don't know" rather than to a wrong number. */
+      card_count:  Number(r.card_count || r.total_cards || r.cards || 0) || null,
+      parent_name: r.parent_set_name || null,
+      slug:        r.slug || null
+    })).filter(x => x.ucid && x.set_name);
+
+    /* Write through, including the miss. */
+    if (supabaseAdmin) {
+      try {
+        if (sets.length) {
+          await supabaseAdmin.from("catalog_sets").upsert(
+            sets.map(x => Object.assign({}, x, { fetched_at: new Date().toISOString() })),
+            { onConflict: "ucid" }
+          );
+        }
+        await supabaseAdmin.from("catalog_set_queries").upsert({
+          q: q,
+          ucid: sets.length ? sets[0].ucid : null,
+          found: sets.length > 0,
+          fetched_at: new Date().toISOString()
+        }, { onConflict: "q" });
+      } catch (e) {
+        console.warn("[catalog] cache write failed:", e.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      cached: false,
+      sets: sets,
+      remaining: remaining != null ? Number(remaining) : null,
+      note: sets.length ? "" : "No matching set in the catalog."
+    });
+  } catch (error) {
+    /* Never a 500 to the browser. A failed lookup means somebody types
+       the number themselves, which is exactly what they did before this
+       endpoint existed — the page must keep working. */
+    console.warn("[catalog] lookup failed:", error.message);
+    res.json({ success: true, cached: false, sets: [], note: error.message });
+  }
+});
+
 // ── WATCHLIST DAILY PRICE REFRESH ──────────────────────────────
 const cron = require("node-cron");
 const { createClient } = require("@supabase/supabase-js");
