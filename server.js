@@ -497,26 +497,40 @@ function normalizeCardQuery(query) {
    the printed card; here it stays null.
    ============================================================ */
 
-/* Longest first, so "Topps Chrome" wins before "Topps" can match it. */
+/* MANUFACTURERS ONLY.
+
+   An earlier version listed "Topps Chrome" and "Panini Prizm" as brands,
+   which produced two records of the same product line that disagreed:
+   a typed search stored brand="Topps Chrome", set=null, while a photo
+   scan of the same card stored brand="Topps", set="Chrome". Sorting by
+   brand then split one product line across two buckets.
+
+   The scan path is the more authoritative of the two — it reads the card
+   rather than guessing from a sentence — so the parser follows it.
+   Manufacturer in `brand`, product line in `set`. "Topps Chrome" is
+   Topps making a set called Chrome, and that is how it is stored. */
 const KNOWN_BRANDS = [
-  "Topps Chrome", "Topps Finest", "Topps Heritage", "Topps Update",
-  "Bowman Chrome", "Bowman Draft", "Bowman Sterling",
-  "Panini Prizm", "Panini Select", "Panini Mosaic", "Panini Optic",
-  "Panini Donruss", "Panini Contenders", "Panini Immaculate",
-  "Upper Deck", "Fleer Ultra", "Score Select",
-  "Topps", "Bowman", "Panini", "Donruss", "Fleer", "Score", "Leaf",
-  "Prizm", "Mosaic", "Optic", "Select", "Chrome", "Finest", "Heritage",
-  "Stadium Club", "Allen & Ginter", "Gypsy Queen", "Pokemon", "Pok\u00e9mon"
+  "Upper Deck", "Panini", "Topps", "Bowman", "Donruss", "Fleer",
+  "Score", "Leaf", "Pinnacle", "Pok\u00e9mon", "Pokemon"
 ];
 
-/* Set/subset words that follow a brand. Only ones common enough to be
-   worth the risk of a false positive. */
+/* Product lines and sets, longest first so "Update Series" is matched
+   before a bare "Update" can take half of it.
+
+   Bowman is deliberately in both lists. It is a manufacturer in its own
+   right AND a Topps product line, so "2023 Bowman Chrome" resolves to
+   brand Bowman / set Chrome, and "2023 Topps Bowman" to brand Topps /
+   set Bowman. Whichever appears first wins, which is how people write
+   them. */
 const KNOWN_SETS = [
-  "Update Series", "Update", "Chrome", "Refractor", "Heritage", "Finest",
-  "Stadium Club", "Opening Day", "Allen & Ginter", "Gypsy Queen",
-  "Base Set", "Jungle", "Fossil", "Team Rocket", "Neo Genesis",
-  "Evolving Skies", "Hidden Fates", "Rebel Clash", "Darkness Ablaze",
-  "Champions Path", "Obsidian Flames", "Sword & Shield", "Silver Tempest"
+  "Update Series", "Stadium Club", "Allen & Ginter", "Gypsy Queen",
+  "Opening Day", "Bowman Draft", "Bowman Sterling", "Bowman Chrome",
+  "Sword & Shield", "Evolving Skies", "Hidden Fates", "Rebel Clash",
+  "Darkness Ablaze", "Champions Path", "Obsidian Flames", "Silver Tempest",
+  "Neo Genesis", "Team Rocket", "Base Set",
+  "Contenders", "Immaculate", "Heritage", "Finest", "Chrome", "Update",
+  "Prizm", "Mosaic", "Optic", "Select", "Bowman", "Jungle", "Fossil",
+  "Flawless", "Absolute", "Certified", "Spectra", "Obsidian"
 ];
 
 /* Words that are never part of a player's name. Grades, conditions,
@@ -542,25 +556,33 @@ function parseCardQuery(query) {
     rest = rest.replace(ym[0], " ");
   }
 
-  /* Brand, longest match first. */
+  const wordRe = t => new RegExp("\\b" + t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "i");
+
+  /* Manufacturer. */
   for (const b of KNOWN_BRANDS) {
-    const re = new RegExp("\\b" + b.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "i");
-    if (re.test(rest)) {
+    if (wordRe(b).test(rest)) {
       out.brand = b;
-      rest = rest.replace(re, " ");
+      rest = rest.replace(wordRe(b), " ");
       break;
     }
   }
 
-  /* Set, from what's left. */
-  for (const st of KNOWN_SETS) {
-    const re = new RegExp("\\b" + st.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "i");
-    if (re.test(rest)) {
+  /* Product line, longest first. */
+  const setsByLength = KNOWN_SETS.slice().sort((a, b) => b.length - a.length);
+  for (const st of setsByLength) {
+    if (wordRe(st).test(rest)) {
       out.set = st;
-      rest = rest.replace(re, " ");
+      rest = rest.replace(wordRe(st), " ");
       break;
     }
   }
+
+  /* People say "2020 Prizm Herbert" without writing Panini, and "Prizm"
+     alone identifies the product perfectly well. Rather than record no
+     brand at all, let the set stand in — better a searchable brand than
+     an empty column, and it matches how the card is actually referred
+     to. */
+  if (!out.brand && out.set) out.brand = out.set;
 
   /* Parallel: reuse the same word lists the ask and sold filters use, so
      "silver prizm" means the same thing everywhere in this file. */
