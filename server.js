@@ -1496,11 +1496,78 @@ function summarizeSold(records, query, limitUsed) {
     soldRawBasis:       rawBasis,
     soldGradeBreakdown: soldGradeBreakdown(ladderSrc),
     bestOfferCount: clean.filter(r => r.listingType === "best_offer").length,
+
+    /* How these sales happened, not just what they went for.
+    
+       An auction ending at $14.50 and a Buy It Now at $14.50 are not the
+       same fact. An auction is several people converging on a price; a
+       fixed-price sale is one person accepting one seller's number. A
+       median built entirely from fixed-price listings is a median of
+       what sellers asked and somebody eventually paid \u2014 which is much
+       closer to an asking price than it looks.
+    
+       Card Ladder shows the listing type per sale. Worth having as a
+       mix, because the mix is what tells you whether to trust the
+       median. */
+    listingMix: listingMix(clean),
     lastSaleDate:   dates.length ? dates[dates.length - 1] : null,
     sales:          clean.slice(0, 12),
     query:          query,
     lookbackDays:   CARDAPI_LOOKBACK
   };
+}
+
+/* Sales grouped by how they happened. Returns null rather than a table
+   of zeroes when the source doesn't carry the field, so the frontend can
+   stay silent instead of printing an empty breakdown. */
+function listingMix(rows) {
+  if (!Array.isArray(rows) || !rows.length) return null;
+  const typed = rows.filter(r => r && r.listingType);
+  if (!typed.length) return null;
+
+  const bucket = t => {
+    const v = String(t || "").toLowerCase();
+    if (v.indexOf("auction") > -1)   return "auction";
+    if (v.indexOf("best_offer") > -1 || v.indexOf("best offer") > -1) return "bestOffer";
+    if (v.indexOf("fixed") > -1 || v.indexOf("buy") > -1) return "fixed";
+    return "other";
+  };
+
+  const counts = { auction: 0, bestOffer: 0, fixed: 0, other: 0 };
+  const prices = { auction: [], bestOffer: [], fixed: [], other: [] };
+  typed.forEach(r => {
+    const b = bucket(r.listingType);
+    counts[b] += 1;
+    const p = Number(r.price);
+    if (isFinite(p) && p > 0) prices[b].push(p);
+  });
+
+  const out = {
+    total:      typed.length,
+    untyped:    rows.length - typed.length,
+    auction:    counts.auction,
+    bestOffer:  counts.bestOffer,
+    fixed:      counts.fixed,
+    other:      counts.other,
+    auctionMedian: median(prices.auction),
+    fixedMedian:   median(prices.fixed),
+    note: ""
+  };
+
+  /* The reading, not just the numbers. A median resting almost entirely
+     on fixed-price sales deserves a caveat: nobody competed for those,
+     so they describe what one buyer accepted rather than what the market
+     converged on. */
+  const pctAuction = Math.round((out.auction / out.total) * 100);
+  if (out.total < 4) {
+    out.note = "";
+  } else if (pctAuction >= 60) {
+    out.note = "Mostly auctions \u2014 these are prices buyers competed to reach.";
+  } else if (pctAuction <= 15) {
+    out.note = "Almost all fixed-price sales. Nobody bid against anyone here, so these " +
+               "are closer to what sellers asked than what a market settled on.";
+  }
+  return out;
 }
 
 async function readSoldCache(key) {
@@ -2123,9 +2190,18 @@ app.post(
       const ai = await scanWithOpenAI(front, back);
 
       const cleanCardName = buildDisplayName(ai);
+
+      /* Verification runs alongside the price lookup rather than before
+         it. Sequencing them would add its latency to every scan for a
+         check that usually passes; in parallel it is nearly free in
+         wall-clock time and the result is ready when the response is
+         assembled. */
+      const verifyPromise = verifyAgainstCatalog(ai);
+
       const market        = await getCardMarketForCard(ai);
       const searchQuery   = market.searchQuery || buildCardQuery(ai) || cleanCardName;
       const sold          = await getSoldComps(searchQuery, market.avgPrice);
+      const verification  = await verifyPromise;
 
       console.log(
         "[scan] " + cleanCardName +
@@ -2138,7 +2214,10 @@ app.post(
         " | n=" + market.listingCount +
         " | ask=$" + market.avgPrice +
         " | sold=$" + (sold && sold.soldMedian ? sold.soldMedian : "-") +
-        " (" + (sold ? sold.soldCount : 0) + " sales" + (sold && sold.cached ? ", cached" : "") + ")"
+        " (" + (sold ? sold.soldCount : 0) + " sales" + (sold && sold.cached ? ", cached" : "") + ")" +
+        " | verified=" + (verification.checked
+            ? (verification.exists === true ? "yes" : verification.exists === false ? "NO" : "?")
+            : "skipped")
       );
 
       return res.json({
@@ -2169,6 +2248,16 @@ app.post(
         spreadNote:        market.spreadNote   || "",
         signal:            ai.signal     || "VERIFY",
         confidence:        ai.confidence || "Medium",
+
+        /* A second opinion from the catalog. Deliberately reported
+           alongside the read rather than folded into it: if this ever
+           silently replaced a field, somebody would see a confident
+           answer with no way to know it had been swapped.
+
+           verified.exists === false is the useful one. It means the set
+           is real and the card number is not in it, which is what a
+           misread looks like from the outside. */
+        verified:          verification,
         summary:           ai.summary    || "AI scan complete. Verify exact version, condition, and comps.",
         avgSoldPrice:      market.avgPrice,
         avgPrice:          market.avgPrice,
@@ -2501,6 +2590,162 @@ app.get("/api/price-history", async (req, res) => {
                days: days, points: data || [] });
   } catch (error) {
     res.status(500).json({ success: false, error: "History lookup failed", details: error.message });
+  }
+});
+
+/* ── UP, DOWN, OR NEITHER ───────────────────────────────────────
+
+   The old Beckett guides put an arrow next to every card. They could,
+   because they compared monthly issues over dense data on cards that
+   traded constantly.
+
+   This does not have that. A 30-day median can rest on four sales, and
+   if one $40 sale ages out while a $55 one arrives, the median jumps
+   30% without the card having moved at all. An arrow on that is the
+   same failure as a confident price on a mixed search: a number that
+   sounds certain and describes nothing.
+
+   So the arrow has to earn its place three times over:
+
+     - enough sales on BOTH sides of the comparison, not just recently
+     - a move big enough to clear the noise those few sales create
+     - two windows far enough apart to be different periods
+
+   Most cards will fail one of those and show a flat dash. That is the
+   honest answer for a card that traded six times in a month, and a
+   dash that means "we don't know" is worth more than an arrow that
+   means nothing.
+   ─────────────────────────────────────────────────────────────── */
+
+const MOVE_WINDOW_DAYS = 15;   // each half of the comparison
+const MOVE_MIN_SALES   = 4;    // per side — below this, medians are noise
+const MOVE_MIN_PCT     = 8;    // smaller than this is not a movement
+
+function medianOf(nums) {
+  const a = nums.filter(n => typeof n === "number" && isFinite(n) && n > 0).sort((x, y) => x - y);
+  if (!a.length) return null;
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+
+/* Returns one of: up, down, flat, unknown — and always says why. The
+   reason is not decoration; a dash with no explanation reads as broken,
+   and a dash that says "only 3 sales" reads as careful. */
+function movementFrom(points) {
+  const out = { direction: "unknown", pct: null, reason: "", recent: null, prior: null,
+                recentSales: 0, priorSales: 0 };
+  if (!Array.isArray(points) || !points.length) {
+    out.reason = "No price history for this card yet.";
+    return out;
+  }
+
+  const now  = Date.now();
+  const dayMs = 86400000;
+  const recentCut = now - MOVE_WINDOW_DAYS * dayMs;
+  const priorCut  = now - MOVE_WINDOW_DAYS * 2 * dayMs;
+
+  const recent = [], prior = [];
+  let recentSales = 0, priorSales = 0;
+
+  points.forEach(p => {
+    const t = new Date(p.sale_date + "T12:00:00Z").getTime();
+    const v = Number(p.sold_median);
+    const n = Number(p.sold_count) || 0;
+    if (!isFinite(t) || !(v > 0)) return;
+    if (t >= recentCut)      { recent.push(v); recentSales += n; }
+    else if (t >= priorCut)  { prior.push(v);  priorSales  += n; }
+  });
+
+  out.recentSales = recentSales;
+  out.priorSales  = priorSales;
+
+  if (!recent.length || !prior.length) {
+    out.reason = "Not enough history yet \u2014 we need about a month to compare two periods.";
+    return out;
+  }
+
+  /* The gate that matters. Two medians built on a handful of sales each
+     will disagree by 20% on nothing at all. */
+  if (recentSales < MOVE_MIN_SALES || priorSales < MOVE_MIN_SALES) {
+    out.reason = "Too few sales to call it \u2014 " + recentSales + " recently against " +
+                 priorSales + " before that. Below " + MOVE_MIN_SALES +
+                 " a side, the median moves on which cards happened to sell.";
+    return out;
+  }
+
+  const r = medianOf(recent), p = medianOf(prior);
+  if (!r || !p) { out.reason = "No usable prices in one of the periods."; return out; }
+
+  out.recent = Math.round(r);
+  out.prior  = Math.round(p);
+  const pct = ((r - p) / p) * 100;
+  out.pct = Math.round(pct * 10) / 10;
+
+  if (Math.abs(pct) < MOVE_MIN_PCT) {
+    out.direction = "flat";
+    out.reason = "Holding steady \u2014 moved " + (pct >= 0 ? "+" : "") + out.pct +
+                 "%, which is inside the noise on this many sales.";
+    return out;
+  }
+
+  out.direction = pct > 0 ? "up" : "down";
+  out.reason = "Median of the last " + MOVE_WINDOW_DAYS + " days against the " +
+               MOVE_WINDOW_DAYS + " before it, on " + (recentSales + priorSales) + " sales.";
+  return out;
+}
+
+/* GET /api/card-movement?query=...
+   One card. The binder asks for several, so it batches below. */
+app.get("/api/card-movement", async (req, res) => {
+  try {
+    const query = String(req.query.query || "").trim();
+    if (!query) return res.status(400).json({ success: false, error: "query required" });
+    if (!supabaseAdmin) return res.json({ success: true, movement: { direction: "unknown",
+                                          reason: "History not configured." } });
+
+    const { data, error } = await supabaseAdmin
+      .from("card_price_history")
+      .select("sale_date,sold_median,sold_count")
+      .eq("cache_key", cacheKeyFor(query))
+      .gte("sale_date", daysAgoISO(MOVE_WINDOW_DAYS * 2 + 2))
+      .order("sale_date", { ascending: true });
+    if (error) throw new Error(error.message);
+
+    res.set("Cache-Control", "no-store");
+    res.json({ success: true, query: query, movement: movementFrom(data || []) });
+  } catch (error) {
+    res.json({ success: false, error: error.message });
+  }
+});
+
+/* POST /api/card-movement-batch  { queries: [...] }
+   A binder with sixty cards should be one request, not sixty. */
+app.post("/api/card-movement-batch", async (req, res) => {
+  try {
+    let queries = (req.body && req.body.queries) || [];
+    if (!Array.isArray(queries)) return res.status(400).json({ success: false, error: "queries must be an array" });
+    queries = queries.map(q => String(q || "").trim()).filter(Boolean).slice(0, 300);
+    if (!queries.length || !supabaseAdmin) return res.json({ success: true, movements: {} });
+
+    const keys = [...new Set(queries.map(cacheKeyFor))];
+    const { data, error } = await supabaseAdmin
+      .from("card_price_history")
+      .select("cache_key,sale_date,sold_median,sold_count")
+      .in("cache_key", keys)
+      .gte("sale_date", daysAgoISO(MOVE_WINDOW_DAYS * 2 + 2))
+      .order("sale_date", { ascending: true });
+    if (error) throw new Error(error.message);
+
+    const byKey = {};
+    (data || []).forEach(r => { (byKey[r.cache_key] = byKey[r.cache_key] || []).push(r); });
+
+    const movements = {};
+    queries.forEach(q => { movements[q] = movementFrom(byKey[cacheKeyFor(q)] || []); });
+
+    res.set("Cache-Control", "no-store");
+    res.json({ success: true, movements: movements });
+  } catch (error) {
+    res.json({ success: false, error: error.message });
   }
 });
 
@@ -2906,6 +3151,153 @@ app.get("/api/set-lookup", async (req, res) => {
     res.json({ success: true, cached: false, sets: [], note: error.message });
   }
 });
+
+/* ── DOES THIS CARD EXIST? ──────────────────────────────────────
+
+   Every accuracy failure this week was the same shape: the model
+   produced a plausible answer and nothing checked whether the card it
+   described was real. Topps read as Donruss. A 2026 Murakami came back
+   as 2022. An unrecognised Pokemon code resolved to the nearest set the
+   model happened to know, and the year moved to match.
+
+   None of those are hard to catch. The catalog knows what exists — it
+   is the subscription that has so far produced exactly one checklist —
+   and asking it "is there a #274 in 2026 Bowman Chrome?" is a boolean,
+   not an opinion.
+
+   Three decisions shape this:
+
+   1. It NEVER changes the answer. A verification step that quietly
+      substitutes a different card is worse than no verification: the
+      person sees a confident result and has no idea it was swapped.
+      This annotates and, when it disagrees, says so.
+
+   2. It costs at most a handful of records, and only when there is
+      something to check. No card number means nothing to look up, so
+      it does not run.
+
+   3. It fails silent. The catalog being down, out of allowance, or not
+      on the plan must leave the scan exactly as it was. Verification is
+      a second opinion, not a dependency.
+   ─────────────────────────────────────────────────────────────── */
+
+const VERIFY_MAX_CANDIDATES = 5;
+
+/* Card numbers are compared the way people write them, not the way they
+   are stored: "#027", "27" and "027" are the same card, and Pokemon's
+   "4/102" has to survive intact. */
+function sameCardNumber(a, b) {
+  const n = v => String(v == null ? "" : v).trim().toLowerCase()
+                   .replace(/^#+/, "").replace(/^0+(?=\d)/, "");
+  const x = n(a), y = n(b);
+  return !!x && x === y;
+}
+
+async function verifyAgainstCatalog(ai) {
+  const out = {
+    checked:   false,      // did we get to ask?
+    exists:    null,       // true / false / null when unknown
+    confidence:null,       // high | medium | low
+    ucid:      null,
+    note:      "",
+    candidates: []
+  };
+
+  if (!CARDAPI_KEY) return out;
+
+  const number = String(ai.cardNumber || "").trim();
+  const year   = parseInt(ai.year, 10);
+  const brand  = String(ai.brand || "").trim();
+  const setNm  = String(ai.set || "").trim();
+
+  /* Without a card number there is nothing precise to verify. A name and
+     a year match half the hobby. */
+  if (!number || number.toLowerCase() === "unknown") {
+    out.note = "No card number read, so nothing to check against.";
+    return out;
+  }
+
+  try {
+    /* Find the set first. This is the same lookup the set-size feature
+       uses and it shares the same cache, so for any set somebody has
+       already looked up it costs nothing at all. */
+    const setQuery = [year || "", brand, setNm].filter(Boolean).join(" ").trim();
+    if (!setQuery) return out;
+
+    const params = new URLSearchParams({ q: setQuery, limit: String(VERIFY_MAX_CANDIDATES) });
+    if (year)      params.set("year", String(year));
+    if (ai.sport)  params.set("sport", String(ai.sport));
+
+    const setRes = await catalogFetch("/sets?" + params.toString());
+    const sets = Array.isArray(setRes.body && setRes.body.data) ? setRes.body.data : [];
+    if (!sets.length) {
+      out.checked = true;
+      out.note = "That set isn't in the card catalog, so we couldn't confirm it.";
+      return out;
+    }
+
+    /* Prefer the right year and a set with no parent — a base product
+       rather than an insert inside another one. */
+    sets.sort((a, b) => {
+      const sc = x => (year && Number(x.year) === year ? 4 : 0)
+                    + (x.parent_set_name || x.parent_name ? 0 : 2);
+      return sc(b) - sc(a);
+    });
+    const set = sets[0];
+    const setUcid = set.ucid || set.set_ucid;
+    if (!setUcid) return out;
+
+    /* Now the actual question: is there a card with this number in that
+       set? One record if it exists, zero if it doesn't. */
+    const cardRes = await catalogFetch("/?" + new URLSearchParams({
+      set_id: setUcid, card_number: number, limit: "3"
+    }).toString());
+    const cards = Array.isArray(cardRes.body && cardRes.body.data) ? cardRes.body.data : [];
+
+    out.checked = true;
+
+    const hit = cards.find(c => sameCardNumber(c.card_number, number));
+    if (hit) {
+      out.exists     = true;
+      out.ucid       = hit.ucid || null;
+      out.confidence = "high";
+      out.candidates = cards.slice(0, 3).map(c => ({
+        ucid: c.ucid, card_number: c.card_number, subject: c.subject || null
+      }));
+
+      /* The card exists. Does the person on it match what the model
+         said? A number that lands on a different player means the scan
+         read one of the two fields wrong, and that is worth saying. */
+      const said = String(ai.player || "").toLowerCase().replace(/[^a-z ]/g, "").trim();
+      const real = String(hit.subject || "").toLowerCase().replace(/[^a-z ]/g, "").trim();
+      if (said && real) {
+        const overlap = said.split(" ").filter(w => w.length > 2 && real.indexOf(w) > -1);
+        if (!overlap.length) {
+          out.confidence = "low";
+          out.note = "The catalog lists #" + number + " in this set as " + hit.subject +
+                     ", not " + ai.player + ". One of those is wrong \u2014 worth checking " +
+                     "the card number on the back.";
+        }
+      }
+      return out;
+    }
+
+    /* The set is real and the number is not in it. That is the clearest
+       possible signal that something was misread. */
+    out.exists     = false;
+    out.confidence = "low";
+    out.note = "We couldn't find card #" + number + " in " + (set.set_name || setNm) +
+               ". The number or the set may have been misread \u2014 a photo of the back " +
+               "usually fixes it.";
+    return out;
+
+  } catch (e) {
+    /* Allowance gone, catalog down, not on the plan. The scan stands as
+       it was; a second opinion we could not get is not an error. */
+    console.warn("[verify] skipped:", e.message);
+    return out;
+  }
+}
 
 /* ── CHECKLISTS: WHICH CARDS ARE IN THIS SET ────────────────────
 
