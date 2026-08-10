@@ -1454,8 +1454,39 @@ function summarizeSold(records, query, limitUsed) {
     return base.length >= MIN_GROUP ? base : group;
   };
 
-  const gradedAll = clean.filter(r => r.grader && r.grade);
-  const rawAll    = clean.filter(r => !r.grader);
+  /* Splitting raw from graded on the grader FIELD ALONE leaks in two
+     directions, and both matter.
+
+     A slab whose record carries no grader lands in the raw pool and
+     drags the raw median up — which is the number people quote as what
+     the card is worth ungraded. And a record with a grader but no grade
+     falls into neither pool: excluded from graded because that test
+     needs both, excluded from raw because it has one.
+
+     The title is the backstop. detectGrade() already reads "PSA 10" out
+     of a listing title and has been used on the ask side for months; it
+     was simply never applied to sold records. A sale titled
+     "2018 Topps Chrome Ohtani PSA 10" is a graded sale whatever the
+     record says. */
+  const gradeOf = r => {
+    if (r.grader) return { company: String(r.grader).toUpperCase(), grade: r.grade || null };
+    const fromTitle = detectGrade(r.title);
+    return fromTitle.graded
+      ? { company: fromTitle.company, grade: fromTitle.grade != null ? String(fromTitle.grade) : null }
+      : null;
+  };
+
+  clean.forEach(r => {
+    const g = gradeOf(r);
+    r.isGraded = !!g;
+    if (g) {
+      if (!r.grader) r.grader = g.company;   // fill from the title
+      if (!r.grade && g.grade != null) r.grade = String(g.grade);
+    }
+  });
+
+  const gradedAll = clean.filter(r => r.isGraded);
+  const rawAll    = clean.filter(r => !r.isGraded);
 
   const raw    = narrow(rawAll);
   const graded = narrow(gradedAll);
