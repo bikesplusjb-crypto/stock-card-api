@@ -1488,11 +1488,25 @@ function summarizeSold(records, query, limitUsed) {
      The query carries the parallel terms, so it answers this directly. */
   const targetIsParallel = titleLooksParallel(query, "");
 
+  /* If the card being priced IS an auto, excluding autos removes every
+     sale it has.
+
+     NOT_THE_CARD exists to keep four-figure autographs out of a base
+     card's median. Applied blindly it does the opposite: a 2019 Bowman
+     Chrome Brady Singer AUTO had every one of its sales filtered away
+     as "not the card", and the page fell back to asking prices with no
+     sold data at all.
+
+     Same guard the parallel filter has already had for months. If the
+     query says auto, autos are the comparison. */
+  const targetIsSpecial = notTheCard(query);
+
   /* Base-only applies ONLY when enough base sales survive it. Below the
      floor the sample is noise, so it falls back to every ungraded sale —
      the same fallback pattern selectListings uses on the ask side. */
   const narrow = function (group) {
-    if (targetIsParallel) return group;
+    /* Whatever the card IS, its own kind must not be filtered out. */
+    if (targetIsParallel || targetIsSpecial) return group;
     const base = group.filter(looksBaseSale);
     return base.length >= MIN_GROUP ? base : group;
   };
