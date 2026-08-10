@@ -836,7 +836,45 @@ const POKEMON_WORDS = [
   "prerelease", "staff promo"
 ];
 
+/* NOT A BASE CARD, and not a parallel either.
+
+   The parallel lists above handle colours and finishes, which is what
+   they were built for. They say nothing about the other ways a listing
+   can be a completely different object from the base card, and those
+   were walking straight into the base-card median:
+
+     - An autograph. A 2018 Chrome Ohtani auto is a four-figure card
+       sitting in the same search as a $70 base rookie.
+     - A patch or relic. Same problem, different premium.
+     - A LOT. "Lot of 5" is five cards at one price, so the price is not
+       the price of a card at all.
+     - A reprint or a custom, which is not the card.
+
+   A raw median of $425 on a card whose PSA 9 sells for $475 is the tell:
+   a base card does not sell for 89% of its own graded copy, and the
+   whole reason grading exists is that gap. The autographs were in the
+   pool.
+
+   Kept separate from PARALLEL_WORDS on purpose. A parallel IS the card,
+   in a different finish, and somebody scanning a Purple Refractor wants
+   parallel sales. Nobody scanning any card wants a lot of five or
+   somebody's custom. */
+const NOT_THE_CARD = [
+  "auto", "autograph", "autographed", "signed", "signature", "on card auto",
+  "patch", "relic", "jersey", "memorabilia", "game used", "game-used", "swatch",
+  "lot of", "card lot", "bulk lot", "mystery", "repack", "break",
+  "reprint", "custom", "aceo", "novelty", "proxy", "facsimile"
+];
+
 const PARALLEL_WORDS = COLOR_WORDS.concat(TEXTURE_WORDS).concat(POKEMON_WORDS);
+
+/* True when a listing is something other than the card itself. */
+function notTheCard(title) {
+  const t = " " + String(title || "").toLowerCase().replace(/[^a-z0-9 -]/g, " ")
+                    .replace(/\s+/g, " ") + " ";
+  return NOT_THE_CARD.some(w => t.indexOf(" " + w + " ") > -1 || t.indexOf(" " + w) === 0
+                                 || t.indexOf(" " + w + " ") > -1);
+}
 
 function cleanVal(v) {
   const s = String(v == null ? "" : v).trim();
@@ -1051,6 +1089,11 @@ function titleLooksParallel(title, brandName) {
    product names, so there is nothing to strip. */
 function looksBaseSale(r) {
   if (r.printRun != null && r.printRun > 0) return false;
+  /* Autos, patches, lots and reprints are not base cards and not
+     parallels — they are different objects at wildly different prices,
+     and they were the reason a base median could sit at 89% of its own
+     PSA 9. */
+  if (notTheCard(r.title)) return false;
   if (titleLooksParallel(r.title, "")) return false;
   return true;
 }
@@ -1069,7 +1112,7 @@ function selectListings(ai, byTier) {
   // card gets priced off refractors sitting in the same results.
   if (tight.length >= MIN) {
     if (!isParallel) {
-      const tightBase = tight.filter(l => !titleLooksParallel(l.title, brand));
+      const tightBase = tight.filter(l => !titleLooksParallel(l.title, brand) && !notTheCard(l.title));
       if (tightBase.length >= 3) {
         return { listings: tightBase, matchQuality: "exact", tierUsed: "tight-base",
                  note: "Priced from base-card listings; parallels excluded." };
@@ -1104,7 +1147,7 @@ function selectListings(ai, byTier) {
                note: "Only " + tight.length + " listing" + (tight.length === 1 ? "" : "s") +
                      " found for this parallel — treat this price as a rough guide." };
     }
-    const base = wide.filter(l => !titleLooksParallel(l.title, brand));
+    const base = wide.filter(l => !titleLooksParallel(l.title, brand) && !notTheCard(l.title));
     if (base.length >= 3) {
       return { listings: base, matchQuality: "base_fallback", tierUsed: "core-base",
                note: "No listings found for this parallel. Showing BASE card prices — a parallel is usually worth more." };
@@ -1114,7 +1157,7 @@ function selectListings(ai, byTier) {
   }
 
   if (!isParallel && wide.length) {
-    const base = wide.filter(l => !titleLooksParallel(l.title, brand));
+    const base = wide.filter(l => !titleLooksParallel(l.title, brand) && !notTheCard(l.title));
     if (base.length >= 3) {
       return { listings: base, matchQuality: "exact", tierUsed: "core-base",
                note: "Priced from base-card listings; parallels excluded." };
