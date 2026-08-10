@@ -5,6 +5,7 @@
    + median pricing + graded/raw split
    + TIERED PARALLEL-AWARE PRICING
    + STRIPE PRO SUBSCRIPTIONS
+   + WORD-BOUNDARY BASE FILTER (Aug 10)
 ================================ */
 
 const express = require("express");
@@ -423,7 +424,7 @@ function gradeBreakdown(gradedItems) {
     buckets[key].push(x.price);
   });
   return Object.keys(buckets)
-    .filter(k => buckets[k].length >= MIN_GROUP)   // <- the fix
+    .filter(k => buckets[k].length >= MIN_GROUP)
     .sort()
     .map(k => ({
       grade:  k,
@@ -868,12 +869,38 @@ const NOT_THE_CARD = [
 
 const PARALLEL_WORDS = COLOR_WORDS.concat(TEXTURE_WORDS).concat(POKEMON_WORDS);
 
+/* ── WORD-BOUNDARY MATCHING ─────────────────────────────────────
+
+   FIXED Aug 10. The old test was `t.includes(" " + word)`, which has an
+   opening boundary and no closing one. Every one of these was a false
+   positive, and each one silently removed a real base-card sale from
+   the pool:
+
+     " black"  matched  Charlie BLACKmon
+     " red"    matched  REDemption
+     " gold"   matched  GOLDen anniversary
+     " white"  matched  WHITEhead
+     " green"  matched  GREENberg
+     " auto"   matched  AUTOmatic, AUTOgraph relic wording
+
+   The damage compounded rather than being cosmetic. Base sales got
+   flagged as parallels and filtered out; the surviving base pool fell
+   below MIN_GROUP; the fallback in summarizeSold then handed back the
+   ENTIRE ungraded group — refractors included — and labelled it RAW.
+   That is how a 2018 Chrome Ohtani base RC reported a $425 raw median
+   against its own $475 PSA 9.
+
+   A shared helper so the two filters can never drift apart again. */
+function hasWord(hay, word) {
+  const w = String(word).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp("(^|[^a-z0-9])" + w + "([^a-z0-9]|$)", "i").test(hay);
+}
+
 /* True when a listing is something other than the card itself. */
 function notTheCard(title) {
   const t = " " + String(title || "").toLowerCase().replace(/[^a-z0-9 -]/g, " ")
                     .replace(/\s+/g, " ") + " ";
-  return NOT_THE_CARD.some(w => t.indexOf(" " + w + " ") > -1 || t.indexOf(" " + w) === 0
-                                 || t.indexOf(" " + w + " ") > -1);
+  return NOT_THE_CARD.some(w => hasWord(t, w));
 }
 
 function cleanVal(v) {
@@ -1067,7 +1094,9 @@ function titleLooksParallel(title, brandName) {
     if (w.length > 2) t = t.split(w).join(" ");
   });
   if (looksLikeSerialNumbering(t)) return true;
-  return PARALLEL_WORDS.some(w => t.includes(" " + w));
+  // Word-boundary match — see hasWord(). The old includes(" " + w) test
+  // matched Blackmon as "black" and redemption as "red".
+  return PARALLEL_WORDS.some(w => hasWord(t, w));
 }
 
 /* Is this SOLD record a base card?
@@ -1419,13 +1448,28 @@ const CACHE_TTL_HOURS  = Number(process.env.SOLD_CACHE_TTL_HOURS || 12);
    so refinements ask for half. The frontend flags them with compact=1. */
 const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
 
+/* Bump this whenever the sold-side filtering logic changes.
+
+   Same pattern as CATALOG_LOGIC_VERSION further down, and for the same
+   reason: a permanent cache and improving logic are a bad pair without a
+   version stamp. Every row cached before the word-boundary fix was
+   computed by a filter that let refractors into the base pool, and
+   serving those back would hide the fix completely.
+
+   NOTE: card_price_history is keyed on cache_key too, so bumping this
+   starts a fresh daily series per card. The old series was built on
+   contaminated medians, so that is the right trade — but it is a real
+   cost and it is deliberate. */
+const SOLD_LOGIC_VERSION = 2;
+
 /* The cache key must carry the limit. Without it a 50-record compact pull
    gets stored under the same key as a full lookup and is then served back
    as though it were one. */
 function cacheKeyFor(query, limit) {
   const base = normalizeCardQuery(query).toLowerCase().replace(/\s+/g, " ").trim().slice(0, 280);
   const n = Number(limit || CARDAPI_LIMIT);
-  return n === CARDAPI_LIMIT ? base : base + "#" + n;
+  const stem = n === CARDAPI_LIMIT ? base : base + "#" + n;
+  return stem + "@v" + SOLD_LOGIC_VERSION;
 }
 
 function daysAgoISO(n) {
@@ -1477,7 +1521,8 @@ function summarizeSold(records, query, limitUsed) {
       soldRaw: { count: 0, median: 0 }, soldGraded: { count: 0, median: 0 },
       soldGradeBreakdown: [], bestOfferCount: 0, lastSaleDate: null,
       sales: [], query: query, lookbackDays: CARDAPI_LOOKBACK,
-      limitUsed: limitUsed || CARDAPI_LIMIT
+      limitUsed: limitUsed || CARDAPI_LIMIT,
+      soldBasis: "none", soldWarning: "", soldContaminated: false
     };
   }
 
@@ -1488,27 +1533,35 @@ function summarizeSold(records, query, limitUsed) {
      The query carries the parallel terms, so it answers this directly. */
   const targetIsParallel = titleLooksParallel(query, "");
 
-  /* If the card being priced IS an auto, excluding autos removes every
-     sale it has.
+  /* Whatever the card IS, its own kind must not be filtered out.
 
-     NOT_THE_CARD exists to keep four-figure autographs out of a base
-     card's median. Applied blindly it does the opposite: a 2019 Bowman
-     Chrome Brady Singer AUTO had every one of its sales filtered away
-     as "not the card", and the page fell back to asking prices with no
-     sold data at all.
+     NOT_THE_CARD keeps four-figure autographs out of a BASE card's
+     median. Applied to an auto search it does the opposite: every sale
+     gets flagged as "not the card", the base pool empties, and the
+     fallback then reports "only 0 confirmed base-card sales" on a card
+     that is an autograph and was never going to have any.
 
-     Same guard the parallel filter has already had for months. If the
-     query says auto, autos are the comparison. */
+     Same guard titleLooksParallel has always had. If the query says
+     auto, autos are the comparison. */
   const targetIsSpecial = notTheCard(query);
 
-  /* Base-only applies ONLY when enough base sales survive it. Below the
-     floor the sample is noise, so it falls back to every ungraded sale —
-     the same fallback pattern selectListings uses on the ask side. */
-  const narrow = function (group) {
-    /* Whatever the card IS, its own kind must not be filtered out. */
+  /* THE SILENT FALLBACK, NOW AUDIBLE.
+
+     The old narrow() returned the UNFILTERED group whenever fewer than
+     MIN_GROUP base sales survived, and said nothing about it. The page
+     then printed a refractor-contaminated median under a "RAW" badge.
+
+     The fallback still happens — a thin sample beats no answer — but it
+     is recorded here and reported below. A number that quietly stopped
+     meaning what its label says is worse than a number with a caveat. */
+  const filt = { rawBase: 0, rawAll: 0, rawFellBack: false };
+  const narrow = function (group, tag) {
     if (targetIsParallel || targetIsSpecial) return group;
     const base = group.filter(looksBaseSale);
-    return base.length >= MIN_GROUP ? base : group;
+    if (tag === "raw") { filt.rawBase = base.length; filt.rawAll = group.length; }
+    if (base.length >= MIN_GROUP) return base;
+    if (tag === "raw") filt.rawFellBack = group.length > base.length;
+    return group;
   };
 
   /* Splitting raw from graded on the grader FIELD ALONE leaks in two
@@ -1522,9 +1575,7 @@ function summarizeSold(records, query, limitUsed) {
 
      The title is the backstop. detectGrade() already reads "PSA 10" out
      of a listing title and has been used on the ask side for months; it
-     was simply never applied to sold records. A sale titled
-     "2018 Topps Chrome Ohtani PSA 10" is a graded sale whatever the
-     record says. */
+     was simply never applied to sold records. */
   const gradeOf = r => {
     if (r.grader) return { company: String(r.grader).toUpperCase(), grade: r.grade || null };
     const fromTitle = detectGrade(r.title);
@@ -1545,19 +1596,20 @@ function summarizeSold(records, query, limitUsed) {
   const gradedAll = clean.filter(r => r.isGraded);
   const rawAll    = clean.filter(r => !r.isGraded);
 
-  const raw    = narrow(rawAll);
-  const graded = narrow(gradedAll);
+  const raw    = narrow(rawAll, "raw");
+  const graded = narrow(gradedAll, "graded");
 
   /* The grade ladder needs the same treatment. A PSA 10 of a Gold /50
      landing on the PSA 10 rung of a base card is what makes the scanner
      tell somebody to spend $25 grading a common. */
-  const ladderSrc = narrow(clean);
+  const ladderSrc = narrow(clean, "ladder");
 
-  const rawBasis = (raw.length !== rawAll.length) ? "base" : "ungraded";
+  const rawP  = raw.map(r => r.price).sort((a, b) => a - b);
+  const grP   = graded.map(r => r.price).sort((a, b) => a - b);
+  const dates = clean.map(r => r.saleDate).filter(Boolean).sort();
 
-  const rawP   = raw.map(r => r.price).sort((a, b) => a - b);
-  const grP    = graded.map(r => r.price).sort((a, b) => a - b);
-  const dates  = clean.map(r => r.saleDate).filter(Boolean).sort();
+  const ladder = soldGradeBreakdown(ladderSrc);
+  const rawMed = median(rawP);
 
   /* The headline number must describe ONE thing. A raw card is not worth
      the median of raw sales and PSA 10 slabs mixed together — that median
@@ -1565,38 +1617,70 @@ function summarizeSold(records, query, limitUsed) {
      sales, they are the headline; the graded side is reported separately. */
   const useRaw   = rawP.length >= MIN_GROUP;
   const headline = useRaw ? rawP : prices;
+  let   basis    = useRaw ? "raw" : "all";
   const range    = trimmedRange(headline);
+
+  /* SELF-CONSISTENCY CHECK.
+
+     A base card cannot be worth most of its own graded copy — the gap is
+     the entire reason grading exists. When the raw median lands near the
+     PSA 9, the raw pool is not raw base cards, whatever the filter
+     concluded. Both numbers are already computed here, so this costs
+     nothing to check and catches contamination the word lists miss.
+
+     The 0.7 line is deliberately loose. Genuine raw-to-PSA-9 ratios on
+     modern cards sit around 0.2-0.4; anything at 0.7 or above is not a
+     tight call. */
+  let warning = "";
+  let contaminated = false;
+  const psa9  = ladder.find(g => g.grade === "PSA 9");
+  const psa10 = ladder.find(g => g.grade === "PSA 10");
+  const rung  = (psa9 && psa9.median) || (psa10 && psa10.median ? psa10.median * 0.34 : 0);
+
+  if (useRaw && rung > 0 && rawMed >= rung * 0.7) {
+    contaminated = true;
+    basis = "mixed";
+    warning = "These ungraded sales look like they include parallels or inserts — " +
+              "the raw price sits too close to the graded price to be one card. " +
+              "Narrow the search before trusting this number.";
+  } else if (filt.rawFellBack) {
+    contaminated = true;
+    basis = "mixed";
+    warning = "Only " + filt.rawBase + " confirmed base-card sale" +
+              (filt.rawBase === 1 ? "" : "s") + " out of " + filt.rawAll +
+              " ungraded. This median includes other versions of the card.";
+  }
 
   return {
     soldCount:     clean.length,
     soldMedian:    median(headline),
     soldLow:       range.low,
     soldHigh:      range.high,
-    soldBasis:     useRaw ? "raw" : "all",
+    soldBasis:     basis,
+    soldWarning:   warning,
+    soldContaminated: contaminated,
     soldMedianAll: median(prices),
     soldCountUsed: headline.length,
     /* The frontend prints "100+" when the count hits the limit, because a
        count sitting exactly at the ceiling is a ceiling and not a total.
        It needs to know what the ceiling actually was. */
     limitUsed:     limitUsed || CARDAPI_LIMIT,
-    soldRaw:    { count: raw.length,    median: median(rawP) },
+    soldRaw:    { count: raw.length,    median: rawMed },
     soldGraded: { count: graded.length, median: median(grP) },
-    soldRawBasis:       rawBasis,
-    soldGradeBreakdown: soldGradeBreakdown(ladderSrc),
+    soldRawBasis:      filt.rawFellBack ? "ungraded" : "base",
+    soldBaseCount:     filt.rawBase,
+    soldUngradedCount: filt.rawAll,
+    soldGradeBreakdown: ladder,
     bestOfferCount: clean.filter(r => r.listingType === "best_offer").length,
 
     /* How these sales happened, not just what they went for.
-    
+
        An auction ending at $14.50 and a Buy It Now at $14.50 are not the
        same fact. An auction is several people converging on a price; a
        fixed-price sale is one person accepting one seller's number. A
        median built entirely from fixed-price listings is a median of
        what sellers asked and somebody eventually paid \u2014 which is much
-       closer to an asking price than it looks.
-    
-       Card Ladder shows the listing type per sale. Worth having as a
-       mix, because the mix is what tells you whether to trust the
-       median. */
+       closer to an asking price than it looks. */
     listingMix: listingMix(clean),
     lastSaleDate:   dates.length ? dates[dates.length - 1] : null,
     sales:          clean.slice(0, 12),
@@ -1690,6 +1774,13 @@ async function writeSoldCache(key, query, payload) {
 // builds its own price history without paying for deep lookback.
 async function recordPriceHistory(key, query, sold, askMedian) {
   if (!supabaseAdmin || !sold || !sold.soldCount) return;
+  /* A contaminated median must not enter the permanent series. The
+     cached payload expires in twelve hours; a history row does not, and
+     a bad point poisons every movement arrow computed against it. */
+  if (sold.soldContaminated) {
+    console.log("[history] skipped contaminated median for " + query);
+    return;
+  }
   try {
     await supabaseAdmin.from("card_price_history").upsert({
       cache_key:     key,
@@ -1790,6 +1881,21 @@ const IMPLAUSIBLE_GAP_PCT = 65;
 function askVsSold(market, sold) {
   if (!sold || !sold.soldCount) return null;
 
+  /* A deal callout on a pool we have already flagged as mixed is the
+     same mistake in a different place. If the sold side is known to be
+     contaminated, say that instead of computing a percentage off it. */
+  if (sold.soldContaminated) {
+    return {
+      ask: safeNumber(market && market.avgPrice, 0),
+      sold: safeNumber(sold.soldMedian, 0),
+      diff: 0, pct: 0, basis: "mixed", mismatch: true,
+      note: sold.soldWarning || "The recent sales look like several different versions "
+            + "of this card, so there is nothing reliable to compare against.",
+      askCount: (market && market.listingCount) || 0,
+      soldCount: sold.soldCount
+    };
+  }
+
   const askRaw    = (market && market.raw)    || { count: 0, median: 0 };
   const askGraded = (market && market.graded) || { count: 0, median: 0 };
   const soldRaw    = sold.soldRaw    || { count: 0, median: 0 };
@@ -1822,11 +1928,19 @@ function askVsSold(market, sold) {
      opportunity that isn't there. */
   const mismatch = (basis === 'all' && Math.abs(pct) >= IMPLAUSIBLE_GAP_PCT);
 
+  /* A deal callout while the ASK side is flagged as a wide spread is the
+     same error the sold side just guarded against: the cheap listings are
+     probably a different version, not a bargain. */
+  const askIsMessy = !!(market && market.wideSpread);
+
   let note;
   if (mismatch) {
     note = 'Asking prices and recent sales are too far apart to compare — '
          + 'the listings and the sales look like different versions of this card. '
          + 'Narrow the search before trusting either number.';
+  } else if (pct <= -10 && askIsMessy) {
+    note = 'Some listings sit below recent sales, but the listings vary too much to call '
+         + 'it a deal — the cheap ones are probably a different version. Narrow the search first.';
   } else if (pct >= 10) {
     note = label + 'sellers are asking ' + pct + '% over what buyers actually pay. Don\'t pay list price.';
   } else if (pct <= -10) {
@@ -1876,7 +1990,7 @@ async function scanWithOpenAI(frontFile, backFile) {
     messages: [
       { role: "system", content: "You are an expert trading card identifier. You examine photos of sports cards, Pokemon cards, TCG cards, graded slabs, and sealed product. You return ONLY valid JSON with no markdown, no code fences, and no commentary. You never estimate dollar values." },
       { role: "user", content: [
-        { type: "text", text: "Identify this card as precisely as possible. Return ONLY a JSON object with these exact keys: cardName, player, year, brand, set, setCode, cardNumber, sport, parallel, serialNumber, language, isRookie, isAutograph, isPatch, gradeCompany, gradeValue, signal, confidence, summary.\n\nHOW TO READ A CARD \u2014 DO THIS FIRST, BEFORE ANY OF THE RULES BELOW:\nEverything you need is PRINTED ON THE CARD. Read it. Do not infer it from what the card looks like or from what cards like this usually are.\n1. BRAND \u2014 find the manufacturer logo. It is almost always on the front, and the copyright line on the back names it outright: 'Topps', 'Panini', 'Upper Deck', 'Donruss', 'Bowman', 'Fleer', 'Leaf'. These logos look nothing alike. Read the one that is actually there. Do NOT guess a brand because the design reminds you of one \u2014 a wrong brand sends the whole lookup to a different company's product.\n2. YEAR \u2014 the copyright line on the back, usually next to the manufacturer name. Use that, not the season the player was active.\n3. CARD NUMBER \u2014 usually on the back, top or bottom corner. Copy it exactly, including any letters or slashes.\n4. PLAYER \u2014 printed on the front. Full name as shown.\n5. SET \u2014 the product line, printed on the front or named in the back's copyright line.\n\nIf the photo is too blurry or cropped to read one of these, return 'Unknown' for that field. A field you could not read is far better than one you invented \u2014 a made-up brand or year produces a confident price for a completely different card.\n\nTHE SINGLE MOST IMPORTANT FIELD IS player. Never leave it empty.\n- On a sports card it is the athlete's name.\n- ON A POKEMON OR TCG CARD IT IS THE CREATURE'S NAME, including its suffix exactly as printed: 'Coalossal VMAX', 'Charizard V', 'Umbreon VMAX', 'Pikachu ex', 'Mewtwo GX'. Set sport to 'Pokemon' and brand to 'Pokemon'. Without the name every price lookup fails, so read it off the top of the card even if the rest of the card is unclear.\n\nCRITICAL — PARALLEL IDENTIFICATION. Parallels change a card's value by 10x or more, so look carefully before concluding a card is base:\n- Border color is the main tell. Panini Prizm/Select/Optic parallels are named by color: Silver, Red, Blue, Green, Orange, Purple, Gold, Black, Pink, Camo, Mojo, Wave, Hyper, Disco, Shimmer, Ice.\n- Topps Chrome parallels: Refractor, X-Fractor, Prism, Atomic, Sepia, Gold, Orange, Red, SuperFractor, Negative, Speckle.\n- POKEMON: the variant matters as much as any colour parallel. Report it in the parallel field. Vintage: 1st Edition (look for the black stamp to the left of the artwork), Shadowless (no drop shadow on the right of the art box). Any era: Reverse Holo (the CARD BODY is foil, the artwork is not), Full Art, Alt Art, Rainbow Rare, Gold Secret Rare, Illustration Rare. Do NOT write Unlimited or Regular \u2014 that is the base printing, so leave parallel empty.\n- Look for rainbow/foil sheen, cracked-ice texture, sparkle, or a colored border that differs from the base design.\n- Look for serial numbering printed on the front or back, usually small, formatted like 25/99 or /99. Report it exactly as printed in serialNumber. POKEMON CARD NUMBERS ARE NOT SERIAL NUMBERING: 074/073, 4/102 and SV107/SV122 are the card's number within its set. Put those in cardNumber and leave serialNumber EMPTY.\n- '1/1' or 'One of One' is critical — always report it.\n- If you see a colored border or foil pattern but cannot name the exact parallel, use the color plus the word Parallel, e.g. 'Blue Parallel'.\n- Use an empty string for parallel ONLY if the card is clearly a plain base card.\n\nSET FIELD RULES — IMPORTANT:\n- The 'set' field must be the actual product/subset name as it would appear in an eBay listing title, for example 'Update Series', 'Draft Picks', 'Downtown', 'Kaboom'.\n- If the card is just the base set of the product, return an EMPTY STRING for set. Never return 'Base', 'Base Set', 'Base Rookie', or 'Common' — those words do not appear in listing titles and break the price search.\n- POKEMON IS THE EXCEPTION TO THAT RULE. Pokemon set names are real products and must ALWAYS be returned in full, even when they sound generic: 'Base Set', 'Jungle', 'Fossil', 'Team Rocket', 'Neo Genesis', 'Evolving Skies', 'Champions Path', 'Darkness Ablaze', 'Rebel Clash', 'Hidden Fates', 'Obsidian Flames', '151'. Use the set symbol and the card number to identify it. Never return an empty set for a Pokemon card if you can name the set at all.\n- POKEMON SET CODES \u2014 REPORT WHAT IS PRINTED, SEPARATELY FROM WHAT YOU THINK IT MEANS. Modern Pokemon cards print a 2-4 letter code in the bottom corner beside the card number: SVI, PAL, OBF, EVS, SSP, MEW, ASC, PFL.\n  \u2022 Put the code EXACTLY as printed in setCode. This is something you can read \u2014 report it even if the set is unfamiliar.\n  \u2022 Put the set name in set ONLY IF YOU ARE CERTAIN which set that code belongs to. If you are not certain, LEAVE set EMPTY. Do not reach for the closest set you happen to know.\n  \u2022 A wrong set name is far worse than no set name. It pulls comps for a different card and looks authoritative doing it. 'I read PFL and I do not know that set' is a correct and useful answer; guessing 'Obsidian Flames' because OBF is similar is not.\n  \u2022 The year must match the set you name. If you are unsure of the set, do not adjust the year to fit a guess \u2014 read the copyright year off the card.\n\nSPORT \u2014 ALWAYS FILL THIS IN:\n- One of: Baseball, Basketball, Football, Hockey, Soccer, Pokemon, Racing, Wrestling, Golf, Tennis, MMA, Non-Sport.\n- Read it off the card: the team, the league logo, the uniform, the position, the equipment in the photo.\n- This is NOT optional and 'Unknown' is not an acceptable answer. Two sets can share a name, a year and a brand and still be different sets \u2014 1986 Topps is 792 cards in baseball and 396 in football. Without the sport there is no way to tell them apart, so a collector gets the wrong set size for the rest of time.\n- If the card is genuinely ambiguous, pick the most likely sport rather than leaving it blank.\n\nLANGUAGE:\n- Return 'Japanese' if the card text is Japanese, or 'Chinese' or 'Korean' where those apply. Otherwise return 'English'.\n- Japanese Pokemon cards trade as a separate market at different prices, so getting this wrong misprices the card badly. They are a slightly different size, carry Japanese characters in the name and attack text, and usually print the card number without a set total.\n\nOTHER RULES:\n- If a back image is provided, TRUST THE BACK for card number, set name, and copyright year — printed text beats inferring from the front design.\n- If the card is in a graded slab, read the label for company, grade, year, player, set, and card number.\n- isRookie, isAutograph, isPatch must be true or false booleans.\n- signal must be one of: GRADE, WATCH, SELL RAW, HOT, VERIFY.\n- confidence must be High, Medium, or Low. Use Low if the image is blurry or you are unsure about the parallel.\n- Never guess a dollar value. Never include price fields." },
+        { type: "text", text: "Identify this card as precisely as possible. Return ONLY a JSON object with these exact keys: cardName, player, year, brand, set, setCode, cardNumber, sport, parallel, insert, serialNumber, language, isRookie, isAutograph, isPatch, gradeCompany, gradeValue, signal, confidence, summary.\n\nHOW TO READ A CARD \u2014 DO THIS FIRST, BEFORE ANY OF THE RULES BELOW:\nEverything you need is PRINTED ON THE CARD. Read it. Do not infer it from what the card looks like or from what cards like this usually are.\n1. BRAND \u2014 find the manufacturer logo. It is almost always on the front, and the copyright line on the back names it outright: 'Topps', 'Panini', 'Upper Deck', 'Donruss', 'Bowman', 'Fleer', 'Leaf'. These logos look nothing alike. Read the one that is actually there. Do NOT guess a brand because the design reminds you of one \u2014 a wrong brand sends the whole lookup to a different company's product.\n2. YEAR \u2014 the copyright line on the back, usually next to the manufacturer name. Use that, not the season the player was active.\n3. CARD NUMBER \u2014 usually on the back, top or bottom corner. Copy it exactly, including any letters or slashes.\n4. PLAYER \u2014 printed on the front. Full name as shown.\n5. SET \u2014 the product line, printed on the front or named in the back's copyright line.\n\nIf the photo is too blurry or cropped to read one of these, return 'Unknown' for that field. A field you could not read is far better than one you invented \u2014 a made-up brand or year produces a confident price for a completely different card.\n\nTHE SINGLE MOST IMPORTANT FIELD IS player. Never leave it empty.\n- On a sports card it is the athlete's name.\n- ON A POKEMON OR TCG CARD IT IS THE CREATURE'S NAME, including its suffix exactly as printed: 'Coalossal VMAX', 'Charizard V', 'Umbreon VMAX', 'Pikachu ex', 'Mewtwo GX'. Set sport to 'Pokemon' and brand to 'Pokemon'. Without the name every price lookup fails, so read it off the top of the card even if the rest of the card is unclear.\n\nCRITICAL \u2014 PARALLEL IDENTIFICATION. Parallels change a card's value by 10x or more, so look carefully before concluding a card is base:\n- Border color is the main tell. Panini Prizm/Select/Optic parallels are named by color: Silver, Red, Blue, Green, Orange, Purple, Gold, Black, Pink, Camo, Mojo, Wave, Hyper, Disco, Shimmer, Ice.\n- Topps Chrome parallels: Refractor, X-Fractor, Prism, Atomic, Sepia, Gold, Orange, Red, SuperFractor, Negative, Speckle.\n- POKEMON: the variant matters as much as any colour parallel. Report it in the parallel field. Vintage: 1st Edition (look for the black stamp to the left of the artwork), Shadowless (no drop shadow on the right of the art box). Any era: Reverse Holo (the CARD BODY is foil, the artwork is not), Full Art, Alt Art, Rainbow Rare, Gold Secret Rare, Illustration Rare. Do NOT write Unlimited or Regular \u2014 that is the base printing, so leave parallel empty.\n- Look for rainbow/foil sheen, cracked-ice texture, sparkle, or a colored border that differs from the base design.\n- Look for serial numbering printed on the front or back, usually small, formatted like 25/99 or /99. Report it exactly as printed in serialNumber. POKEMON CARD NUMBERS ARE NOT SERIAL NUMBERING: 074/073, 4/102 and SV107/SV122 are the card's number within its set. Put those in cardNumber and leave serialNumber EMPTY.\n- '1/1' or 'One of One' is critical \u2014 always report it.\n- If you see a colored border or foil pattern but cannot name the exact parallel, use the color plus the word Parallel, e.g. 'Blue Parallel'.\n- Use an empty string for parallel ONLY if the card is clearly a plain base card.\n\nINSERT SETS \u2014 REPORT THESE TOO, IN THE insert FIELD:\n- An insert is a themed subset printed alongside the base set, with its own name printed on the card front: 'Freshman Flash', 'Future Stars', 'Kaboom', 'Downtown', 'Diamond Kings', 'Stars of MLB', 'Home Field Advantage'.\n- An insert is NOT the base card and does not trade at base-card prices, so a base price on an insert is wrong in both directions.\n- Read the name off the front and put it in insert EXACTLY as printed. If the card carries no insert name, return an empty string.\n- Do not confuse an insert with a parallel. A parallel is the same card in a different finish; an insert is a different card design entirely. A card can be both.\n\nSET FIELD RULES \u2014 IMPORTANT:\n- The 'set' field must be the actual product/subset name as it would appear in an eBay listing title, for example 'Update Series', 'Draft Picks', 'Downtown', 'Kaboom'.\n- If the card is just the base set of the product, return an EMPTY STRING for set. Never return 'Base', 'Base Set', 'Base Rookie', or 'Common' \u2014 those words do not appear in listing titles and break the price search.\n- POKEMON IS THE EXCEPTION TO THAT RULE. Pokemon set names are real products and must ALWAYS be returned in full, even when they sound generic: 'Base Set', 'Jungle', 'Fossil', 'Team Rocket', 'Neo Genesis', 'Evolving Skies', 'Champions Path', 'Darkness Ablaze', 'Rebel Clash', 'Hidden Fates', 'Obsidian Flames', '151'. Use the set symbol and the card number to identify it. Never return an empty set for a Pokemon card if you can name the set at all.\n- POKEMON SET CODES \u2014 REPORT WHAT IS PRINTED, SEPARATELY FROM WHAT YOU THINK IT MEANS. Modern Pokemon cards print a 2-4 letter code in the bottom corner beside the card number: SVI, PAL, OBF, EVS, SSP, MEW, ASC, PFL.\n  \u2022 Put the code EXACTLY as printed in setCode. This is something you can read \u2014 report it even if the set is unfamiliar.\n  \u2022 Put the set name in set ONLY IF YOU ARE CERTAIN which set that code belongs to. If you are not certain, LEAVE set EMPTY. Do not reach for the closest set you happen to know.\n  \u2022 A wrong set name is far worse than no set name. It pulls comps for a different card and looks authoritative doing it. 'I read PFL and I do not know that set' is a correct and useful answer; guessing 'Obsidian Flames' because OBF is similar is not.\n  \u2022 The year must match the set you name. If you are unsure of the set, do not adjust the year to fit a guess \u2014 read the copyright year off the card.\n\nSPORT \u2014 ALWAYS FILL THIS IN:\n- One of: Baseball, Basketball, Football, Hockey, Soccer, Pokemon, Racing, Wrestling, Golf, Tennis, MMA, Non-Sport.\n- Read it off the card: the team, the league logo, the uniform, the position, the equipment in the photo.\n- This is NOT optional and 'Unknown' is not an acceptable answer. Two sets can share a name, a year and a brand and still be different sets \u2014 1986 Topps is 792 cards in baseball and 396 in football. Without the sport there is no way to tell them apart, so a collector gets the wrong set size for the rest of time.\n- If the card is genuinely ambiguous, pick the most likely sport rather than leaving it blank.\n\nLANGUAGE:\n- Return 'Japanese' if the card text is Japanese, or 'Chinese' or 'Korean' where those apply. Otherwise return 'English'.\n- Japanese Pokemon cards trade as a separate market at different prices, so getting this wrong misprices the card badly. They are a slightly different size, carry Japanese characters in the name and attack text, and usually print the card number without a set total.\n\nOTHER RULES:\n- If a back image is provided, TRUST THE BACK for card number, set name, and copyright year \u2014 printed text beats inferring from the front design.\n- If the card is in a graded slab, read the label for company, grade, year, player, set, and card number.\n- isRookie, isAutograph, isPatch must be true or false booleans.\n- signal must be one of: GRADE, WATCH, SELL RAW, HOT, VERIFY.\n- confidence must be High, Medium, or Low. Use Low if the image is blurry or you are unsure about the parallel.\n- Never guess a dollar value. Never include price fields." },
         ...images
       ]}
     ],
@@ -2277,6 +2391,19 @@ app.post(
 
       const ai = await scanWithOpenAI(front, back);
 
+      /* An insert is not the base card and does not trade like one. The
+         model now reports it separately; folding it into `set` is what
+         makes it reach the eBay keywords and the display name, which is
+         where it needs to be. Guarded so an insert name that duplicates
+         the set is not written twice. */
+      const insertName = cleanVal(ai.insert);
+      if (insertName && !GENERIC_SET.test(insertName)) {
+        const existingSet = cleanVal(ai.set);
+        if (!existingSet || existingSet.toLowerCase().indexOf(insertName.toLowerCase()) < 0) {
+          ai.set = joinParts([existingSet, insertName]);
+        }
+      }
+
       const cleanCardName = buildDisplayName(ai);
 
       /* Verification runs alongside the price lookup rather than before
@@ -2295,6 +2422,7 @@ app.post(
         "[scan] " + cleanCardName +
         " | back=" + (back ? "yes" : "no") +
         " | parallel=" + (ai.parallel || "-") +
+        " | insert=" + (insertName || "-") +
         " | serial=" + (ai.serialNumber || "-") +
         " | q=" + searchQuery +
         " | tier=" + (market.tierUsed || "-") +
@@ -2303,6 +2431,7 @@ app.post(
         " | ask=$" + market.avgPrice +
         " | sold=$" + (sold && sold.soldMedian ? sold.soldMedian : "-") +
         " (" + (sold ? sold.soldCount : 0) + " sales" + (sold && sold.cached ? ", cached" : "") + ")" +
+        (sold && sold.soldContaminated ? " | CONTAMINATED" : "") +
         " | verified=" + (verification.checked
             ? (verification.exists === true ? "yes" : verification.exists === false ? "NO" : "?")
             : "skipped")
@@ -2318,6 +2447,7 @@ app.post(
            unfamiliar codes was producing confidently wrong set names. */
         set:               resolvePokemonSet(ai) || "Unknown",
         setCode:           String(ai.setCode || "").trim().toUpperCase() || null,
+        insert:            insertName || "",
         brand:             ai.brand      || "Unknown",
         cardNumber:        ai.cardNumber || "Unknown",
         sport:             ai.sport      || "Unknown",
@@ -2854,7 +2984,8 @@ app.get("/api/cardapi-status", async (req, res) => {
       lookbackDays:  CARDAPI_LOOKBACK,
       cacheTtlHours: CACHE_TTL_HOURS,
       recordLimit:        CARDAPI_LIMIT,
-      recordLimitCompact: CARDAPI_LIMIT_COMPACT
+      recordLimitCompact: CARDAPI_LIMIT_COMPACT,
+      soldLogicVersion:   SOLD_LOGIC_VERSION
     });
   } catch (e) {
     res.json({ success: false, configured: true, error: e.message });
@@ -3666,6 +3797,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`CardGauge backend running on port ${PORT}`);
   console.log(`eBay EPN affiliate active — campid: ${EPN_CAMPAIGN_ID}`);
+  console.log("Sold filter logic version: " + SOLD_LOGIC_VERSION);
   console.log(
     "Stripe Pro webhook: " +
     (STRIPE_SECRET_KEY && STRIPE_WEBHOOK_SECRET ? "configured" : "NOT configured — set STRIPE_SECRET_KEY + STRIPE_WEBHOOK_SECRET")
