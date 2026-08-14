@@ -163,6 +163,36 @@ async function setProStatus(email, active, note) {
   }
 }
 
+/* ── THE ONE THING JOINING A CLICK TO A PAYMENT ──────────────
+   The binder logs pro_click with the Supabase user id. Stripe fires
+   this webhook server-side with no session, no referrer and no idea
+   what page anybody was on — so the id is the only thread between the
+   two halves of the funnel.
+
+   The webhook already resolves that id, but only to an EMAIL, which it
+   writes to pro_users. It never recorded the id itself and never wrote
+   to scan_events, so "12 people clicked Pro" and "1 person paid" lived
+   in different tables with nothing in common. This writes the payment
+   into the same table as the click, keyed the same way.
+
+   Deliberately fire-and-forget, wrapped so nothing here can throw. A
+   failure to record analytics must never take down the handler that
+   grants somebody the access they just paid for — and the webhook
+   must still return 200 or Stripe retries forever. */
+async function logProEvent(event, detail) {
+  if (!supabaseAdmin) return;
+  try {
+    await supabaseAdmin.rpc('log_scan_event', {
+      p_event:     String(event).slice(0, 40),
+      p_card_name: detail ? String(detail).slice(0, 200) : null,
+      p_used_back: false,
+      p_is_owner:  false
+    });
+  } catch (e) {
+    console.log("[stripe] analytics write failed (ignored):", e.message);
+  }
+}
+
 app.post(
   "/api/stripe-webhook",
   express.raw({ type: "application/json" }),
@@ -212,6 +242,14 @@ app.post(
 
           if (email) {
             await setProStatus(email, true, "Stripe subscribe via " + via);
+            /* The id when we have it, so the click and the payment
+               join. When Stripe could not give us one, 'unmatched'
+               rather than nothing — a payment that cannot be traced
+               back is still a payment, and dropping it would understate
+               the only number here that is actually revenue. */
+            await logProEvent('subscription_paid',
+              (via === "client_reference_id" && obj.client_reference_id)
+                ? String(obj.client_reference_id) : 'unmatched:' + via);
           } else {
             console.log("[stripe] checkout.session.completed with NO resolvable email — session " + (obj.id || "?"));
           }
@@ -222,6 +260,10 @@ app.post(
         const email = await emailFromCustomer(obj.customer);
         if (email) await setProStatus(email, false, "Stripe subscription canceled");
         else console.log("[stripe] cancel event but no email for customer " + obj.customer);
+        /* Counted so that "active Pro" can be derived from events rather
+           than inferred from a pro_users row — which checkPro()'s
+           fail-open behaviour makes unreliable as a source of truth. */
+        await logProEvent('subscription_cancelled', email || 'unknown');
       }
 
       else if (type === "customer.subscription.updated") {
