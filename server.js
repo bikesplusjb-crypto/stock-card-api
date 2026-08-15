@@ -3218,7 +3218,12 @@ app.get("/api/vs-market", async (req, res) => {
    ─────────────────────────────────────────────────────────────── */
 const CATALOG_BASE      = "https://www.thecardapi.com/api/v1/catalog";
 const CATALOG_PAGE_SIZE = 5;      // records per lookup — see note 1 above
-const CATALOG_TIMEOUT   = 9000;
+/* 9s was too tight. Real lookups against thecardapi were aborting
+   mid-flight, and the abort surfaced to the user as "we can't match
+   this to a set in the catalog" — which says the set does not exist
+   when the truth is that we stopped waiting. A slow answer that
+   arrives beats a fast one that is wrong. */
+const CATALOG_TIMEOUT   = 20000;
 
 /* Bump this whenever the lookup gets smarter.
 
@@ -3266,6 +3271,16 @@ async function catalogFetch(pathAndQuery) {
     if (!r.ok) throw new Error("catalog error " + r.status);
     const body = await r.json();
     return { body: body, remaining: remaining };
+  } catch (e) {
+    /* An abort is a timeout, not a verdict. Naming it lets the caller
+       say "this is taking too long, try again" instead of "this set
+       does not exist", which is what a user was being told. */
+    if (e && (e.name === "AbortError" || /abort/i.test(e.message || ""))) {
+      var te = new Error("catalog timed out");
+      te.timedOut = true;
+      throw te;
+    }
+    throw e;
   } finally {
     clearTimeout(timer);
   }
@@ -3490,7 +3505,13 @@ app.get("/api/set-lookup", async (req, res) => {
        the number themselves, which is exactly what they did before this
        endpoint existed — the page must keep working. */
     console.warn("[catalog] lookup failed:", error.message);
-    res.json({ success: true, cached: false, sets: [], note: error.message });
+    res.json({
+      success: true, cached: false, sets: [],
+      timedOut: !!error.timedOut,
+      note: error.timedOut
+        ? "The card catalog is slow right now \u2014 try again in a moment."
+        : error.message
+    });
   }
 });
 
