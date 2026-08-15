@@ -3232,7 +3232,10 @@ const CATALOG_TIMEOUT   = 9000;
    A version stamp means better logic automatically retires worse
    answers. Old rows are ignored rather than deleted, so a rollback
    still has its cache. */
-const CATALOG_LOGIC_VERSION = 4;
+const CATALOG_LOGIC_VERSION = 5;
+/* v5: set names are translated to the catalog's vocabulary before the
+   lookup — Topps Bowman, doubled words, and bare Panini product names
+   all failed and were cached as misses. */
 /* v4: sport is translated to the catalog's own vocabulary before being
    used as a filter. Every Pokemon lookup before this was cached as a
    MISS — and misses are cached deliberately, so without a bump they
@@ -3299,6 +3302,48 @@ function catalogSport(v) {
   return CATALOG_SPORT[t.toLowerCase()] || t;
 }
 
+/* ── WHAT THE CATALOG CALLS THIS SET ─────────────────────────
+   The scanner records what is printed on the card. The catalog records
+   what the product is filed as. Those disagree in a few specific ways,
+   and each one produced a set nobody could look up:
+
+     "Topps Bowman"  — Bowman is its own brand, not a Topps line. The
+                       card says Topps on the copyright and Bowman on
+                       the front, and the model reported both.
+     "Prizm Prizm"   — brand and set both read as Prizm, because Prizm
+                       is a Panini product and the parser falls back to
+                       using the set as the brand when no manufacturer
+                       is named.
+     "Pokemon PFL"   — an unexpanded set code. Nothing can match it.
+
+   Fixed here rather than in the scan, deliberately. What the model
+   read off the card is not wrong, and rewriting it at the source would
+   corrupt the binder's own fields — sorting, grouping and the display
+   name all depend on them. This translates only the string used to ASK
+   the catalog, and leaves the record intact. */
+function catalogSetQuery(raw) {
+  var q = String(raw || "").replace(/\s+/g, " ").trim();
+  if (!q) return q;
+
+  /* Same word twice in a row: "Prizm Prizm", "Bowman Bowman". A
+     duplicate is never part of a real set name and always comes from
+     brand and set having resolved to the same thing. */
+  q = q.replace(/\b(\w+)(\s+\1)+\b/gi, "$1");
+
+  /* Bowman is a Topps property but a separate brand in every catalog.
+     "2023 Topps Bowman Chrome" is filed as "2023 Bowman Chrome". */
+  q = q.replace(/\btopps\s+bowman\b/gi, "Bowman");
+
+  /* Prizm, Optic, Select, Mosaic and Donruss are Panini products. The
+     catalog prefixes the manufacturer; a card that only said "Prizm"
+     needs it added or nothing matches. */
+  if (/\b(prizm|optic|select|mosaic)\b/i.test(q) && !/\bpanini\b/i.test(q)) {
+    q = q.replace(/\b(prizm|optic|select|mosaic)\b/i, "Panini $1");
+  }
+
+  return q.replace(/\s+/g, " ").trim();
+}
+
 app.get("/api/set-lookup", async (req, res) => {
   const raw = String(req.query.q || "").trim();
   /* Sport is part of the question, so it is part of the cache key.
@@ -3355,7 +3400,7 @@ app.get("/api/set-lookup", async (req, res) => {
     const ym = raw.match(/\b(18[5-9]\d|19\d\d|20[0-4]\d)\b/);
     const wantYear = ym ? Number(ym[1]) : null;
 
-    const params = new URLSearchParams({ q: raw, limit: String(CATALOG_PAGE_SIZE) });
+    const params = new URLSearchParams({ q: catalogSetQuery(raw), limit: String(CATALOG_PAGE_SIZE) });
     if (wantYear) params.set("year", String(wantYear));
     if (sport)    params.set("sport", catalogSport(sport));
 
