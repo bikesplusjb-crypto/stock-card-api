@@ -3237,7 +3237,9 @@ const CATALOG_TIMEOUT   = 20000;
    A version stamp means better logic automatically retires worse
    answers. Old rows are ignored rather than deleted, so a rollback
    still has its cache. */
-const CATALOG_LOGIC_VERSION = 5;
+const CATALOG_LOGIC_VERSION = 6;
+/* v6: Pokemon sets now resolve against TCGdex. Every Pokemon lookup
+   before this was cached as a miss against thecardapi. */
 /* v5: set names are translated to the catalog's vocabulary before the
    lookup — Topps Bowman, doubled words, and bare Panini product names
    all failed and were cached as misses. */
@@ -3359,6 +3361,140 @@ function catalogSetQuery(raw) {
   return q.replace(/\s+/g, " ").trim();
 }
 
+/* ═══ POKEMON SETS COME FROM TCGDEX ═══════════════════════════
+   thecardapi charges one catalog record per card and caps the day at
+   400, so a 200-card Pokemon set is half a day's allowance. TCGdex
+   returns the same set — every card, id, number and name — in a single
+   22KB response, free, with no key and no budget.
+
+   It also carries the number that caused a visible bug: cardCount has
+   both `official` (the printed base count) and `total` (including
+   secret rares). Astral Radiance showed 215 in one place and 216 in
+   another because we only ever had one of those figures.
+
+   SPORTS STAYS ON THECARDAPI. TCGdex is Pokemon only, so this is a
+   branch rather than a replacement, and the response shape is
+   deliberately identical so nothing downstream changes.
+
+   Their FAQ asks that bulk users cache rather than refetch, which is
+   what already happens — sets and checklists persist in Supabase and
+   are shared across every user. */
+const TCGDEX_BASE = "https://api.tcgdex.net/v2/en";
+
+function isPokemonSet(sport, label) {
+  var hay = (String(sport || "") + " " + String(label || "")).toLowerCase();
+  return hay.indexOf("pok") > -1 || /\bgaming\b/.test(hay);
+}
+
+/* The set list is 35KB for every Pokemon set in existence, so it is
+   fetched once and held for the life of the process. A cold start pays
+   137ms; nothing else does. */
+var tcgdexSets = null, tcgdexSetsAt = 0;
+const TCGDEX_SETS_TTL = 6 * 3600 * 1000;
+
+async function tcgdexAllSets() {
+  if (tcgdexSets && (Date.now() - tcgdexSetsAt) < TCGDEX_SETS_TTL) return tcgdexSets;
+  var ctrl = new AbortController();
+  var timer = setTimeout(function(){ ctrl.abort(); }, 12000);
+  try {
+    var r = await fetch(TCGDEX_BASE + "/sets", { signal: ctrl.signal });
+    if (!r.ok) throw new Error("tcgdex sets HTTP " + r.status);
+    var list = await r.json();
+    if (!Array.isArray(list)) throw new Error("tcgdex sets: unexpected shape");
+    tcgdexSets = list; tcgdexSetsAt = Date.now();
+    return list;
+  } finally { clearTimeout(timer); }
+}
+
+/* Match a binder label against a TCGdex set name.
+
+   The label is "2023 Pokemon Obsidian Flames"; the set is "Obsidian
+   Flames". So the year and the word Pokemon are stripped and what
+   remains is compared. Scored rather than filtered, because a hard
+   match on the full string finds nothing — which is precisely how
+   three Pokemon sets came to look unsupported when they were sitting
+   in the database all along. */
+function tcgdexMatch(sets, label) {
+  var q = String(label || "").toLowerCase()
+    .replace(/\b(18[5-9]\d|19\d\d|20[0-4]\d)\b/g, " ")
+    .replace(/\bpok[e\u00e9]mon\b/g, " ")
+    .replace(/[^a-z0-9 &]/g, " ")
+    .replace(/\s+/g, " ").trim();
+  if (!q) return null;
+
+  var best = null, bestScore = 0;
+  sets.forEach(function (set) {
+    var n = String(set.name || "").toLowerCase()
+      .replace(/[^a-z0-9 &]/g, " ").replace(/\s+/g, " ").trim();
+    if (!n) return;
+
+    var score = 0;
+    if (n === q) score = 100;
+    else if (n.indexOf(q) > -1 || q.indexOf(n) > -1) score = 70;
+    else {
+      /* Word overlap, so "Sword & Shield Evolving Skies" still matches
+         a label that only says "Evolving Skies". */
+      var qw = q.split(" ").filter(function(w){ return w.length > 2; });
+      var nw = n.split(" ");
+      var hit = qw.filter(function(w){ return nw.indexOf(w) > -1; }).length;
+      if (qw.length) score = Math.round((hit / qw.length) * 60);
+    }
+    /* A set with no card count is no use to a checklist. */
+    if (!(set.cardCount && set.cardCount.total)) score -= 30;
+    if (score > bestScore) { bestScore = score; best = set; }
+  });
+
+  return bestScore >= 45 ? best : null;
+}
+
+/* Same shape /api/set-lookup already returns, so the binder cannot
+   tell which source answered. */
+async function tcgdexLookup(label) {
+  var sets = await tcgdexAllSets();
+  var hit = tcgdexMatch(sets, label);
+  if (!hit) return null;
+  return {
+    ucid:        "TCGDEX:" + hit.id,
+    set_name:    hit.name,
+    year:        null,
+    sport:       "Pokemon",
+    /* total, not official — the checklist lists every card including
+       secret rares, and a target that stops short of the list would
+       read as complete while cards were still missing. */
+    card_count:  (hit.cardCount && (hit.cardCount.total || hit.cardCount.official)) || null,
+    parent_name: null,
+    slug:        hit.id
+  };
+}
+
+/* One request for the whole set. thecardapi needs one record per card
+   against a 400/day cap; this is 22KB and free. */
+async function tcgdexChecklist(setId) {
+  var ctrl = new AbortController();
+  var timer = setTimeout(function(){ ctrl.abort(); }, 12000);
+  try {
+    var r = await fetch(TCGDEX_BASE + "/sets/" + encodeURIComponent(setId), { signal: ctrl.signal });
+    if (!r.ok) throw new Error("tcgdex set HTTP " + r.status);
+    var d = await r.json();
+    var cards = Array.isArray(d.cards) ? d.cards : [];
+    return {
+      total: (d.cardCount && (d.cardCount.total || d.cardCount.official)) || cards.length,
+      cards: cards.map(function (c) {
+        return {
+          ucid:        "TCGDEX:" + c.id,
+          set_ucid:    "TCGDEX:" + setId,
+          card_number: c.localId != null ? String(c.localId) : null,
+          subject:     c.name || null,
+          is_rookie:   false,
+          print_run:   null,
+          image_url:   c.image ? (c.image + "/high.webp") : null,
+          fetched_at:  new Date().toISOString()
+        };
+      })
+    };
+  } finally { clearTimeout(timer); }
+}
+
 app.get("/api/set-lookup", async (req, res) => {
   const raw = String(req.query.q || "").trim();
   /* Sport is part of the question, so it is part of the cache key.
@@ -3396,6 +3532,36 @@ app.get("/api/set-lookup", async (req, res) => {
     } catch (e) {
       /* A cache that is down is a slow day, not a broken feature. */
       console.warn("[catalog] cache read failed:", e.message);
+    }
+  }
+
+  /* Pokemon goes to TCGdex before thecardapi is consulted at all. It
+     is free, faster, and returns whole checklists in one call — and
+     thecardapi's Pokemon coverage was the thing that failed. Falls
+     through to the paid catalog if this finds nothing, so a miss here
+     costs nothing. */
+  if (isPokemonSet(sport, raw)) {
+    try {
+      var pk = await tcgdexLookup(raw);
+      if (pk) {
+        if (supabaseAdmin) {
+          try {
+            await supabaseAdmin.from("catalog_sets").upsert(
+              [Object.assign({}, pk, { fetched_at: new Date().toISOString() })],
+              { onConflict: "ucid" });
+            await supabaseAdmin.from("catalog_set_queries").upsert({
+              q: q, ucid: pk.ucid, found: true,
+              logic_version: CATALOG_LOGIC_VERSION,
+              fetched_at: new Date().toISOString()
+            }, { onConflict: "q" });
+          } catch (e) { console.warn("[tcgdex] cache write failed:", e.message); }
+        }
+        res.set("Cache-Control", "no-store");
+        return res.json({ success: true, cached: false, sets: [pk], source: "tcgdex" });
+      }
+    } catch (e) {
+      /* Their outage is not a dead end — thecardapi may still have it. */
+      console.warn("[tcgdex] lookup failed, falling through:", e.message);
     }
   }
 
@@ -3704,6 +3870,31 @@ function normCardNumber(v) {
 
 async function buildChecklist(setUcid, setName, expectedTotal) {
   if (!supabaseAdmin) return { ok: false, reason: "no database" };
+
+  /* A TCGdex set arrives whole. No paging, no daily budget, no
+     "come back tomorrow" — which was the worst thing about large sets
+     on the paid catalog. */
+  if (String(setUcid).indexOf("TCGDEX:") === 0) {
+    var prevP = null;
+    try {
+      var pr = await supabaseAdmin.from("catalog_checklist_progress")
+        .select("*").eq("set_ucid", setUcid).maybeSingle();
+      prevP = pr.data;
+    } catch (e) {}
+    if (prevP && prevP.complete) return { ok: true, complete: true, count: prevP.fetched_count };
+
+    try {
+      var pk = await tcgdexChecklist(String(setUcid).slice(7));
+      if (pk.cards.length) {
+        await supabaseAdmin.from("catalog_cards").upsert(pk.cards, { onConflict: "ucid" });
+      }
+      await saveProgress(setUcid, setName, pk.total, pk.cards.length, 1, true, null);
+      return { ok: true, complete: true, count: pk.cards.length, total: pk.total };
+    } catch (e) {
+      console.warn("[tcgdex] checklist failed:", e.message);
+      return { ok: true, complete: false, count: 0, paused: e.message };
+    }
+  }
 
   let prog = null;
   try {
