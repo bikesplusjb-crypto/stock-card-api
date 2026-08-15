@@ -4076,11 +4076,43 @@ async function refreshWatchlistPrices() {
 
     let updated = 0;
     let failed = 0;
+    /* Counted separately so the log distinguishes "no sold data" from
+       "the write failed" — they need different responses. */
+    let skipped = 0;
 
     for (const item of items) {
       try {
+        /* SOLD, NOT ASKING.
+
+           This used avgPrice — the median of live LISTINGS. Cards
+           entered the binder at a sold price and were then re-priced
+           every night against what sellers hope for, which runs above
+           what buyers pay and does so unevenly. Every "since saved"
+           figure was therefore comparing two different kinds of number,
+           and a portfolio total built that way drifts further from
+           reality the longer it runs.
+
+           A contaminated pool is refused outright rather than written.
+           The scanner will not vouch for those medians, and a value
+           that silently enters a portfolio is worse than one shown on
+           screen with a warning attached — nobody is watching when the
+           cron runs.
+
+           When there are no sales at all the card keeps yesterday's
+           price rather than taking an asking price. A stale number is
+           honest about being old; an asking price wearing a sold
+           label is not. */
         const market = await getEbayCardMarket(item.card_name);
-        const newPrice = safeNumber(market.avgPrice, 0);
+        const sold   = market.sold || {};
+        const contaminated = !!sold.soldContaminated;
+        const soldMed = contaminated ? 0 : safeNumber(
+          (sold.soldRaw && sold.soldRaw.count >= 3 ? sold.soldRaw.median : 0) || sold.soldMedian, 0);
+        const newPrice = soldMed;
+
+        if (!newPrice) {
+          skipped++;
+          continue;
+        }
 
         const { error: updateError } = await supabaseAdmin
           .from("watchlist_items")
@@ -4105,7 +4137,7 @@ async function refreshWatchlistPrices() {
     }
 
     const elapsed = Math.round((Date.now() - startTime) / 1000);
-    console.log(`[watchlist-refresh] done. updated=${updated} failed=${failed} elapsed=${elapsed}s`);
+    console.log(`[watchlist-refresh] done. updated=${updated} skipped=${skipped} failed=${failed} elapsed=${elapsed}s`);
   } catch (e) {
     console.error("[watchlist-refresh] fatal error:", e.message);
   }
