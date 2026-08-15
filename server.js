@@ -3933,6 +3933,59 @@ app.get("/api/refresh-watchlist", async (req, res) => {
   refreshWatchlistPrices();
 });
 
+/* ── CAN THIS SERVER REACH TCGDEX? ──────────────────────────
+   Diagnostic, not a feature. TCGdex is unreachable from the browser
+   this was tested in, but a browser's network is not Render's — a
+   local DNS or firewall problem looks identical to a dead service from
+   where you are sitting, and the two need completely different
+   responses.
+
+   This runs the fetch FROM Render and reports exactly what came back:
+   status, timing, and the first slice of the body. That is the only
+   test that decides anything, because Render is where the code would
+   live.
+
+   Delete it once the question is answered. A permanent endpoint that
+   calls a third party on demand is a small liability. */
+app.get("/api/tcgdex-check", async (req, res) => {
+  var urls = [
+    "https://api.tcgdex.net/v2/en/sets/swsh3",
+    "https://api.tcgdex.net/v2/en/sets"
+  ];
+  var out = [];
+
+  for (var i = 0; i < urls.length; i++) {
+    var started = Date.now();
+    var ctrl = new AbortController();
+    var timer = setTimeout(function(){ ctrl.abort(); }, 12000);
+    try {
+      var r = await fetch(urls[i], { signal: ctrl.signal });
+      var text = await r.text();
+      out.push({
+        url: urls[i],
+        ok: r.ok,
+        status: r.status,
+        ms: Date.now() - started,
+        bytes: text.length,
+        sample: text.slice(0, 300)
+      });
+    } catch (e) {
+      out.push({
+        url: urls[i],
+        ok: false,
+        ms: Date.now() - started,
+        /* An abort here means Render could not reach them either, which
+           rules out a problem local to the browser. */
+        error: (e && e.name === "AbortError") ? "timed out after 12s" : (e.message || String(e))
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  res.json({ success: true, checkedAt: new Date().toISOString(), results: out });
+});
+
 app.use((req, res) => {
   res.status(404).json({ success: false, error: "Endpoint not found" });
 });
