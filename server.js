@@ -3232,7 +3232,12 @@ const CATALOG_TIMEOUT   = 9000;
    A version stamp means better logic automatically retires worse
    answers. Old rows are ignored rather than deleted, so a rollback
    still has its cache. */
-const CATALOG_LOGIC_VERSION = 3;
+const CATALOG_LOGIC_VERSION = 4;
+/* v4: sport is translated to the catalog's own vocabulary before being
+   used as a filter. Every Pokemon lookup before this was cached as a
+   MISS — and misses are cached deliberately, so without a bump they
+   would keep returning "no matching set" forever even though the fix
+   is live. This is exactly the case the version stamp exists for. */
 
 function normaliseSetQuery(q) {
   return String(q || "")
@@ -3261,6 +3266,37 @@ async function catalogFetch(pathAndQuery) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/* THE CATALOG FILES POKEMON UNDER "GAMING".
+
+   The scanner records sport as "Pokemon" — correct, and what a
+   collector would call it. The catalog uses "Gaming" for trading card
+   games. Passing ours through as a filter therefore excluded every
+   Pokemon set the catalog holds, including 1999 Base Set, which it
+   carries with a full 106-card count.
+
+   Found by calling the endpoint without a sport at all and watching it
+   match instantly. Three Pokemon sets had failed in a row and the
+   conclusion nearly drawn was that the catalog had no Pokemon in it.
+
+   Anything not in this map passes through unchanged: the sports names
+   already agree, and inventing translations for terms that match would
+   create the same class of bug in the other direction. */
+const CATALOG_SPORT = {
+  "pokemon":   "Gaming",
+  "pok\u00e9mon":   "Gaming",
+  "gaming (tcg)": "Gaming",
+  "tcg":       "Gaming",
+  "magic the gathering": "Gaming",
+  "yugioh":    "Gaming",
+  "yu-gi-oh":  "Gaming"
+};
+
+function catalogSport(v) {
+  var t = String(v || "").trim();
+  if (!t) return "";
+  return CATALOG_SPORT[t.toLowerCase()] || t;
 }
 
 app.get("/api/set-lookup", async (req, res) => {
@@ -3321,7 +3357,7 @@ app.get("/api/set-lookup", async (req, res) => {
 
     const params = new URLSearchParams({ q: raw, limit: String(CATALOG_PAGE_SIZE) });
     if (wantYear) params.set("year", String(wantYear));
-    if (sport)    params.set("sport", sport);
+    if (sport)    params.set("sport", catalogSport(sport));
 
     const { body, remaining } = await catalogFetch("/sets?" + params.toString());
     const rows = Array.isArray(body && body.data) ? body.data : [];
@@ -3487,7 +3523,7 @@ async function verifyAgainstCatalog(ai) {
 
     const params = new URLSearchParams({ q: setQuery, limit: String(VERIFY_MAX_CANDIDATES) });
     if (year)      params.set("year", String(year));
-    if (ai.sport)  params.set("sport", String(ai.sport));
+    if (ai.sport)  params.set("sport", catalogSport(ai.sport));
 
     const setRes = await catalogFetch("/sets?" + params.toString());
     const sets = Array.isArray(setRes.body && setRes.body.data) ? setRes.body.data : [];
