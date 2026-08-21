@@ -4417,6 +4417,137 @@ app.get("/api/run-price-alerts", async (req, res) => {
   runPriceAlerts();
 });
 
+/* ══════════════════════════════════════════════════════════════
+   WELCOME EMAIL — Phase 3 of the email/retention project.
+
+   Sent once, shortly after signup. Runs on a short-interval cron
+   (every 5 minutes) rather than firing from the frontend at the moment
+   of signup — a cron still sends the email if somebody closes the tab
+   the instant their code verifies, where a frontend-triggered send
+   would silently never fire.
+
+   Bounded to accounts created in the last 24 hours. Without that bound,
+   any bug that left welcome_sent stuck at false would eventually scan
+   every account ever created, on every run, forever. A welcome email
+   that arrives a day late because of a bug is a minor annoyance; an
+   unbounded query that grows with the user base is a real one.
+
+   Deliberately does NOT touch email_preferences beyond marking
+   welcome_sent — this is a transactional send (the person just created
+   the account), not a marketing send, so it does not check
+   price_alerts/weekly_update/unsubscribed_all. It DOES still create the
+   preferences row via the trigger already in place, so those other
+   emails respect the person's choices from their very first message
+   onward.
+══════════════════════════════════════════════════════════════ */
+
+function buildWelcomeEmailHtml() {
+  return (
+    '<div style="background:#0a0e1a;padding:32px 16px;font-family:Arial,sans-serif;">' +
+      '<div style="max-width:480px;margin:0 auto;background:#111827;border:1px solid #1e2d45;border-radius:14px;padding:28px;">' +
+        '<div style="font-size:20px;font-weight:800;color:#f1f5f9;margin-bottom:4px;">CARD<span style="color:#f59e0b;">GAUGE</span></div>' +
+        '<p style="color:#94a3b8;font-size:13px;margin:0 0 20px;">Welcome to CardGauge 👋</p>' +
+        '<p style="color:#f1f5f9;font-size:15px;line-height:1.6;margin:0 0 16px;">' +
+          'Your free account is ready.' +
+        '</p>' +
+        '<p style="color:#94a3b8;font-size:14px;line-height:1.65;margin:0 0 20px;">' +
+          'Scan cards, save the ones you care about, build your collection. ' +
+          'We\'ll let you know when cards you\'re watching change significantly in value.' +
+        '</p>' +
+        '<p style="color:#94a3b8;font-size:13px;line-height:1.6;margin:0 0 24px;">' +
+          'Your first 25 watched cards are free.' +
+        '</p>' +
+        '<a href="https://www.cardgauge.com" style="display:block;background:#22c55e;color:#052e16;text-decoration:none;text-align:center;padding:13px;border-radius:10px;font-weight:800;font-size:14px;">Open CardGauge \u2192</a>' +
+        '<p style="color:#64748b;font-size:11px;line-height:1.6;margin-top:24px;">' +
+          'You\'re getting this because you created a CardGauge account. ' +
+          '<a href="https://www.cardgauge.com/my-binder" style="color:#64748b;">Manage email preferences</a>' +
+        '</p>' +
+      '</div>' +
+    '</div>'
+  );
+}
+
+async function runWelcomeEmails() {
+  if (!supabaseAdmin) return;
+  if (!RESEND_API_KEY) return;
+
+  try {
+    // Only accounts from the last 24 hours — see the note above on why
+    // this is bounded rather than an open-ended "not yet sent" scan.
+    const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+
+    const { data: prefs, error } = await supabaseAdmin
+      .from("email_preferences")
+      .select("user_id, created_at")
+      .eq("welcome_sent", false)
+      .gte("created_at", since)
+      .limit(50);
+
+    if (error) {
+      console.error("[welcome-email] fetch error:", error.message);
+      return;
+    }
+    if (!prefs || !prefs.length) return;
+
+    let sent = 0, skipped = 0;
+
+    for (const row of prefs) {
+      try {
+        const { data: userData, error: userErr } = await supabaseAdmin.auth.admin.getUserById(row.user_id);
+        if (userErr || !userData || !userData.user || !userData.user.email) {
+          skipped++;
+          continue;
+        }
+
+        const ok = await sendResendEmail(
+          userData.user.email,
+          "Welcome to CardGauge \uD83D\uDC4B",
+          buildWelcomeEmailHtml()
+        );
+
+        if (ok) {
+          sent++;
+          await supabaseAdmin
+            .from("email_preferences")
+            .update({ welcome_sent: true, welcome_sent_at: new Date().toISOString() })
+            .eq("user_id", row.user_id);
+          try {
+            await supabaseAdmin.rpc("log_scan_event", {
+              p_event: "welcome_email_sent",
+              p_card_name: null,
+              p_used_back: false,
+              p_is_owner: false
+            });
+          } catch (e) { /* analytics failure must never block the send */ }
+        } else {
+          skipped++;
+        }
+      } catch (e) {
+        console.error("[welcome-email] error for user " + row.user_id + ":", e.message);
+        skipped++;
+      }
+    }
+
+    if (sent || skipped) {
+      console.log("[welcome-email] sent=" + sent + " skipped=" + skipped);
+    }
+  } catch (e) {
+    console.error("[welcome-email] fatal error:", e.message);
+  }
+}
+
+cron.schedule("*/5 * * * *", runWelcomeEmails);
+console.log("Welcome emails checking every 5 minutes");
+
+// Manual trigger for testing.
+app.get("/api/run-welcome-emails", async (req, res) => {
+  if (!process.env.REFRESH_SECRET || req.query.key !== process.env.REFRESH_SECRET) {
+    return res.status(403).json({ success: false, error: "Forbidden" });
+  }
+  res.json({ success: true, message: "Welcome email check started — check server logs" });
+  runWelcomeEmails();
+});
+
 /* ── CAN THIS SERVER REACH TCGDEX? ──────────────────────────
    Diagnostic, not a feature. TCGdex is unreachable from the browser
    this was tested in, but a browser's network is not Render's — a
