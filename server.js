@@ -4175,6 +4175,248 @@ app.get("/api/refresh-watchlist", async (req, res) => {
   refreshWatchlistPrices();
 });
 
+/* ══════════════════════════════════════════════════════════════
+   PRICE ALERTS — Phase 4 of the email/retention project.
+
+   Runs after the nightly watchlist refresh (which updates current_price),
+   so this always sees today's numbers, not yesterday's.
+
+   ONE EMAIL PER USER, not one per card. Someone watching eight cards
+   that all moved gets one digest, not eight separate emails — the
+   inbox experience matters as much as the data.
+
+   THE RE-ALERT PROBLEM: comparing current_price to price_when_added
+   forever means a card that crossed 10% once gets re-reported every
+   single night after that, even with zero further movement. Each row
+   carries its own last_alerted_price — the price that triggered the
+   PREVIOUS alert (or price_when_added if never alerted). Only a move
+   from THAT baseline counts as new, and after sending, the baseline
+   resets to the current price. So the next alert only fires on a
+   genuinely new move.
+
+   Respects email_preferences: skipped if price_alerts is off or
+   unsubscribed_all is true. A user with no preferences row (shouldn't
+   happen given the backfill + trigger, but code defensively) is
+   treated as opted out — silence is the safe default, not spam.
+══════════════════════════════════════════════════════════════ */
+
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+/* No verified domain yet — see the Cloudflare DNS migration note.
+   Once cardgauge.com is verified in Resend, change this one line and
+   nothing else needs to change. */
+const ALERT_FROM_EMAIL = "CardGauge <onboarding@resend.dev>";
+const PRICE_ALERT_PCT = 10;   // minimum move to bother somebody about
+
+async function sendResendEmail(to, subject, html) {
+  if (!RESEND_API_KEY) {
+    console.log("[email] RESEND_API_KEY missing — skipping send to " + to);
+    return false;
+  }
+  try {
+    const r = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + RESEND_API_KEY,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        from: ALERT_FROM_EMAIL,
+        to: [to],
+        subject: subject,
+        html: html
+      })
+    });
+    if (!r.ok) {
+      const body = await r.text();
+      console.log("[email] Resend send failed " + r.status + ": " + body.slice(0, 300));
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.log("[email] Resend send error:", e.message);
+    return false;
+  }
+}
+
+function alertCardRowHtml(item, pct) {
+  const up = pct >= 0;
+  const arrow = up ? "\u25B2" : "\u25BC";
+  const color = up ? "#22c55e" : "#ef4444";
+  return (
+    '<tr style="border-bottom:1px solid #1e2d45;">' +
+      '<td style="padding:10px 0;color:#f1f5f9;font-family:sans-serif;font-size:14px;">' +
+        (item.card_name || "Card") +
+      '</td>' +
+      '<td style="padding:10px 0;text-align:right;color:' + color + ';font-family:monospace;font-size:14px;font-weight:700;white-space:nowrap;">' +
+        arrow + ' ' + Math.abs(Math.round(pct)) + '%' +
+      '</td>' +
+      '<td style="padding:10px 0 10px 14px;text-align:right;color:#94a3b8;font-family:monospace;font-size:12.5px;white-space:nowrap;">' +
+        '$' + Math.round(item.last_alerted_price || item.price_when_added || 0) + ' \u2192 $' + Math.round(item.current_price) +
+      '</td>' +
+    '</tr>'
+  );
+}
+
+function buildAlertEmailHtml(rows) {
+  const rowsHtml = rows.map(function (r) { return alertCardRowHtml(r.item, r.pct); }).join("");
+  return (
+    '<div style="background:#0a0e1a;padding:32px 16px;font-family:Arial,sans-serif;">' +
+      '<div style="max-width:480px;margin:0 auto;background:#111827;border:1px solid #1e2d45;border-radius:14px;padding:28px;">' +
+        '<div style="font-size:20px;font-weight:800;color:#f1f5f9;margin-bottom:4px;">CARD<span style="color:#f59e0b;">GAUGE</span></div>' +
+        '<p style="color:#94a3b8;font-size:13px;margin:0 0 20px;">' +
+          rows.length + ' card' + (rows.length === 1 ? '' : 's') + ' in your binder moved today.' +
+        '</p>' +
+        '<table style="width:100%;border-collapse:collapse;">' + rowsHtml + '</table>' +
+        '<a href="https://www.cardgauge.com/my-binder" style="display:block;margin-top:24px;background:#22c55e;color:#052e16;text-decoration:none;text-align:center;padding:13px;border-radius:10px;font-weight:800;font-size:14px;">View your binder \u2192</a>' +
+        '<p style="color:#64748b;font-size:11px;line-height:1.6;margin-top:20px;">' +
+          'You\'re getting this because price alerts are on for your CardGauge account. ' +
+          '<a href="https://www.cardgauge.com/my-binder" style="color:#64748b;">Manage email preferences</a>' +
+        '</p>' +
+      '</div>' +
+    '</div>'
+  );
+}
+
+async function runPriceAlerts() {
+  if (!supabaseAdmin) {
+    console.log("[price-alerts] skipped — no Supabase client");
+    return;
+  }
+  if (!RESEND_API_KEY) {
+    console.log("[price-alerts] skipped — RESEND_API_KEY not set");
+    return;
+  }
+
+  const startTime = Date.now();
+  console.log("[price-alerts] starting…");
+
+  try {
+    const { data: items, error } = await supabaseAdmin
+      .from("watchlist_items")
+      .select("id, user_id, card_name, price_when_added, current_price, last_alerted_price")
+      .not("current_price", "is", null)
+      .not("price_when_added", "is", null)
+      .gt("price_when_added", 0);
+
+    if (error) {
+      console.error("[price-alerts] fetch error:", error.message);
+      return;
+    }
+    if (!items || !items.length) {
+      console.log("[price-alerts] nothing to check");
+      return;
+    }
+
+    // Which moves actually clear the bar, per-card, against each card's own baseline.
+    const movers = [];
+    for (const item of items) {
+      const baseline = safeNumber(item.last_alerted_price, 0) || safeNumber(item.price_when_added, 0);
+      if (!baseline || !item.current_price) continue;
+      const pct = ((item.current_price - baseline) / baseline) * 100;
+      if (Math.abs(pct) >= PRICE_ALERT_PCT) {
+        movers.push({ item: item, pct: pct });
+      }
+    }
+
+    if (!movers.length) {
+      console.log("[price-alerts] no cards crossed " + PRICE_ALERT_PCT + "% today");
+      return;
+    }
+
+    // Group by user — one digest email, not one email per card.
+    const byUser = {};
+    movers.forEach(function (m) {
+      const uid = m.item.user_id;
+      if (!byUser[uid]) byUser[uid] = [];
+      byUser[uid].push(m);
+    });
+
+    let emailsSent = 0, emailsSkipped = 0, usersChecked = 0;
+
+    for (const userId of Object.keys(byUser)) {
+      usersChecked++;
+      try {
+        const { data: prefs } = await supabaseAdmin
+          .from("email_preferences")
+          .select("price_alerts, unsubscribed_all")
+          .eq("user_id", userId)
+          .maybeSingle();
+
+        // No row, opted out, or globally unsubscribed — silence, not a send.
+        if (!prefs || !prefs.price_alerts || prefs.unsubscribed_all) {
+          emailsSkipped++;
+          continue;
+        }
+
+        const { data: userData, error: userErr } = await supabaseAdmin.auth.admin.getUserById(userId);
+        if (userErr || !userData || !userData.user || !userData.user.email) {
+          emailsSkipped++;
+          continue;
+        }
+        const email = userData.user.email;
+
+        const rows = byUser[userId];
+        const html = buildAlertEmailHtml(rows);
+        const subject = rows.length === 1
+          ? (rows[0].pct >= 0 ? "\uD83D\uDCC8 " : "\uD83D\uDCC9 ") + rows[0].item.card_name + " moved " + Math.abs(Math.round(rows[0].pct)) + "%"
+          : rows.length + " cards moved in your CardGauge binder";
+
+        const sent = await sendResendEmail(email, subject, html);
+        if (sent) {
+          emailsSent++;
+          // Reset each card's baseline to today's price, so tomorrow's
+          // comparison is against TODAY, not the original save price.
+          for (const m of rows) {
+            await supabaseAdmin
+              .from("watchlist_items")
+              .update({
+                last_alerted_price: m.item.current_price,
+                last_alerted_at: new Date().toISOString()
+              })
+              .eq("id", m.item.id);
+          }
+          try {
+            await supabaseAdmin.rpc("log_scan_event", {
+              p_event: "price_alert_sent",
+              p_card_name: String(rows.length),
+              p_used_back: false,
+              p_is_owner: false
+            });
+          } catch (e) { /* analytics failure must never block the send */ }
+        } else {
+          emailsSkipped++;
+        }
+      } catch (e) {
+        console.error("[price-alerts] error for user " + userId + ":", e.message);
+        emailsSkipped++;
+      }
+    }
+
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    console.log(
+      "[price-alerts] done. users_with_movers=" + usersChecked +
+      " sent=" + emailsSent + " skipped=" + emailsSkipped +
+      " elapsed=" + elapsed + "s"
+    );
+  } catch (e) {
+    console.error("[price-alerts] fatal error:", e.message);
+  }
+}
+
+// Runs 30 minutes after the watchlist price refresh, so current_price
+// reflects today's numbers before this checks them.
+cron.schedule("30 4 * * *", runPriceAlerts, { timezone: "America/New_York" });
+console.log("Price alerts scheduled for 4:30 AM ET");
+
+// Manual trigger for testing — same auth pattern as /api/refresh-watchlist.
+app.get("/api/run-price-alerts", async (req, res) => {
+  if (!process.env.REFRESH_SECRET || req.query.key !== process.env.REFRESH_SECRET) {
+    return res.status(403).json({ success: false, error: "Forbidden" });
+  }
+  res.json({ success: true, message: "Price alerts started — check server logs" });
+  runPriceAlerts();
+});
+
 /* ── CAN THIS SERVER REACH TCGDEX? ──────────────────────────
    Diagnostic, not a feature. TCGdex is unreachable from the browser
    this was tested in, but a browser's network is not Render's — a
