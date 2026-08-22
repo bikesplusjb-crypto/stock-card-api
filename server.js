@@ -498,8 +498,57 @@ function spreadRatio(sortedPrices) {
   return r.high / m;
 }
 
+/* JUNK STRIPPING — added after the Aug 22 sold-price coverage audit.
+
+   Two concretely-evidenced patterns were killing otherwise-searchable
+   queries:
+
+     "2025 ... Brock Bowers #34 CMP116854"          -> 0 sold comps
+     "2025 ... Brock Bowers #34"                     -> 51 sold comps
+     "2025 ... Brock Bowers #34 white background"    -> 0 sold comps
+
+   CMP116854 is an internal marketplace SKU, not a card identifier —
+   thecardapi has never heard of it and the extra token just prevents a
+   match. "white background" describes a PHOTO, not a card.
+
+   Deliberately narrow. A card number (#34), a parallel (Refractor), a
+   serial (/499) and autograph terminology all look superficially like
+   "extra tokens after the player name" too, and stripping too eagerly
+   would break exactly the queries this function exists to get right.
+   So this only removes:
+
+     1. Internal SKU/cert codes: 3+ letters immediately followed by
+        4+ digits, with no space between them (CMP116854, PWCC00219).
+        A real card number is never written this way — it's a bare
+        number, "#34", or a fraction like "4/102" — so this pattern
+        should not collide with anything legitimate.
+
+     2. A short, fixed list of listing-photo/condition phrases that
+        describe the LISTING, never the card. Kept deliberately short
+        rather than trying to anticipate every possible junk phrase —
+        a narrow list that's certainly safe beats a broad one that
+        might not be. */
+const SKU_CODE_RE = /\b[A-Za-z]{3,}\d{4,}\b/g;
+const LISTING_NOISE_PHRASES = [
+  "white background", "black background", "no reserve",
+  "free shipping", "fast shipping", "ships fast", "ships free",
+  "with sleeve", "in sleeve", "top loader", "toploader",
+  "penny sleeve", "brand new", "mint condition", "great condition"
+];
+
+function stripQueryJunk(q) {
+  let out = String(q || "");
+  out = out.replace(SKU_CODE_RE, " ");
+  LISTING_NOISE_PHRASES.forEach(phrase => {
+    const re = new RegExp("\\b" + phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "gi");
+    out = out.replace(re, " ");
+  });
+  return out.replace(/\s+/g, " ").trim();
+}
+
 function normalizeCardQuery(query) {
-  let q = String(query || "").replace(/\s+/g, " ").trim();
+  let q = stripQueryJunk(query);
+  q = q.replace(/\s+/g, " ").trim();
   if (!q) return "sports trading card";
   const lower = q.toLowerCase();
   const pokemonNames = [
