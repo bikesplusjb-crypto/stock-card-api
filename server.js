@@ -4555,6 +4555,287 @@ app.get("/api/run-welcome-emails", async (req, res) => {
   runWelcomeEmails();
 });
 
+/* ══════════════════════════════════════════════════════════════
+   WEEKLY DIGEST — Phase 5 of the email/retention project.
+
+   "$4,281 estimated value, +$183 this week, biggest movers, N cards
+   M sets" — the weekly-habit email, distinct from price alerts (which
+   fire on individual moves, whenever they happen).
+
+   THE COMPARISON PROBLEM. watchlist_items only holds the CURRENT
+   price — there was no record anywhere of what a user's collection was
+   worth seven days ago. weekly_portfolio_snapshots exists to fix that:
+   this function reads the most recent prior snapshot, diffs against
+   today, then writes a new snapshot for next week to diff against.
+
+   A user's first-ever digest has no prior snapshot to compare to — it
+   still sends (showing just the current total, no delta, no movers),
+   because "here's where you stand" is still useful on its own, and
+   skipping it silently would mean somebody with a real collection
+   never gets a digest until their SECOND eligible week.
+
+   Skipped entirely for users with zero cards. An email whose entire
+   content is "$0, 0 cards" is not a habit-forming touchpoint, it is
+   noise, and it is the majority of users right now given how few
+   people have saved anything.
+══════════════════════════════════════════════════════════════ */
+
+function fmtUsd(n) {
+  const v = Math.round(Number(n) || 0);
+  return "$" + v.toLocaleString();
+}
+
+function digestMoverRowHtml(name, from, to) {
+  const pct = from ? Math.round(((to - from) / from) * 100) : 0;
+  const up = to >= from;
+  const arrow = up ? "\u25B2" : "\u25BC";
+  const color = up ? "#22c55e" : "#ef4444";
+  return (
+    '<tr style="border-bottom:1px solid #1e2d45;">' +
+      '<td style="padding:9px 0;color:#f1f5f9;font-family:sans-serif;font-size:13.5px;">' + name + '</td>' +
+      '<td style="padding:9px 0;text-align:right;color:' + color + ';font-family:monospace;font-size:13px;font-weight:700;white-space:nowrap;">' +
+        arrow + ' ' + Math.abs(pct) + '%' +
+      '</td>' +
+    '</tr>'
+  );
+}
+
+function buildWeeklyDigestHtml(opts) {
+  const hasComparison = opts.hasComparison;
+  const deltaColor = opts.delta >= 0 ? "#22c55e" : "#ef4444";
+  const deltaSign = opts.delta >= 0 ? "+" : "\u2212";
+  const moversHtml = opts.movers.map(function (m) {
+    return digestMoverRowHtml(m.name, m.from, m.to);
+  }).join("");
+
+  return (
+    '<div style="background:#0a0e1a;padding:32px 16px;font-family:Arial,sans-serif;">' +
+      '<div style="max-width:480px;margin:0 auto;background:#111827;border:1px solid #1e2d45;border-radius:14px;padding:28px;">' +
+        '<div style="font-size:20px;font-weight:800;color:#f1f5f9;margin-bottom:4px;">CARD<span style="color:#f59e0b;">GAUGE</span></div>' +
+        '<p style="color:#94a3b8;font-size:13px;margin:0 0 20px;">Your weekly CardGauge update</p>' +
+        '<div style="font-size:34px;font-weight:900;color:#f1f5f9;line-height:1;">' + fmtUsd(opts.totalValue) + '</div>' +
+        (hasComparison
+          ? '<div style="color:' + deltaColor + ';font-family:monospace;font-size:13px;font-weight:700;margin-top:6px;">' +
+              deltaSign + fmtUsd(Math.abs(opts.delta)) + ' this week</div>'
+          : '<div style="color:#64748b;font-family:monospace;font-size:12px;margin-top:6px;">First week tracking your collection</div>') +
+        (moversHtml
+          ? '<div style="margin-top:22px;padding-top:18px;border-top:1px solid #1e2d45;">' +
+              '<div style="color:#94a3b8;font-family:monospace;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:10px;">Biggest movers</div>' +
+              '<table style="width:100%;border-collapse:collapse;">' + moversHtml + '</table>' +
+            '</div>'
+          : '') +
+        '<div style="margin-top:22px;padding-top:18px;border-top:1px solid #1e2d45;color:#94a3b8;font-family:monospace;font-size:12px;">' +
+          opts.cardCount + ' card' + (opts.cardCount === 1 ? '' : 's') +
+        '</div>' +
+        '<a href="https://www.cardgauge.com/my-binder" style="display:block;margin-top:20px;background:#22c55e;color:#052e16;text-decoration:none;text-align:center;padding:13px;border-radius:10px;font-weight:800;font-size:14px;">View your binder \u2192</a>' +
+        '<p style="color:#64748b;font-size:11px;line-height:1.6;margin-top:20px;">' +
+          '<a href="https://www.cardgauge.com/my-binder" style="color:#64748b;">Manage email preferences</a>' +
+        '</p>' +
+      '</div>' +
+    '</div>'
+  );
+}
+
+async function runWeeklyDigest() {
+  if (!supabaseAdmin || !SENDGRID_API_KEY) return;
+
+  const startTime = Date.now();
+  console.log("[weekly-digest] starting…");
+
+  try {
+    const { data: items, error } = await supabaseAdmin
+      .from("watchlist_items")
+      .select("id, user_id, card_name, current_price")
+      .not("current_price", "is", null)
+      .gt("current_price", 0);
+
+    if (error) {
+      console.error("[weekly-digest] fetch error:", error.message);
+      return;
+    }
+    if (!items || !items.length) {
+      console.log("[weekly-digest] no priced cards to report on");
+      return;
+    }
+
+    // Group into per-user portfolios.
+    const byUser = {};
+    items.forEach(function (it) {
+      if (!byUser[it.user_id]) byUser[it.user_id] = [];
+      byUser[it.user_id].push(it);
+    });
+
+    let sent = 0, skipped = 0;
+
+    for (const userId of Object.keys(byUser)) {
+      try {
+        const { data: prefs } = await supabaseAdmin
+          .from("email_preferences")
+          .select("weekly_update, unsubscribed_all")
+          .eq("user_id", userId)
+          .maybeSingle();
+
+        if (!prefs || !prefs.weekly_update || prefs.unsubscribed_all) {
+          skipped++;
+          continue;
+        }
+
+        const rows = byUser[userId];
+        const totalValue = rows.reduce(function (a, r) { return a + safeNumber(r.current_price, 0); }, 0);
+        const nowItems = {};
+        rows.forEach(function (r) {
+          nowItems[r.id] = { name: r.card_name || "Card", price: safeNumber(r.current_price, 0) };
+        });
+
+        // Most recent prior snapshot, if any.
+        const { data: prior } = await supabaseAdmin
+          .from("weekly_portfolio_snapshots")
+          .select("total_value, items, snapshot_at")
+          .eq("user_id", userId)
+          .order("snapshot_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        let hasComparison = false, delta = 0, movers = [];
+        if (prior && prior.items) {
+          hasComparison = true;
+          delta = totalValue - safeNumber(prior.total_value, 0);
+
+          // Per-card diff, sorted by absolute % move, top 3.
+          const diffs = [];
+          Object.keys(nowItems).forEach(function (id) {
+            const before = prior.items[id];
+            if (!before || !before.price) return;
+            const pct = Math.abs((nowItems[id].price - before.price) / before.price);
+            if (pct >= 0.05) {   // 5%+ to count as a "mover" in the digest
+              diffs.push({ name: nowItems[id].name, from: before.price, to: nowItems[id].price, pct: pct });
+            }
+          });
+          diffs.sort(function (a, b) { return b.pct - a.pct; });
+          movers = diffs.slice(0, 3);
+        }
+
+        const { data: userData, error: userErr } = await supabaseAdmin.auth.admin.getUserById(userId);
+        if (userErr || !userData || !userData.user || !userData.user.email) {
+          skipped++;
+          continue;
+        }
+
+        const html = buildWeeklyDigestHtml({
+          totalValue: totalValue,
+          hasComparison: hasComparison,
+          delta: delta,
+          movers: movers,
+          cardCount: rows.length
+        });
+
+        const ok = await sendResendEmail(
+          userData.user.email,
+          "Your CardGauge Weekly Update",
+          html
+        );
+
+        if (ok) {
+          sent++;
+          try {
+            await supabaseAdmin.rpc("log_scan_event", {
+              p_event: "weekly_update_sent",
+              p_card_name: null,
+              p_used_back: false,
+              p_is_owner: false
+            });
+          } catch (e) { /* analytics failure must never block the send */ }
+        } else {
+          skipped++;
+        }
+
+        // New snapshot either way — even a skipped/failed send still
+        // gets one, so next week's comparison isn't built on stale data.
+        await supabaseAdmin.from("weekly_portfolio_snapshots").insert({
+          user_id: userId,
+          total_value: totalValue,
+          card_count: rows.length,
+          items: nowItems
+        });
+      } catch (e) {
+        console.error("[weekly-digest] error for user " + userId + ":", e.message);
+        skipped++;
+      }
+    }
+
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    console.log("[weekly-digest] done. sent=" + sent + " skipped=" + skipped + " elapsed=" + elapsed + "s");
+  } catch (e) {
+    console.error("[weekly-digest] fatal error:", e.message);
+  }
+}
+
+// Monday mornings, ET.
+cron.schedule("0 8 * * 1", runWeeklyDigest, { timezone: "America/New_York" });
+console.log("Weekly digest scheduled for Mondays 8:00 AM ET");
+
+app.get("/api/run-weekly-digest", async (req, res) => {
+  if (!process.env.REFRESH_SECRET || req.query.key !== process.env.REFRESH_SECRET) {
+    return res.status(403).json({ success: false, error: "Forbidden" });
+  }
+  res.json({ success: true, message: "Weekly digest started — check server logs" });
+  runWeeklyDigest();
+});
+
+/* ══════════════════════════════════════════════════════════════
+   EMAIL OPEN/CLICK TRACKING — Phase 9 of the email/retention project.
+
+   SendGrid can POST every open, click, bounce, and spam report back to
+   a URL of our choosing (their "Event Webhook"). Until this exists,
+   "welcome_email_sent" and "price_alert_sent" were the only signal —
+   whether anybody actually OPENED one, let alone clicked through, was
+   invisible. This endpoint is where those events land.
+
+   MUST use express.raw or otherwise read the body before any JSON
+   parsing runs — SendGrid's webhook sends an array of events, and this
+   route is registered below express.json() in the file, which is fine
+   here because this endpoint doesn't need signature verification on
+   the raw body the way Stripe's does. It reads the already-parsed body.
+
+   Logged as generic email_opened / email_clicked rather than tied to
+   which specific campaign, because SendGrid's event payload doesn't
+   carry that unless custom_args were attached at send time — which
+   the current sendResendEmail() does not do. Good enough to answer
+   "are people opening these at all", not yet enough to break down
+   opens by price-alert vs weekly-digest vs welcome. That's a future
+   refinement, not a blocker for having open/click data at all.
+══════════════════════════════════════════════════════════════ */
+
+app.post("/api/sendgrid-webhook", async (req, res) => {
+  // Always 200 quickly — SendGrid retries on non-2xx, and a slow or
+  // failing analytics write must never cause repeated redelivery.
+  res.status(200).send("ok");
+
+  if (!supabaseAdmin) return;
+  const events = Array.isArray(req.body) ? req.body : [];
+  if (!events.length) return;
+
+  const EVENT_MAP = {
+    open: "email_opened",
+    click: "email_clicked",
+    bounce: "email_bounced",
+    spamreport: "email_spam_report"
+  };
+
+  for (const ev of events) {
+    const mapped = EVENT_MAP[ev.event];
+    if (!mapped) continue;   // ignore delivered/processed/deferred — not useful signal here
+    try {
+      await supabaseAdmin.rpc("log_scan_event", {
+        p_event: mapped,
+        p_card_name: ev.email ? String(ev.email).slice(0, 200) : null,
+        p_used_back: false,
+        p_is_owner: false
+      });
+    } catch (e) { /* one bad event must not block the rest of the batch */ }
+  }
+});
+
 /* ── CAN THIS SERVER REACH TCGDEX? ──────────────────────────
    Diagnostic, not a feature. TCGdex is unreachable from the browser
    this was tested in, but a browser's network is not Render's — a
