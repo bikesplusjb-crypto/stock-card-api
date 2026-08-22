@@ -4200,40 +4200,47 @@ app.get("/api/refresh-watchlist", async (req, res) => {
    treated as opted out — silence is the safe default, not spam.
 ══════════════════════════════════════════════════════════════ */
 
-const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
-/* No verified domain yet — see the Cloudflare DNS migration note.
-   Once cardgauge.com is verified in Resend, change this one line and
-   nothing else needs to change. */
-const ALERT_FROM_EMAIL = "CardGauge <onboarding@resend.dev>";
+/* SendGrid, not Resend. cardgauge.com is verified there via CNAME
+   records — Resend specifically required an MX record to enable
+   sending, and Wix's DNS panel cannot publish MX records on a
+   subdomain. SendGrid's default "Automated Security" setup only needs
+   CNAMEs, which Wix handles fine, so this is the actual working path.
+
+   Function name kept as sendResendEmail so the two callers (price
+   alerts, welcome emails) needed zero changes — only the
+   implementation underneath changed. */
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";
+const ALERT_FROM_EMAIL = "CardGauge <alerts@cardgauge.com>";
 const PRICE_ALERT_PCT = 10;   // minimum move to bother somebody about
 
 async function sendResendEmail(to, subject, html) {
-  if (!RESEND_API_KEY) {
-    console.log("[email] RESEND_API_KEY missing — skipping send to " + to);
+  if (!SENDGRID_API_KEY) {
+    console.log("[email] SENDGRID_API_KEY missing — skipping send to " + to);
     return false;
   }
   try {
-    const r = await fetch("https://api.resend.com/emails", {
+    const r = await fetch("https://api.sendgrid.com/v3/mail/send", {
       method: "POST",
       headers: {
-        Authorization: "Bearer " + RESEND_API_KEY,
+        Authorization: "Bearer " + SENDGRID_API_KEY,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        from: ALERT_FROM_EMAIL,
-        to: [to],
+        personalizations: [{ to: [{ email: to }] }],
+        from: { email: "alerts@cardgauge.com", name: "CardGauge" },
         subject: subject,
-        html: html
+        content: [{ type: "text/html", value: html }]
       })
     });
+    // SendGrid returns 202 with an empty body on success — not 200.
     if (!r.ok) {
       const body = await r.text();
-      console.log("[email] Resend send failed " + r.status + ": " + body.slice(0, 300));
+      console.log("[email] SendGrid send failed " + r.status + ": " + body.slice(0, 300));
       return false;
     }
     return true;
   } catch (e) {
-    console.log("[email] Resend send error:", e.message);
+    console.log("[email] SendGrid send error:", e.message);
     return false;
   }
 }
@@ -4282,8 +4289,8 @@ async function runPriceAlerts() {
     console.log("[price-alerts] skipped — no Supabase client");
     return;
   }
-  if (!RESEND_API_KEY) {
-    console.log("[price-alerts] skipped — RESEND_API_KEY not set");
+  if (!SENDGRID_API_KEY) {
+    console.log("[price-alerts] skipped — SENDGRID_API_KEY not set");
     return;
   }
 
@@ -4469,7 +4476,7 @@ function buildWelcomeEmailHtml() {
 
 async function runWelcomeEmails() {
   if (!supabaseAdmin) return;
-  if (!RESEND_API_KEY) return;
+  if (!SENDGRID_API_KEY) return;
 
   try {
     // Only accounts from the last 24 hours — see the note above on why
