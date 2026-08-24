@@ -4823,6 +4823,10 @@ function buildWeeklyDigestHtml(opts) {
         '<div style="margin-top:22px;padding-top:18px;border-top:1px solid #1e2d45;color:#94a3b8;font-family:monospace;font-size:12px;">' +
           opts.cardCount + ' card' + (opts.cardCount === 1 ? '' : 's') +
         '</div>' +
+        '<div style="margin-top:18px;padding:14px;background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.25);border-radius:10px;">' +
+          '<div style="color:#fbbf24;font-weight:700;font-size:12.5px;margin-bottom:4px;">\ud83d\udcc7 New: scan a PSA barcode</div>' +
+          '<div style="color:#94a3b8;font-size:11.5px;line-height:1.5;">Already graded? Skip the photo \u2014 scan the barcode on the label and we\u2019ll pull the card, grade and price straight from PSA\u2019s own record.</div>' +
+        '</div>' +
         '<a href="https://www.cardgauge.com/my-binder" style="display:block;margin-top:20px;background:#22c55e;color:#052e16;text-decoration:none;text-align:center;padding:13px;border-radius:10px;font-weight:800;font-size:14px;">View your binder \u2192</a>' +
         '<p style="color:#64748b;font-size:11px;line-height:1.6;margin-top:20px;">' +
           '<a href="https://www.cardgauge.com/my-binder" style="color:#64748b;">Manage email preferences</a>' +
