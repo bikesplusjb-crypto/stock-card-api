@@ -2612,6 +2612,153 @@ app.post(
   }
 );
 
+/* ══════════════════════════════════════════════════════════════
+   PSA CERT LOOKUP — scan a graded slab's barcode instead of the card.
+
+   PSA already knows exactly what's inside the holder — player, year,
+   set, card number, and the grade itself. There is no reason to run
+   that through the AI vision identification step at all; this skips
+   straight to pricing using PSA's own ground truth.
+
+   REAL, OFFICIAL, FREE API — not scraping. Docs:
+   https://www.psacard.com/publicapi/documentation
+   Get a token by registering at https://www.psacard.com/publicapi
+   with a PSA account, then set PSA_API_TOKEN in Render's env vars.
+
+   THE ONE HONEST UNKNOWN: PSA's docs show the request pattern but not
+   the full response JSON schema. Rather than guess at field names and
+   silently return blank fields, this logs the raw response on every
+   call until the mapping below has been confirmed against a real cert
+   number — cheap insurance against shipping a broken field map. */
+const PSA_API_TOKEN = process.env.PSA_API_TOKEN || "";
+const PSA_API_BASE = "https://api.psacard.com/publicapi";
+
+/* Defensive across likely casings, since the exact schema isn't
+   confirmed yet. Tries PascalCase (a .NET-style API, which the
+   GetByCertNumber naming convention suggests) and camelCase, and
+   falls back gracefully rather than throwing on an unexpected shape. */
+function pick(obj, ...keys) {
+  for (const k of keys) {
+    if (obj && obj[k] != null && obj[k] !== "") return obj[k];
+  }
+  return null;
+}
+
+async function fetchPsaCert(certNumber) {
+  if (!PSA_API_TOKEN) return { ok: false, reason: "PSA_API_TOKEN not configured" };
+  const clean = String(certNumber || "").replace(/[^0-9]/g, "");
+  if (!clean) return { ok: false, reason: "No cert number provided" };
+
+  try {
+    const r = await fetch(PSA_API_BASE + "/cert/GetByCertNumber/" + clean, {
+      headers: { Authorization: "bearer " + PSA_API_TOKEN }
+    });
+    if (!r.ok) {
+      console.log("[psa] HTTP " + r.status + " for cert " + clean);
+      return { ok: false, reason: "PSA API returned " + r.status };
+    }
+    const body = await r.json();
+
+    /* Logged until the field mapping below is confirmed against a
+       real response — see the note above. Safe to remove once we've
+       verified this once. */
+    console.log("[psa] raw response for cert " + clean + ":", JSON.stringify(body).slice(0, 800));
+
+    if (body && body.IsValidRequest === false) {
+      return { ok: false, reason: body.ServerMessage || "Invalid cert number" };
+    }
+    if (body && body.ServerMessage === "No data found") {
+      return { ok: false, reason: "No PSA record found for that cert number" };
+    }
+
+    // The cert payload may be nested under a PSACert-style key, or flat.
+    const cert = body.PSACert || body.psaCert || body.Cert || body.cert || body;
+
+    const parsed = {
+      certNumber:   clean,
+      player:       pick(cert, "Subject", "subject", "PlayerName", "playerName") || "Unknown",
+      year:         pick(cert, "Year", "year") || "Unknown",
+      brand:        pick(cert, "Brand", "brand") || "Unknown",
+      set:          pick(cert, "Variety", "variety", "Set", "set") || "",
+      cardNumber:   pick(cert, "CardNumber", "cardNumber", "CardNo", "cardNo") || "Unknown",
+      grade:        pick(cert, "CardGrade", "cardGrade", "Grade", "grade"),
+      gradeDescription: pick(cert, "GradeDescription", "gradeDescription") || "",
+      sport:        pick(cert, "Category", "category", "Sport", "sport") || "Unknown",
+      isAutograph:  !!(pick(cert, "IsDualCert", "isDualCert") || /auto/i.test(String(pick(cert, "Subject", "subject") || ""))),
+      raw: body
+    };
+
+    return { ok: true, data: parsed };
+  } catch (e) {
+    console.log("[psa] error:", e.message);
+    return { ok: false, reason: e.message };
+  }
+}
+
+app.get("/api/psa-cert", async (req, res) => {
+  const certNumber = req.query.cert;
+  if (!certNumber) return res.status(400).json({ success: false, error: "cert number required" });
+
+  const psa = await fetchPsaCert(certNumber);
+  if (!psa.ok) {
+    return res.json({ success: false, error: psa.reason });
+  }
+
+  const d = psa.data;
+
+  /* Feed straight into the existing pricing pipeline — same path a
+     photo scan uses, just skipping AI identification because PSA
+     already told us exactly what this is. */
+  const ai = {
+    cardName: [d.year, d.brand, d.set, d.player].filter(Boolean).join(" "),
+    player: d.player, year: d.year, brand: d.brand, set: d.set,
+    cardNumber: d.cardNumber, sport: d.sport,
+    parallel: "", serialNumber: "", isRookie: false,
+    isAutograph: d.isAutograph, isPatch: false,
+    gradeCompany: "PSA", gradeValue: d.grade
+  };
+
+  const cleanCardName = buildDisplayName(ai);
+  const market = await getCardMarketForCard(ai);
+  const searchQuery = market.searchQuery || buildCardQuery(ai) || cleanCardName;
+  const sold = await getSoldComps(searchQuery, market.avgPrice);
+
+  console.log("[psa] " + cleanCardName + " | PSA " + d.grade + " | cert " + d.certNumber +
+    " | sold=$" + (sold && sold.soldMedian ? sold.soldMedian : "-"));
+
+  res.json({
+    success: true,
+    source: "psa_cert",
+    certNumber: d.certNumber,
+    cardName: cleanCardName || "Unknown Trading Card",
+    player: d.player, year: d.year, set: d.set || "Unknown",
+    brand: d.brand, cardNumber: d.cardNumber, sport: d.sport,
+    parallel: "", serialNumber: "", isRookie: false,
+    isAutograph: d.isAutograph, isPatch: false, usedBack: false,
+    gradeCompany: "PSA", gradeValue: d.grade, gradeDescription: d.gradeDescription,
+    signal: "GRADE", confidence: "High",
+    searchQuery: searchQuery,
+    sold: sold || null,
+    askVsSold: askVsSold(market, sold),
+    matchQuality: market.matchQuality || "exact",
+    tierUsed: market.tierUsed || "",
+    priceNote: market.priceNote || "",
+    spreadNote: market.spreadNote || "",
+    avgSoldPrice: market.avgPrice, avgPrice: market.avgPrice,
+    lowPrice: market.lowPrice, highPrice: market.highPrice,
+    listingCount: market.listingCount,
+    soldCount: (sold && sold.soldCount) || 0,
+    spreadRatio: market.spreadRatio, wideSpread: market.wideSpread,
+    raw: market.raw, graded: market.graded, gradeBreakdown: market.gradeBreakdown,
+    image: market.image, priceSource: market.priceSource,
+    listings: market.listings,
+    soldCompsUrl: ebayUrl(searchQuery, true),
+    activeListingsUrl: ebayUrl(searchQuery, false),
+    summary: "Identified from PSA cert " + d.certNumber + " — grade and card details are PSA's own record, not an AI guess.",
+    timestamp: Date.now()
+  });
+});
+
 // ── /api/grade-estimate ────────────────────────────────────────
 //
 //  Powers /grade-prescreen. The page was live and linked from both
