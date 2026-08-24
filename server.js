@@ -1054,6 +1054,33 @@ function cardNumberToken(ai) {
        wrong way, or worse). */
     return bare.replace(/(^|\/)0+(?=\d)/g, "$1");
   }
+
+  /* INSERT-SET LETTER-CODE NUMBERS DO NOT SEARCH WELL.
+
+     Insert and parallel subsets are numbered against the INSERT, not the
+     player — "RA-THN" (Rookie Auto), "EOZ-11" (Emperors of the Zone),
+     "CLA-JP" (Class Act), "ISPR-SSS" (Immaculate Signature Patch Rookie).
+     Confirmed directly against real cache data: roughly a quarter of
+     EVERY zero-sold-result lookup on CardGauge over a 7-day window
+     carried exactly this shape of card number — a letter prefix, a
+     hyphen, then more letters or digits.
+
+     Including it verbatim does not narrow a search, it poisons it.
+     Sellers almost never type these letter-for-letter in a listing
+     title; they name the insert and the player instead — which the
+     insert field already folds into `set` before this function runs.
+     A plain numeric card number like "#269" is something sellers do
+     reliably type, so that case is untouched. This only drops the
+     letter-hyphen-code shape, which behaves completely differently in
+     practice.
+
+     Dropped from the SEARCH token only. The raw value is untouched
+     everywhere else it's read (display, verification against the
+     catalog, the saved binder record). */
+  if (/^[A-Za-z]{1,6}-[A-Za-z0-9]{1,8}$/.test(bare)) {
+    return "";
+  }
+
   return "#" + bare;
 }
 
