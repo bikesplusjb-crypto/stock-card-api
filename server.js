@@ -1744,16 +1744,27 @@ function summarizeSold(records, query, limitUsed) {
      concluded. Both numbers are already computed here, so this costs
      nothing to check and catches contamination the word lists miss.
 
-     The 0.7 line is deliberately loose. Genuine raw-to-PSA-9 ratios on
-     modern cards sit around 0.2-0.4; anything at 0.7 or above is not a
-     tight call. */
+     THE THRESHOLD SCALES WITH SAMPLE SIZE. A fixed 0.7 line treats a
+     2-sale sample and a 46-sale sample as equally trustworthy, which
+     they are not: 46 independent sales landing near each other is real
+     evidence a 2-sale sample simply cannot offer. A popular, heavily
+     traded card (confirmed case: a 2018 Ohtani RC with 46 confirmed
+     base-card sales) was getting flagged as contaminated on every
+     single lookup despite the data being genuinely solid — a stricter
+     line makes sense on thin data, where one mixed-in parallel can
+     swing the whole median, but the same line punishes exactly the
+     cards with the most evidence behind them. */
   let warning = "";
   let contaminated = false;
   const psa9  = ladder.find(g => g.grade === "PSA 9");
   const psa10 = ladder.find(g => g.grade === "PSA 10");
   const rung  = (psa9 && psa9.median) || (psa10 && psa10.median ? psa10.median * 0.34 : 0);
+  const contamThreshold = raw.length >= 35 ? 0.85
+                        : raw.length >= 20 ? 0.78
+                        : raw.length >= 10 ? 0.70
+                        : 0.60;
 
-  if (useRaw && rung > 0 && rawMed >= rung * 0.7) {
+  if (useRaw && rung > 0 && rawMed >= rung * contamThreshold) {
     contaminated = true;
     basis = "mixed";
     warning = "These ungraded sales look like they include parallels or inserts — " +
