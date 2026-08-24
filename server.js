@@ -543,6 +543,20 @@ function stripQueryJunk(q) {
     const re = new RegExp("\\b" + phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\b", "gi");
     out = out.replace(re, " ");
   });
+
+  /* Leading zeros in a card-number fraction ("#004/130") kill real
+     matches — sellers write "4/130", not "004/130", even for a card
+     that prints the padded version. Confirmed directly: the same
+     Charizard search returned 100 sold comps without the padding and
+     zero with it, on a genuinely common, heavily-traded card. This
+     covers TYPED searches, which never touch cardNumberToken() —
+     that function only runs on AI-scan output, so a raw typed number
+     needs the identical fix applied separately here. Strips leading
+     zeros from BOTH sides of any digit/digit fraction found anywhere
+     in the text; a genuine "0" (from "000/999") survives since \d+
+     still needs at least one digit left after the zeros are consumed. */
+  out = out.replace(/\b0*(\d+)\s*\/\s*0*(\d+)\b/g, "$1/$2");
+
   return out.replace(/\s+/g, " ").trim();
 }
 
@@ -1028,7 +1042,18 @@ function cardNumberToken(ai) {
   if (!n) return "";
   const bare = n.replace(/^#/, "");
   // Pokemon numbers are written "074/073" in listing titles, never "#074/073".
-  if (bare.indexOf("/") > -1) return bare;
+  if (bare.indexOf("/") > -1) {
+    /* Real listings write "4/130", not "004/130" — sellers drop the
+       leading zeros a modern card prints, even when the card itself
+       pads them. Confirmed directly: the identical Charizard search
+       returned 100 sold comps without the padded fraction and ZERO
+       with it — a common, heavily-traded card silently showing no
+       data because of this one formatting mismatch. Lookahead keeps
+       every digit after the zeros intact (a naive replace risked
+       eating a real digit from "073" and turning it into "73" the
+       wrong way, or worse). */
+    return bare.replace(/(^|\/)0+(?=\d)/g, "$1");
+  }
   return "#" + bare;
 }
 
