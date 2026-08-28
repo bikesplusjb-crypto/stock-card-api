@@ -1935,19 +1935,36 @@ function summarizeSold(records, query, limitUsed) {
               "(median $" + fixedMed + ", only " + fixedP.length + " of them). " +
               "Too thin to call a market price — review before pricing.";
   }
-  /* Limited is surfaced through soldContaminated as well as its own
-     field. The frontend already renders contaminated as a visible
-     caveat; without this, a limited result would display as a clean,
-     confident price, which is the exact failure this change exists to
-     stop. */
-  if (limited) contaminated = true;
+  /* LIMITED IS NOT CONTAMINATED. Kept as two separate facts on purpose.
+
+     soldContaminated means what it has always meant: records that are
+     not this card are still inside the pool the headline was computed
+     from. After this change that is a narrower claim than it used to
+     be, because the base filter no longer falls back to the whole
+     ungraded group — so contamination now means the self-consistency
+     check caught something the word lists missed, not that a fallback
+     substituted the wrong cards.
+
+     soldLimited means the opposite situation: the exclusions all
+     WORKED, and what survived is too small to call a market price.
+     Nothing contaminated is in the number; there is just not enough of
+     it. Reporting that as contamination would say something false
+     about the comps that were selected.
+
+     They are independent, and both can be false, either can be true. */
 
   return {
     soldCount:     clean.length,
     soldMedian:    median(headline),
     soldLow:       range.low,
     soldHigh:      range.high,
-    soldBasis:     basis,
+    /* A limited result must not reach the UI wearing a clean "sold"
+       label. resolvePriceAndBasis() in the frontend decides clean-vs-
+       flagged from soldContaminated alone, and soldContaminated is
+       deliberately false here (see above), so the honest signal has to
+       ride on the basis string instead: "limited" is not "raw", and
+       anything reading this cannot mistake it for a confident median. */
+    soldBasis:     limited ? "limited" : basis,
     soldWarning:   warning,
     soldContaminated: contaminated,
     soldMedianAll: median(prices),
