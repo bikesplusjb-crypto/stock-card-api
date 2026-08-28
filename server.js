@@ -1083,6 +1083,30 @@ function cardNumberToken(ai) {
     return "";
   }
 
+  /* A "CARD NUMBER" WITH NO DIGITS IN IT IS NOT A CARD NUMBER.
+
+     Real case, 2026-08-28: a common Topps Finest Ohtani came back with
+     cardNumber "SO" — the player's initials read off the card, not a
+     number. That went into the query as "#SO", the search found zero
+     sold comps for a card that does not exist, the price fell through
+     to active listings, and the tile rendered $19,000.00 on a card
+     that trades at $3. It reached production inventory.
+
+     The same scan read #50 correctly earlier in the day and #30 in
+     between, so this is model drift, not a fixed misread — which means
+     it will happen again on other cards and cannot be handled by
+     correcting one value.
+
+     A letters-only token is a non-answer. Dropping it from the SEARCH
+     falls back to the year/brand/set/player query, which is broader but
+     genuinely about this card, instead of a precise query about nothing.
+     Everything else — display, catalog verification, the inventory row
+     — still sees the raw value, exactly as with the letter-hyphen case
+     above. */
+  if (!/[0-9]/.test(bare)) {
+    return "";
+  }
+
   return "#" + bare;
 }
 
@@ -2922,6 +2946,36 @@ app.post(
         };
       }
 
+      /* ASK-ONLY SANITY CEILING.
+
+         When no sold comps exist, the headline falls back to the median
+         of ACTIVE listings — and an active listing can be anything a
+         seller types. The $19,000 Ohtani came through here: zero sold
+         records, and the ask median landed on a sealed case or a lot
+         sitting in the same keyword results.
+
+         A sold median is disciplined by completed transactions; an ask
+         median has no such floor, so it is the one number in this
+         response that can be wrong by four orders of magnitude. When
+         asks are the only evidence AND they disagree wildly with each
+         other, that is not a price — it is a search that matched
+         several different things.
+
+         Flags, does not suppress: the number still shows with its
+         existing "Ask only" badge, and the person decides. It just
+         stops arriving as a confident figure with nothing said about
+         it. Uses market.raw (low/high across the listings) which is
+         already computed. */
+      if ((!sold || !sold.soldCount) && market && market.raw) {
+        const lo = Number(market.raw.low), hi = Number(market.raw.high);
+        if (isFinite(lo) && isFinite(hi) && lo > 0 && hi / lo >= 20) {
+          market.priceNote = "No completed sales found, and the asking prices for this " +
+            "search range from $" + lo + " to $" + hi + " — that spread means the search " +
+            "is matching different things, not one card. Treat this number as unverified.";
+          market.askOutlier = true;
+        }
+      }
+
       const verification  = await verifyPromise;
 
       console.log(
@@ -2996,6 +3050,7 @@ app.post(
         tierUsed:          market.tierUsed     || "",
         priceNote:         market.priceNote    || "",
         spreadNote:        market.spreadNote   || "",
+        askOutlier:        !!market.askOutlier,
         signal:            ai.signal     || "VERIFY",
         confidence:        ai.confidence || "Medium",
 
