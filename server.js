@@ -2090,7 +2090,26 @@ async function recordPriceHistory(key, query, sold, askMedian) {
      cached payload expires in twelve hours; a history row does not, and
      a bad point poisons every movement arrow computed against it. */
   if (sold.soldContaminated) {
-    console.log("[history] skipped contaminated median for " + query);
+    console.log("[history] skipped CONTAMINATED median for " + query +
+                " — wrong cards remain in the headline pool");
+    return;
+  }
+  /* Limited is a different reason for the same decision, and it needs
+     its own gate rather than riding on soldContaminated — the two were
+     deliberately separated, so a limited result reaches here with
+     soldContaminated false and would otherwise be written as a clean
+     point.
+
+     A thin-sample median is still shown to the person, with its
+     warning, because a flagged number they can weigh beats no number.
+     It must not become PERMANENT. The cached payload expires in twelve
+     hours; a history row never does, and every movement arrow drawn
+     against it inherits the error. The measured case: a Murakami base
+     rookie reading $1 off six penny auctions, on a card whose
+     fixed-price copies were selling far higher. */
+  if (sold.soldLimited) {
+    console.log("[history] skipped LIMITED median for " + query +
+                " — comps were clean but too thin to price from");
     return;
   }
   try {
