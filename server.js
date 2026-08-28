@@ -1854,9 +1854,29 @@ function summarizeSold(records, query, limitUsed) {
      product decision for shop pricing specifically — a shop is setting
      a sticker, not predicting an auction floor — not a claim that
      fixed-price sales are better evidence in general. */
-  const FIXED_TYPES  = { fixed: 1, best_offer: 1 };
-  const rawFixed     = raw.filter(r => FIXED_TYPES[r.listingType]);
-  const rawAuction   = raw.filter(r => r.listingType === "auction");
+  /* Classified through the SAME bucket() rules listingMix() already
+     uses, not an exact-string match on the field.
+
+     Caught against a real response, not in review: the API returns
+     "fixed_price", while an earlier version of this tested for the
+     literal "fixed". Every fixed-price sale therefore fell through as
+     neither fixed nor auction, the fixed pool was permanently empty,
+     and the fixed-price headline could never engage on any card. It
+     would have looked exactly like "there were never enough fixed
+     sales" — a silent no-op, not an error.
+
+     Sharing listingMix's own classifier is what stops the two from
+     ever disagreeing again: if a new listing type appears, both sides
+     learn about it at once. */
+  const typeBucket = t => {
+    const v = String(t || "").toLowerCase();
+    if (v.indexOf("auction") > -1) return "auction";
+    if (v.indexOf("best_offer") > -1 || v.indexOf("best offer") > -1) return "fixed";
+    if (v.indexOf("fixed") > -1 || v.indexOf("buy") > -1) return "fixed";
+    return "other";
+  };
+  const rawFixed     = raw.filter(r => typeBucket(r.listingType) === "fixed");
+  const rawAuction   = raw.filter(r => typeBucket(r.listingType) === "auction");
   const fixedP       = rawFixed.map(r => r.price).sort((a, b) => a - b);
   const auctionP     = rawAuction.map(r => r.price).sort((a, b) => a - b);
   const fixedMed     = median(fixedP);
