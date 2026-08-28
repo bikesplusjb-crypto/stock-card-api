@@ -444,6 +444,8 @@ function detectGrade(title) {
    entirely so the frontend falls back to an honest estimate. One junk
    $24,999 listing must never become "the PSA 10 price". */
 const MIN_GROUP = 3;
+/* Fixed-price base sales needed before they can carry the headline. */
+const MIN_FIXED = 3;
 
 function summarizeGroup(items) {
   const prices = items.map(x => x.price).sort((a, b) => a - b);
@@ -968,7 +970,7 @@ const POKEMON_WORDS = [
 const NOT_THE_CARD = [
   "auto", "autograph", "autographed", "signed", "signature", "on card auto",
   "patch", "relic", "jersey", "memorabilia", "game used", "game-used", "swatch",
-  "lot of", "card lot", "bulk lot", "mystery", "repack", "break",
+  "lot", "lot of", "card lot", "bulk lot", "mystery", "repack", "break",
   "reprint", "custom", "aceo", "novelty", "proxy", "facsimile"
 ];
 
@@ -1265,12 +1267,53 @@ function looksLikeSerialNumbering(text) {
   return false;
 }
 
+/* TEAM NAMES THAT CONTAIN A COLOUR WORD.
+
+   Found 2026-08-28 against a real sold pool. A Munetaka Murakami base
+   rookie priced at $1.00 while identical fixed-price copies sold at
+   $13. The cause was not contamination — the parallels were being
+   dropped correctly. It was the opposite: three of the cheapest real
+   BASE sales were thrown out because their titles say "White Sox",
+   and "white" is in COLOR_WORDS.
+
+   This is the same family as the Blackmon-matched-as-"black" bug fixed
+   in August, but it is NOT the same cause and the earlier fix cannot
+   catch it. There the boundary matching was broken; here "white" is a
+   genuine standalone word that happens to be half of a team name.
+
+   Measured blast radius, base cards flagged as parallels purely by
+   team name: White Sox, Red Sox, Blue Jays, Green Bay, Red Wings.
+   Every sold median for those teams, everywhere in this file, has been
+   computed from a depleted pool.
+
+   Stripping the PHRASE, not the colour, is what keeps this safe. A
+   genuine parallel of a White Sox card still reads as one: "White Sox
+   Gold Refractor" loses "white sox" and is still caught by "gold" and
+   "refractor". A White parallel of a White Sox card — "White Sox White
+   Parallel" — loses the team phrase and is still caught by the
+   remaining "white". Only the team name itself stops voting. */
+const TEAM_COLOR_PHRASES = [
+  "white sox", "red sox", "blue jays", "red wings", "green bay",
+  "blue jackets", "golden knights", "golden state", "silver knights",
+  "red bulls", "red raiders", "green wave", "black hawks", "blue devils",
+  "orange bowl", "big red"
+];
+function stripTeamColorPhrases(t) {
+  let out = t;
+  for (let i = 0; i < TEAM_COLOR_PHRASES.length; i++) {
+    out = out.split(TEAM_COLOR_PHRASES[i]).join(" ");
+  }
+  return out;
+}
 function titleLooksParallel(title, brandName) {
   let t = " " + String(title || "").toLowerCase() + " ";
   String(brandName || "").toLowerCase().split(/\s+/).forEach(w => {
     if (w.length > 2) t = t.split(w).join(" ");
   });
   if (looksLikeSerialNumbering(t)) return true;
+  // Team names go before the colour test, not after — see
+  // stripTeamColorPhrases(). "Chicago White Sox" must not vote "white".
+  t = stripTeamColorPhrases(t);
   // Word-boundary match — see hasWord(). The old includes(" " + w) test
   // matched Blackmon as "black" and redemption as "red".
   return PARALLEL_WORDS.some(w => hasWord(t, w));
@@ -1731,13 +1774,26 @@ function summarizeSold(records, query, limitUsed) {
      The fallback still happens — a thin sample beats no answer — but it
      is recorded here and reported below. A number that quietly stopped
      meaning what its label says is worse than a number with a caveat. */
-  const filt = { rawBase: 0, rawAll: 0, rawFellBack: false };
+  const filt = { rawBase: 0, rawAll: 0, rawFellBack: false, rawThin: false };
   const narrow = function (group, tag) {
     if (targetIsParallel || targetIsSpecial) return group;
     const base = group.filter(looksBaseSale);
     if (tag === "raw") { filt.rawBase = base.length; filt.rawAll = group.length; }
     if (base.length >= MIN_GROUP) return base;
-    if (tag === "raw") filt.rawFellBack = group.length > base.length;
+    /* THE FALLBACK NO LONGER RUNS FOR THE RAW BASE POOL.
+
+       It used to hand back the ENTIRE ungraded group when too few base
+       sales survived — parallels, inserts and lots included — and the
+       headline was then computed from that. The warning said so, but a
+       shop reads the number, not the caveat, and a contaminated median
+       under any label still ends up on a price sticker.
+
+       A thin clean pool is now returned thin, even empty. Downstream
+       treats that as "not enough clean comps to price from" and flags
+       for review rather than substituting a number built from the wrong
+       cards. Graded and ladder keep the old behaviour: they are reported
+       alongside, never as the headline shop price. */
+    if (tag === "raw") { filt.rawThin = true; return base; }
     return group;
   };
 
@@ -1783,6 +1839,28 @@ function summarizeSold(records, query, limitUsed) {
 
   const rawP  = raw.map(r => r.price).sort((a, b) => a - b);
   const grP   = graded.map(r => r.price).sort((a, b) => a - b);
+
+  /* HOW THE SALE HAPPENED, APPLIED TO THE HEADLINE.
+
+     Measured on a real card (2026 Topps Series Two Murakami #503):
+     auction median $1, fixed-price median $13, from the same 55 sold
+     records. Thirty-four auction closes outvoted twelve fixed-price
+     sales and the shop price came out at $1.00 on a card changing
+     hands around $13.
+
+     Deliberate note, because this file already argues the other way a
+     few lines below: a fixed-price median IS closer to an asking price
+     than an auction close is, and that comment stays true. This is a
+     product decision for shop pricing specifically — a shop is setting
+     a sticker, not predicting an auction floor — not a claim that
+     fixed-price sales are better evidence in general. */
+  const FIXED_TYPES  = { fixed: 1, best_offer: 1 };
+  const rawFixed     = raw.filter(r => FIXED_TYPES[r.listingType]);
+  const rawAuction   = raw.filter(r => r.listingType === "auction");
+  const fixedP       = rawFixed.map(r => r.price).sort((a, b) => a - b);
+  const auctionP     = rawAuction.map(r => r.price).sort((a, b) => a - b);
+  const fixedMed     = median(fixedP);
+  const auctionMed   = median(auctionP);
   const dates = clean.map(r => r.saleDate).filter(Boolean).sort();
 
   const ladder = soldGradeBreakdown(ladderSrc);
@@ -1793,8 +1871,14 @@ function summarizeSold(records, query, limitUsed) {
      drifts upward with every slab in the window. When there are enough raw
      sales, they are the headline; the graded side is reported separately. */
   const useRaw   = rawP.length >= MIN_GROUP;
-  const headline = useRaw ? rawP : prices;
-  let   basis    = useRaw ? "raw" : "all";
+  /* Fixed-price base sales are the headline when there are enough of
+     them. Below MIN_FIXED the fixed sample is too small to be a market
+     read on its own, so the full clean base pool stands instead — and
+     the limited-sample flag below decides whether that number can be
+     trusted at all. */
+  const useFixed = fixedP.length >= MIN_FIXED;
+  const headline = useFixed ? fixedP : (useRaw ? rawP : []);
+  let   basis    = (useFixed || useRaw) ? "raw" : "none";
   const range    = trimmedRange(headline);
 
   /* SELF-CONSISTENCY CHECK.
@@ -1817,6 +1901,7 @@ function summarizeSold(records, query, limitUsed) {
      cards with the most evidence behind them. */
   let warning = "";
   let contaminated = false;
+  let limited = false;
   const psa9  = ladder.find(g => g.grade === "PSA 9");
   const psa10 = ladder.find(g => g.grade === "PSA 10");
   const rung  = (psa9 && psa9.median) || (psa10 && psa10.median ? psa10.median * 0.34 : 0);
@@ -1831,13 +1916,31 @@ function summarizeSold(records, query, limitUsed) {
     warning = "These ungraded sales look like they include parallels or inserts — " +
               "the raw price sits too close to the graded price to be one card. " +
               "Narrow the search before trusting this number.";
-  } else if (filt.rawFellBack) {
-    contaminated = true;
-    basis = "mixed";
-    warning = "Only " + filt.rawBase + " confirmed base-card sale" +
+  } else if (filt.rawThin) {
+    /* Replaces the old rawFellBack branch. That one apologised for a
+       contaminated median; this one exists because there no longer is
+       one. The pool is thin or empty and nothing was substituted. */
+    limited = true;
+    warning = "Only " + filt.rawBase + " clean base-card sale" +
               (filt.rawBase === 1 ? "" : "s") + " out of " + filt.rawAll +
-              " ungraded. This median includes other versions of the card.";
+              " ungraded. Too few to price from — review before pricing.";
+  } else if (!useFixed && useRaw && fixedP.length > 0 && fixedMed >= rawMed * 3) {
+    /* The penny-auction split. Fixed-price copies are selling for
+       several times what auctions close at, but there are too few
+       fixed sales to headline. Publishing the auction median here is
+       exactly the $1-on-a-$13-card failure, so it gets flagged rather
+       than presented as a clean read. */
+    limited = true;
+    warning = "Auction closes (median $" + auctionMed + ") sit far below fixed-price sales " +
+              "(median $" + fixedMed + ", only " + fixedP.length + " of them). " +
+              "Too thin to call a market price — review before pricing.";
   }
+  /* Limited is surfaced through soldContaminated as well as its own
+     field. The frontend already renders contaminated as a visible
+     caveat; without this, a limited result would display as a clean,
+     confident price, which is the exact failure this change exists to
+     stop. */
+  if (limited) contaminated = true;
 
   return {
     soldCount:     clean.length,
@@ -1854,6 +1957,10 @@ function summarizeSold(records, query, limitUsed) {
        It needs to know what the ceiling actually was. */
     limitUsed:     limitUsed || CARDAPI_LIMIT,
     soldRaw:    { count: raw.length,    median: rawMed },
+    soldFixed:   { count: fixedP.length,   median: fixedMed },
+    soldAuction: { count: auctionP.length, median: auctionMed },
+    soldHeadlineBasis: useFixed ? "fixed_base" : useRaw ? "all_base" : "none",
+    soldLimited: limited,
     soldGraded: { count: graded.length, median: median(grP) },
     soldRawBasis:      filt.rawFellBack ? "ungraded" : "base",
     soldBaseCount:     filt.rawBase,
