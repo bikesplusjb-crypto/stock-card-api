@@ -2567,6 +2567,93 @@ app.get("/api/card-price", async (req, res) => {
   }
 });
 
+/* ══════════════════════════════════════════════════════════════
+   LISTING-YEAR CORRECTION
+
+   A real miss, 2026-08-28: a Munetaka Murakami base rookie scanned as
+   "2023 Topps Series Two ... #503" with confidence High. Player right,
+   set right, card number right — the year invented. His MLB rookie card
+   is 2026 Topps Series 2. Every one of the six eBay listings the price
+   was taken from had 2026 in the title. Not one said 2023.
+
+   The cost was not cosmetic. getSoldComps() is handed the same query
+   the listings search used, so the sold lookup went out asking for a
+   card that has never existed, matched nothing (soldCount 0), and the
+   card fell back to an asking median. A hallucinated year turns into a
+   worse number on a shop's shelf, not just a wrong label.
+
+   The correction is free and already in hand: the active listings are
+   real marketplace titles written by people holding the card. When the
+   year the model claims appears in NONE of them and a different year
+   carries most of them, the listings are the better evidence.
+
+   Deliberately narrow, because a wrong "correction" is worse than a
+   missed one:
+     - only runs when the sold lookup as-read found NOTHING. A card that
+       already priced off real sold comps is never second-guessed, and
+       the retry costs exactly one extra call in the only case that
+       needs it;
+     - needs 3+ listings that actually contain a year;
+     - one single listing supporting the model's year cancels it
+       outright — no argument, no weighing;
+     - the replacement year has to carry 70% of the listings that have
+       one, not merely be the most common;
+     - the retry is ADOPTED only if it comes back with real sales. A
+       corrected query that also finds nothing proves nothing, so the
+       original result stands.
+
+   What this deliberately does NOT do: overwrite ai.year, cardName, or
+   searchQuery. Same principle as verifyAgainstCatalog above — a second
+   opinion is reported alongside the read, never folded silently into
+   it. The response carries yearCorrection so the client can show what
+   happened and a human decides. The other half of this (offering the
+   corrected year as a one-tap fix that rewrites the card's identity)
+   belongs in the UI, not here.  */
+function yearsInText(t) {
+  var found = String(t || "").match(/\b(?:19|20)\d{2}\b/g);
+  if (!found) return [];
+  var seen = {}, out = [];
+  for (var i = 0; i < found.length; i++) {
+    if (!seen[found[i]]) { seen[found[i]] = 1; out.push(found[i]); }
+  }
+  return out;
+}
+function detectListingYear(ai, listings) {
+  var claimed = String((ai && ai.year) || "").trim();
+  if (!/^(?:19|20)\d{2}$/.test(claimed)) return null;
+  if (!Array.isArray(listings) || listings.length < 3) return null;
+
+  var withYears = 0, supporting = 0, tally = {};
+  for (var i = 0; i < listings.length; i++) {
+    var years = yearsInText(listings[i] && listings[i].title);
+    if (!years.length) continue;
+    withYears++;
+    if (years.indexOf(claimed) !== -1) { supporting++; continue; }
+    for (var j = 0; j < years.length; j++) tally[years[j]] = (tally[years[j]] || 0) + 1;
+  }
+  if (withYears < 3) return null;
+  if (supporting > 0) return null;
+
+  var best = null, bestN = 0;
+  for (var y in tally) { if (tally[y] > bestN) { best = y; bestN = tally[y]; } }
+  if (!best || bestN < Math.ceil(withYears * 0.7)) return null;
+
+  return { claimedYear: claimed, listingYear: best, agreeing: bestN, total: withYears };
+}
+/* Swaps the year token in place rather than rebuilding the query from
+   scratch, so every other term the tier logic decided on — set, card
+   number, parallel, the junk it already stripped — survives untouched.
+   Returns null when the year isn't actually in the query string, since
+   there is then nothing to correct and guessing where to insert it
+   would be inventing a search nobody chose. */
+function swapYearInQuery(query, fromYear, toYear) {
+  var q = String(query || "");
+  if (!q || !fromYear || !toYear) return null;
+  var re = new RegExp("\\b" + fromYear + "\\b", "g");
+  if (!re.test(q)) return null;
+  return q.replace(new RegExp("\\b" + fromYear + "\\b", "g"), toYear);
+}
+
 // ── /api/scan-card ─────────────────────────────────────────────
 app.post(
   "/api/scan-card",
@@ -2604,7 +2691,74 @@ app.post(
 
       const market        = await getCardMarketForCard(ai);
       const searchQuery   = market.searchQuery || buildCardQuery(ai) || cleanCardName;
-      const sold          = await getSoldComps(searchQuery, market.avgPrice);
+
+      let sold      = await getSoldComps(searchQuery, market.avgPrice);
+      let soldQuery = searchQuery;
+
+      /* See detectListingYear() above. Only fires when the sold lookup
+         as-read came back empty, which is exactly the signature a bad
+         year leaves behind. */
+      let yearCorrection = null;
+      const yearHint = detectListingYear(ai, market.listings);
+      if (yearHint && (!sold || !sold.soldCount)) {
+        const retryQuery = swapYearInQuery(searchQuery, yearHint.claimedYear, yearHint.listingYear);
+        yearCorrection = {
+          claimedYear:  yearHint.claimedYear,
+          listingYear:  yearHint.listingYear,
+          agreeing:     yearHint.agreeing,
+          total:        yearHint.total,
+          retried:      false,
+          adopted:      false,
+          retryQuery:   retryQuery || null,
+          note:         ""
+        };
+        if (retryQuery && retryQuery !== searchQuery) {
+          const retrySold = await getSoldComps(retryQuery, market.avgPrice);
+          yearCorrection.retried = true;
+          if (retrySold && retrySold.soldCount > 0) {
+            /* Adopted for the SOLD figure only. The identification the
+               model returned is left exactly as it read it — this
+               changes which sales were counted, not what the card is
+               claimed to be. */
+            sold      = retrySold;
+            soldQuery = retryQuery;
+            yearCorrection.adopted = true;
+            yearCorrection.note =
+              "No sales found for " + yearHint.claimedYear + ". " +
+              yearHint.agreeing + " of " + yearHint.total + " listings say " +
+              yearHint.listingYear + ", and that year has real sold comps — " +
+              "the sold price shown is from " + yearHint.listingYear + ".";
+          } else {
+            yearCorrection.note =
+              yearHint.agreeing + " of " + yearHint.total + " listings say " +
+              yearHint.listingYear + ", not " + yearHint.claimedYear +
+              ", but neither year found sold comps. Check the year before pricing.";
+          }
+        } else {
+          yearCorrection.note =
+            yearHint.agreeing + " of " + yearHint.total + " listings say " +
+            yearHint.listingYear + ", not " + yearHint.claimedYear +
+            ". The year wasn't in the search terms, so it couldn't be retried.";
+        }
+      } else if (yearHint) {
+        /* Reported but not acted on: the year looks wrong AND real sold
+           comps came back anyway. Retrying would risk trading a working
+           price for a worse one, so this only tells the truth about the
+           disagreement and leaves the number alone. */
+        yearCorrection = {
+          claimedYear: yearHint.claimedYear,
+          listingYear: yearHint.listingYear,
+          agreeing:    yearHint.agreeing,
+          total:       yearHint.total,
+          retried:     false,
+          adopted:     false,
+          retryQuery:  null,
+          note:        yearHint.agreeing + " of " + yearHint.total + " listings say " +
+                       yearHint.listingYear + ", not " + yearHint.claimedYear +
+                       ", but sold comps were found as read — price left as is."
+        };
+      }
+
       const verification  = await verifyPromise;
 
       console.log(
@@ -2621,6 +2775,8 @@ app.post(
         " | sold=$" + (sold && sold.soldMedian ? sold.soldMedian : "-") +
         " (" + (sold ? sold.soldCount : 0) + " sales" + (sold && sold.cached ? ", cached" : "") + ")" +
         (sold && sold.soldContaminated ? " | CONTAMINATED" : "") +
+        (yearCorrection ? " | YEAR? " + yearCorrection.claimedYear + "->" + yearCorrection.listingYear +
+           (yearCorrection.adopted ? " (adopted)" : yearCorrection.retried ? " (retried, no sales)" : " (not retried)") : "") +
         " | verified=" + (verification.checked
             ? (verification.exists === true ? "yes" : verification.exists === false ? "NO" : "?")
             : "skipped")
@@ -2665,6 +2821,12 @@ app.post(
         isPatch:           !!ai.isPatch,
         usedBack:          !!back,
         searchQuery:       searchQuery,
+        /* The query the SOLD figure actually came from. Equals
+           searchQuery unless a year correction was adopted — see
+           yearCorrection below. Separate field so nothing has to
+           infer which search produced which number. */
+        soldQuery:         soldQuery,
+        yearCorrection:    yearCorrection,
         sold:              sold || null,
         askVsSold:         askVsSold(market, sold),
         matchQuality:      market.matchQuality || "exact",
@@ -2698,7 +2860,11 @@ app.post(
         graded:            market.graded,
         gradeBreakdown:    market.gradeBreakdown,
         listings:          market.listings,
-        soldCompsUrl:      ebayUrl(searchQuery, true),
+        /* Built from soldQuery, not searchQuery: when a year
+           correction was adopted, a "see the comps" link built from
+           the original query would show the shop an empty eBay page
+           for the sold number it is being asked to trust. */
+        soldCompsUrl:      ebayUrl(soldQuery, true),
         activeListingsUrl: ebayUrl(searchQuery, false),
         timestamp:         Date.now()
       });
