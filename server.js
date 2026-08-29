@@ -1728,8 +1728,31 @@ const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
    NOTE: card_price_history is keyed on cache_key too, so bumping this
    starts a fresh daily series per card. The old series was built on
    contaminated medians, so that is the right trade — but it is a real
-   cost and it is deliberate. */
-const SOLD_LOGIC_VERSION = 2;
+   cost and it is deliberate.
+
+   v2 -> v3 (2026-08-29). Four changes landed since v2 and every one of
+   them alters what comes back for the same query, so every v2 row is
+   now an answer from logic that no longer exists:
+
+     - the year-correction retry stopped being gated on a zero sold
+       count, since a wrong year fuzzy-matches into a full result set
+       rather than an empty one
+     - a broadening retry was added for exact queries that find nothing
+     - a set-preserving tier was added between tight and core, after
+       dropping the set in one step swept a relic, a Foilboard and a
+       1987 insert into one card's pool
+     - the broadening retry now refuses contaminated and limited pools
+       instead of adopting the first tier with any records
+
+   Without this bump the cache serves v2 answers for twelve hours and
+   the new logic looks like it is doing nothing -- which is exactly what
+   happened while testing today, and cost an afternoon of reading query
+   patterns to work out that the code was fine and the cache was old.
+
+   The cost is one fresh API call per card tomorrow instead of a cache
+   hit. Today's usage was around 2% of the daily allowance, so this is
+   not the thing to economise on. */
+const SOLD_LOGIC_VERSION = 3;
 
 /* The cache key must carry the limit. Without it a 50-record compact pull
    gets stored under the same key as a full lookup and is then served back
