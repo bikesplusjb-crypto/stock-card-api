@@ -3003,6 +3003,65 @@ app.post(
         }
       }
 
+      /* WHEN AN EXACT QUERY FINDS NOTHING, ASK A BROADER ONE.
+
+         Found the moment flatbed scanning started working. Better
+         identification produced WORSE prices, which reads like a
+         contradiction until you see the two queries side by side:
+
+           "Topps Chrome Willy Adames"            -> 100 sold records
+           "2022 Topps Chrome Willy Adames #140"  ->   0 sold records
+
+         Same card, same scan session. The precise read is correct and
+         the loose one is vague, and the vague one is the only one that
+         finds any sales -- because plenty of sellers do not put the year
+         or the card number in a title. Seven cards in one flatbed batch
+         came back "Ask only" for exactly this reason while their looser
+         equivalents had a hundred sales each.
+
+         So identifying the card better must not cost the shop its
+         price. If the exact query returns nothing, drop the narrowing
+         terms a step at a time -- card number first, then set and
+         parallel -- and take the first level that finds real sales.
+
+         Ordering matters and is not arbitrary. The card number is the
+         term most often missing from a seller's title, so it goes
+         first; year and player are the terms almost always present, so
+         they are never dropped. A query that has lost the year would be
+         pricing a different card, which is the failure this whole
+         weekend was spent removing.
+
+         Reported, never silent: soldBroadened carries the query that
+         actually produced the number, so nothing downstream has to
+         guess how wide a net it came from. Costs at most two extra
+         calls, and only on cards that would otherwise show no price at
+         all. */
+      let soldBroadened = null;
+      if ((!sold || !sold.soldCount) && !yearCorrection) {
+        const tiers   = buildQueryTiers(ai) || [];
+        const already = new Set([searchQuery]);
+        for (let i = 0; i < tiers.length; i++) {
+          const q = tiers[i].query;
+          if (!q || already.has(q)) continue;
+          already.add(q);
+          const broader = await getSoldComps(q, market.avgPrice);
+          if (broader && broader.soldCount > 0) {
+            sold      = broader;
+            soldQuery = q;
+            soldBroadened = {
+              from: searchQuery,
+              to:   q,
+              tier: tiers[i].tier,
+              found: broader.soldCount,
+              note: "No sales matched the exact card details, so the sold price " +
+                    "shown is from a broader search (" + q + "). It may include " +
+                    "other versions of this card."
+            };
+            break;
+          }
+        }
+      }
+
       const verification  = await verifyPromise;
 
       console.log(
@@ -3071,6 +3130,7 @@ app.post(
            infer which search produced which number. */
         soldQuery:         soldQuery,
         yearCorrection:    yearCorrection,
+        soldBroadened:     soldBroadened,
         sold:              sold || null,
         askVsSold:         askVsSold(market, sold),
         matchQuality:      market.matchQuality || "exact",
