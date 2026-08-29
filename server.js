@@ -3116,6 +3116,21 @@ app.post(
         " | ask=$" + market.avgPrice +
         " | sold=$" + (sold && sold.soldMedian ? sold.soldMedian : "-") +
         " (" + (sold ? sold.soldCount : 0) + " sales" + (sold && sold.cached ? ", cached" : "") + ")" +
+        /* WHICH QUERY THE PRICE ACTUALLY CAME FROM.
+
+           The line already printed q=<the exact query> and then a sold
+           figure that might have come from a completely different,
+           broader search. Reading it back, there was no way to tell --
+           and an afternoon went into inferring the answer from cache
+           rows when one field here would have said it outright.
+
+           soldLimited is printed for the same reason: a card that found
+           records but had them all filtered out looks identical to a
+           priced card unless the log says otherwise. */
+        (soldBroadened
+          ? " | BROADENED " + soldBroadened.tier + " -> \"" + soldBroadened.to + "\" (" + soldBroadened.found + " sales)"
+          : "") +
+        (sold && sold.soldLimited ? " | LIMITED (too few clean base sales)" : "") +
         (sold && sold.soldContaminated ? " | CONTAMINATED" : "") +
         (yearCorrection ? " | YEAR? " + yearCorrection.claimedYear + "->" + yearCorrection.listingYear +
            (yearCorrection.adopted ? " (adopted)" : yearCorrection.retried ? " (retried, no sales)" : " (not retried)") : "") +
