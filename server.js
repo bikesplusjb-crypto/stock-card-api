@@ -3058,9 +3058,10 @@ app.post(
 
          Reported, never silent: soldBroadened carries the query that
          actually produced the number, so nothing downstream has to
-         guess how wide a net it came from. Costs at most two extra
-         calls, and only on cards that would otherwise show no price at
-         all. */
+         guess how wide a net it came from. Costs at most three extra
+         calls -- one per remaining tier -- and only on cards that would
+         otherwise show no price at all. It stops at the first tier that
+         produces a usable number, so the common case is one. */
       let soldBroadened = null;
       if ((!sold || !sold.soldCount) && !yearCorrection) {
         const tiers   = buildQueryTiers(ai) || [];
@@ -3082,7 +3083,27 @@ app.post(
              nothing, and never try the narrower tier that might have
              worked. Judging on the usable result rather than the raw
              count keeps looking. */
-          const usable = broader && broader.soldCount > 0 && !broader.soldLimited
+          const usable = broader && broader.soldCount > 0
+                         && !broader.soldLimited
+                         /* soldContaminated has to be here too, and its
+                            absence was a real hole. A LIMITED pool comes
+                            back with a median of 0, so the median check
+                            below happened to catch it. A CONTAMINATED
+                            pool does not -- it keeps its median and just
+                            flags that the sales describe more than one
+                            version of the card. So a broadened query
+                            that swept in three different parallels would
+                            have passed this gate, been adopted, and
+                            published a median the server had already
+                            said not to trust.
+
+                            Broadening is exactly the operation most
+                            likely to produce contamination, since every
+                            step widens what can match. Refusing a
+                            contaminated pool here is what keeps the
+                            retry from defeating the filter it depends
+                            on. */
+                         && !broader.soldContaminated
                          && Number(broader.soldMedian) > 0;
           if (usable) {
             sold      = broader;
