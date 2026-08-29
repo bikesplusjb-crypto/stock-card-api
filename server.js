@@ -4963,11 +4963,35 @@ async function refreshWatchlistPrices() {
         const market = await getEbayCardMarket(item.card_name);
         const sold   = market.sold || {};
         const contaminated = !!sold.soldContaminated;
-        const soldMed = contaminated ? 0 : safeNumber(
+
+        /* LIMITED IS A REFUSAL TOO, AND IT WAS MISSING.
+
+           Contaminated and limited are different failures with the same
+           consequence. Contaminated means the wrong records got in.
+           Limited means the filtering worked and what survived is too
+           thin to call a market price -- one clean base sale out of
+           thirteen is not a valuation.
+
+           Only contamination was rejected here. A limited result could
+           still reach current_price whenever soldRaw held three or more
+           records, because that branch is read before soldMedian and
+           does not consult the verdict at all. The card then carried a
+           number the pricing engine had already declined to stand
+           behind, written overnight with nobody watching.
+
+           Price history already refuses both. This makes the nightly
+           refresh consistent with it: same two verdicts, same answer,
+           keep yesterday's price rather than write a weak one. */
+        const limited = !!sold.soldLimited;
+
+        const soldMed = (contaminated || limited) ? 0 : safeNumber(
           (sold.soldRaw && sold.soldRaw.count >= 3 ? sold.soldRaw.median : 0) || sold.soldMedian, 0);
         const newPrice = soldMed;
 
         if (!newPrice) {
+          if (limited) {
+            console.log("[watchlist-refresh] skipped limited sold result — " + item.card_name);
+          }
           skipped++;
           continue;
         }
@@ -5679,58 +5703,6 @@ app.post("/api/sendgrid-webhook", async (req, res) => {
   }
 });
 
-/* ── CAN THIS SERVER REACH TCGDEX? ──────────────────────────
-   Diagnostic, not a feature. TCGdex is unreachable from the browser
-   this was tested in, but a browser's network is not Render's — a
-   local DNS or firewall problem looks identical to a dead service from
-   where you are sitting, and the two need completely different
-   responses.
-
-   This runs the fetch FROM Render and reports exactly what came back:
-   status, timing, and the first slice of the body. That is the only
-   test that decides anything, because Render is where the code would
-   live.
-
-   Delete it once the question is answered. A permanent endpoint that
-   calls a third party on demand is a small liability. */
-app.get("/api/tcgdex-check", async (req, res) => {
-  var urls = [
-    "https://api.tcgdex.net/v2/en/sets/swsh3",
-    "https://api.tcgdex.net/v2/en/sets"
-  ];
-  var out = [];
-
-  for (var i = 0; i < urls.length; i++) {
-    var started = Date.now();
-    var ctrl = new AbortController();
-    var timer = setTimeout(function(){ ctrl.abort(); }, 12000);
-    try {
-      var r = await fetch(urls[i], { signal: ctrl.signal });
-      var text = await r.text();
-      out.push({
-        url: urls[i],
-        ok: r.ok,
-        status: r.status,
-        ms: Date.now() - started,
-        bytes: text.length,
-        sample: text.slice(0, 300)
-      });
-    } catch (e) {
-      out.push({
-        url: urls[i],
-        ok: false,
-        ms: Date.now() - started,
-        /* An abort here means Render could not reach them either, which
-           rules out a problem local to the browser. */
-        error: (e && e.name === "AbortError") ? "timed out after 12s" : (e.message || String(e))
-      });
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  res.json({ success: true, checkedAt: new Date().toISOString(), results: out });
-});
 
 app.use((req, res) => {
   res.status(404).json({ success: false, error: "Endpoint not found" });
