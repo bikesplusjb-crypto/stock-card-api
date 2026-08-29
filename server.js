@@ -1246,10 +1246,35 @@ function buildQueryTiers(ai) {
     loose = joinParts([year, brand, player]);
   }
 
+  /* THE SET IS THE LAST THING TO DROP, NOT THE FIRST.
+
+     Found on a real flatbed batch. The sold retry stepped from
+     "2022 Topps Chrome Willy Adames #140" straight to
+     "2022 Topps Willy Adames" -- dropping the card number AND the set
+     in one move -- and came back with fourteen sales: a Generation Now
+     Blue, an In the Name Relic 1/1 at $92, an Allen & Ginter Chrome,
+     a Stadium Club Orange /25, a Foilboard /875 and a 1987 insert.
+     Every Topps product that player appeared in that year, and not one
+     of them the card being priced.
+
+     After year and player, the SET is the strongest thing separating
+     one card from another -- Chrome, Heritage and Stadium Club are
+     different products at different prices. The card number is the
+     weakest, because sellers routinely leave it out of a title.
+
+     So there is now a step between them: same set, no card number.
+     Broad enough to find the sales a strict number query misses,
+     narrow enough that it cannot wander into a different product.
+     "set-noNum" is tried before anything drops the set. */
+  const setNoNum = poke
+    ? joinParts(["pokemon", lang, player, set, grade])
+    : joinParts([year, brand, set, player, grade]);
+
   const tiers = [];
   if (tight) tiers.push({ tier: "tight", query: tight });
-  if (core && core !== tight) tiers.push({ tier: "core", query: core });
-  if (loose && loose !== core && loose !== tight) tiers.push({ tier: "loose", query: loose });
+  if (setNoNum && setNoNum !== tight) tiers.push({ tier: "set-noNum", query: setNoNum });
+  if (core && core !== tight && core !== setNoNum) tiers.push({ tier: "core", query: core });
+  if (loose && loose !== core && loose !== tight && loose !== setNoNum) tiers.push({ tier: "loose", query: loose });
   return tiers;
 }
 
@@ -3045,7 +3070,21 @@ app.post(
           if (!q || already.has(q)) continue;
           already.add(q);
           const broader = await getSoldComps(q, market.avgPrice);
-          if (broader && broader.soldCount > 0) {
+          /* A broader query only counts as an answer if it produced a
+             number worth showing. soldCount is the raw record count --
+             fourteen sales of six different products still reads as
+             fourteen. What matters is whether anything survived the
+             base filter, which is what soldLimited reports.
+
+             Without this, a broadened query that came back entirely
+             contaminated would end the search: the retry would stop at
+             the first level with ANY records, adopt a pool that prices
+             nothing, and never try the narrower tier that might have
+             worked. Judging on the usable result rather than the raw
+             count keeps looking. */
+          const usable = broader && broader.soldCount > 0 && !broader.soldLimited
+                         && Number(broader.soldMedian) > 0;
+          if (usable) {
             sold      = broader;
             soldQuery = q;
             soldBroadened = {
