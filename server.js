@@ -2885,9 +2885,36 @@ app.post(
       /* See detectListingYear() above. Only fires when the sold lookup
          as-read came back empty, which is exactly the signature a bad
          year leaves behind. */
+      /* THE GATE USED TO BE "only retry when the sold lookup found
+         NOTHING". That was wrong, and a real scan proved it.
+
+         2026-08-29: a Murakami base rookie was read as 2023 again. The
+         query "2023 Topps Munetaka Murakami" came back with 100
+         records -- eBay fuzzy-matches a wrong year into a full result
+         set rather than returning nothing -- so soldCount was high,
+         the retry never ran, and the card landed in a shop's inventory
+         priced at $9.00 under a year that does not exist for it.
+
+         A wrong year does not become right because the marketplace
+         returned something for it. If anything a fuzzy-matched pool is
+         worse than an empty one: an empty result at least shows as
+         "Ask only" and invites a second look, while 100 mixed records
+         produce a confident median for a card nobody scanned.
+
+         detectListingYear() is already strict enough to carry this on
+         its own -- 3+ listings carrying a year, NOT ONE supporting the
+         year claimed, and 70% agreeing on a single different year. If
+         that fires, the year is wrong regardless of what the wrong
+         query happened to match. So the retry now runs whenever the
+         listings disagree, and the result is still only ADOPTED if the
+         corrected query returns real sales.
+
+         Cost is one extra API call per detected mismatch. Today's
+         usage is 1,122 records against a 50,000/day allowance -- 2%.
+         This is not the thing to economise on. */
       let yearCorrection = null;
       const yearHint = detectListingYear(ai, market.listings);
-      if (yearHint && (!sold || !sold.soldCount)) {
+      if (yearHint) {
         const retryQuery = swapYearInQuery(searchQuery, yearHint.claimedYear, yearHint.listingYear);
         yearCorrection = {
           claimedYear:  yearHint.claimedYear,
@@ -2927,11 +2954,11 @@ app.post(
             yearHint.listingYear + ", not " + yearHint.claimedYear +
             ". The year wasn't in the search terms, so it couldn't be retried.";
         }
-      } else if (yearHint) {
-        /* Reported but not acted on: the year looks wrong AND real sold
-           comps came back anyway. Retrying would risk trading a working
-           price for a worse one, so this only tells the truth about the
-           disagreement and leaves the number alone. */
+      } else if (false) {
+        /* Unreachable since the gate above widened -- every detected
+           mismatch is now retried. Left in place rather than deleted so
+           the shape of the branch survives if the gate ever narrows
+           again; deleting it would lose the reasoning with it. */
         yearCorrection = {
           claimedYear: yearHint.claimedYear,
           listingYear: yearHint.listingYear,
