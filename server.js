@@ -5016,6 +5016,33 @@ async function refreshWatchlistPrices() {
             console.log("[watchlist-refresh] skipped limited sold result — " + item.card_name);
           }
           skipped++;
+
+          /* STAMP THE ROW EVEN WHEN THE PRICE IS REFUSED.
+
+             last_checked_at used to be written only alongside a
+             successful price, so a card whose comps were too thin kept
+             a timestamp from whenever it last had a clean number --
+             sometimes weeks earlier.
+
+             That made the field mean two different things at once, and
+             it cost real time: the whole watchlist read as "last run 23
+             August" and looked like a cron that had stopped firing. It
+             was impossible to tell that apart from a job running nightly
+             and skipping every card, which is exactly what the new
+             soldLimited rule makes more likely, not less.
+
+             current_price is deliberately untouched -- yesterday's
+             number stands, which is the entire point of the skip. Only
+             the timestamp moves, and it now answers the question it
+             appears to answer: when did we last look at this card. */
+          try {
+            await supabaseAdmin
+              .from("watchlist_items")
+              .update({ last_checked_at: new Date().toISOString() })
+              .eq("id", item.id);
+          } catch (e) {
+            console.warn("[watchlist-refresh] could not stamp skipped card " + item.id + ":", e.message);
+          }
           continue;
         }
 
@@ -5042,7 +5069,7 @@ async function refreshWatchlistPrices() {
     }
 
     const elapsed = Math.round((Date.now() - startTime) / 1000);
-    console.log(`[watchlist-refresh] done. updated=${updated} skipped=${skipped} failed=${failed} elapsed=${elapsed}s`);
+    console.log(`[watchlist-refresh] done. updated=${updated} skipped=${skipped} (kept previous price) failed=${failed} elapsed=${elapsed}s`);
   } catch (e) {
     console.error("[watchlist-refresh] fatal error:", e.message);
   }
