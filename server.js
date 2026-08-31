@@ -193,6 +193,10 @@ async function logProEvent(event, detail) {
   }
 }
 
+/* Event ids Stripe has already delivered. Insertion-ordered, so the
+   oldest entry is the one evicted when the cap is reached. */
+const seenStripeEvents = new Set();
+
 app.post(
   "/api/stripe-webhook",
   express.raw({ type: "application/json" }),
@@ -219,6 +223,34 @@ app.post(
 
     const type = event.type || "";
     const obj  = (event.data && event.data.object) || {};
+
+    /* STRIPE RETRIES, SO THE SAME EVENT ARRIVES MORE THAN ONCE.
+
+       Stripe redelivers any event it did not get a 2xx for, and will
+       retry for up to three days. Without a check on the event id, one
+       payment could grant Pro repeatedly and, more visibly, log several
+       subscription_paid events for a single sale -- so revenue counted
+       off analytics would be wrong in the direction that flatters.
+
+       Held in memory rather than a table. That is a deliberate limit
+       and worth naming: a restart forgets, so an event redelivered
+       across a deploy could still double-log. Stripe's retries are
+       minutes apart and deploys are not, so this catches the realistic
+       case; a Supabase table would catch all of them and is the upgrade
+       if this ever proves insufficient.
+
+       Capped so a long-running process cannot grow the set unbounded. */
+    if (event.id) {
+      if (seenStripeEvents.has(event.id)) {
+        console.log("[stripe] duplicate event " + event.id + " (" + type + ") — already handled");
+        return res.json({ received: true, duplicate: true });
+      }
+      seenStripeEvents.add(event.id);
+      if (seenStripeEvents.size > 500) {
+        const oldest = seenStripeEvents.values().next().value;
+        seenStripeEvents.delete(oldest);
+      }
+    }
 
     try {
       if (type === "checkout.session.completed") {
@@ -3215,7 +3247,44 @@ app.post(
                              ? ai.parallelOptions.filter(Boolean).map(function(x){
                                  return String(x).slice(0,40); }).slice(0,6)
                              : [],
-        parallelCertain:   ai.parallelCertain !== false,
+        /* THE BACKEND DECIDES THIS, NOT THE MODEL.
+
+           This was ai.parallelCertain !== false, which makes anything
+           other than an explicit false read as certain -- including a
+           field the model omitted entirely. An optimistic default on
+           the one attribute that moves price by 10x to 100x.
+
+           The prompt already asks for parallelEvidence: 'serial' when a
+           serial number identifies the parallel, 'printed' when the name
+           is printed on the card, 'color' when it is going on sheen
+           alone, 'uncertain' when it is a general impression. Colour and
+           impression are exactly where Optic and Chrome base cards get
+           read as parallels, so neither earns certainty no matter what
+           the model claims alongside it.
+
+           Certain now requires three things at once: the model said so,
+           the evidence is something readable rather than inferred, and
+           it did not simultaneously list alternatives it could not rule
+           out. A base card with no parallel at all stays certain, since
+           there is nothing to be uncertain about. */
+        parallelCertain:   (function(){
+          var claimed  = ai.parallelCertain === true;
+          var hasPar   = !!String(ai.parallel || "").trim();
+          var opts     = Array.isArray(ai.parallelOptions) ? ai.parallelOptions.length : 0;
+          var evidence = String(ai.parallelEvidence || "").toLowerCase();
+          if (!hasPar) return claimed;
+          if (opts > 0) return false;
+          return claimed && (evidence === "serial" || evidence === "printed");
+        })(),
+        parallelConfidence: (function(){
+          var hasPar   = !!String(ai.parallel || "").trim();
+          var opts     = Array.isArray(ai.parallelOptions) ? ai.parallelOptions.length : 0;
+          var evidence = String(ai.parallelEvidence || "").toLowerCase();
+          if (!hasPar) return "n/a";
+          if (evidence === "serial" || evidence === "printed") return opts > 0 ? "MEDIUM" : "HIGH";
+          if (evidence === "color") return "LOW";
+          return "LOW";
+        })(),
         serialNumber:      ai.serialNumber  || "",
         isRookie:          !!ai.isRookie,
         isAutograph:       !!ai.isAutograph,
