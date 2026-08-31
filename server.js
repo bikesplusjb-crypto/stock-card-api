@@ -4998,6 +4998,20 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
   console.log("Supabase env vars missing — watchlist refresh disabled");
 }
 
+/* Cards refreshed per nightly run.
+
+   Each card costs one thecardapi records pull (CARDAPI_LIMIT, default
+   100) against the Builder tier's 50,000/day allowance. 113 cards at
+   the full limit is 11,300 records -- about a quarter of the day's
+   budget spent before anybody has scanned anything. Affordable, but
+   the watchlist should not be the reason a shop hits a wall at 3pm.
+
+   Oldest-checked-first plus a cap means every card gets covered over a
+   couple of nights instead of the first N being covered every night.
+   Raise it if the allowance grows; lower it if daytime scans start
+   competing for budget. */
+const REFRESH_MAX_PER_RUN = Number(process.env.REFRESH_MAX_PER_RUN || 80);
+
 async function refreshWatchlistPrices() {
   if (!supabaseAdmin) {
     console.log("[watchlist-refresh] skipped — no Supabase client");
@@ -5008,9 +5022,15 @@ async function refreshWatchlistPrices() {
   console.log("[watchlist-refresh] starting…");
 
   try {
+    /* Oldest first. Combined with the per-run cap this rotates through
+       the whole watchlist rather than repeatedly refreshing whichever
+       rows the database happened to return first. nullsFirst so a card
+       that has never been checked jumps the queue. */
     const { data: items, error } = await supabaseAdmin
       .from("watchlist_items")
-      .select("id, card_name");
+      .select("id, card_name, last_checked_at")
+      .order("last_checked_at", { ascending: true, nullsFirst: true })
+      .limit(REFRESH_MAX_PER_RUN);
 
     if (error) {
       console.error("[watchlist-refresh] fetch error:", error.message);
@@ -5025,117 +5045,88 @@ async function refreshWatchlistPrices() {
     console.log(`[watchlist-refresh] refreshing ${items.length} cards…`);
 
     let updated = 0;
-    let failed = 0;
+    let failed  = 0;
     /* Counted separately so the log distinguishes "no sold data" from
-       "the write failed" — they need different responses. */
+       "the write failed" -- they need different responses. */
     let skipped = 0;
+    let budgetStopped = false;
 
     for (const item of items) {
       try {
         /* SOLD, NOT ASKING.
 
-           This used avgPrice — the median of live LISTINGS. Cards
-           entered the binder at a sold price and were then re-priced
-           every night against what sellers hope for, which runs above
-           what buyers pay and does so unevenly. Every "since saved"
-           figure was therefore comparing two different kinds of number,
-           and a portfolio total built that way drifts further from
-           reality the longer it runs.
+           THE BUG THIS REPLACES: this read `market.sold`, but
+           getEbayCardMarket() returns summarizeListings() or
+           EMPTY_MARKET(), and neither carries a `sold` property -- sold
+           comps come from getSoldComps(), which was never called here.
+           So `sold` was always {}, newPrice was always 0, and EVERY
+           card took the skip branch. The nightly refresh had not
+           written a price since the field was introduced, and because
+           skipped cards now get stamped with last_checked_at, all 113
+           rows looked freshly checked every morning.
 
-           A contaminated pool is refused outright rather than written.
-           The scanner will not vouch for those medians, and a value
-           that silently enters a portfolio is worse than one shown on
-           screen with a warning attached — nobody is watching when the
-           cron runs.
+           It was invisible downstream too: price alerts compare against
+           a current_price that never moved, so nothing ever crossed the
+           10% threshold, and the weekly digest summed frozen numbers.
 
-           When there are no sales at all the card keeps yesterday's
-           price rather than taking an asking price. A stale number is
-           honest about being old; an asking price wearing a sold
-           label is not. */
-        /* SOLD COMPS HAVE TO BE FETCHED, NOT READ OFF THE MARKET OBJECT.
+           Why it must be sold and not asking: cards enter the binder at
+           a sold price. Re-pricing them nightly against live LISTINGS
+           compares two different kinds of number, and asking prices run
+           above what buyers pay, unevenly. A portfolio total built that
+           way drifts further from reality the longer it runs.
 
-           This was `const sold = market.sold || {}`, and
-           getEbayCardMarket() has never returned a `sold` key --
-           summarizeListings() and EMPTY_MARKET() both return active
-           listing data only. Sold comps come from getSoldComps(), which
-           this function never called.
-
-           So `sold` was always {}, soldMed was always 0, and every card
-           fell into the `if (!newPrice)` skip. The job has been running
-           nightly and repricing nothing since the day it was written.
-
-           It hid well. The old code only stamped last_checked_at
-           alongside a successful write, so the whole watchlist read as
-           "last run 23 August" -- which looked like a cron that had
-           stopped firing. Yesterday's change to stamp skipped rows too
-           removed that symptom and made the run look healthy: 113 rows
-           freshly dated, none of them repriced. The timing gives it
-           away -- the success path sleeps a second per card, so 113
-           real updates cannot finish in 81 seconds.
-
-           Everything downstream was quietly disabled by this.
-           runPriceAlerts compares current_price to a baseline that
-           never moves, so no card ever crosses the 10% threshold. The
-           weekly digest sums the same frozen numbers. Three cron jobs
-           and a SendGrid integration, all working correctly on data
-           that stopped changing.
-
-           Same call the scan endpoint makes, with the same query
-           normalisation, so a watchlist price is computed exactly the
-           way the price on the card's own page was. */
+           A contaminated or limited pool is refused outright -- the
+           pricing engine already declined to stand behind those medians
+           on screen, and a value written overnight with nobody watching
+           deserves the same refusal. The card keeps yesterday's price.
+           A stale number is honest about being old; an asking price
+           wearing a sold label is not. */
         const market = await getEbayCardMarket(item.card_name);
-        const soldQ  = market.searchQuery || normalizeCardQuery(item.card_name);
-        const sold   = (await getSoldComps(soldQ, market.avgPrice)) || {};
-        const contaminated = !!sold.soldContaminated;
+        const sold   = await getSoldComps(item.card_name, market.avgPrice);
 
-        /* LIMITED IS A REFUSAL TOO, AND IT WAS MISSING.
+        /* Allowance exhausted. Stop the run rather than grinding
+           through the remaining cards collecting 429s -- they will be
+           first in the queue tomorrow, since their last_checked_at is
+           still the oldest. */
+        if (sold && sold.rateLimited) {
+          budgetStopped = true;
+          console.log("[watchlist-refresh] thecardapi daily allowance reached — stopping early");
+          break;
+        }
 
-           Contaminated and limited are different failures with the same
-           consequence. Contaminated means the wrong records got in.
-           Limited means the filtering worked and what survived is too
-           thin to call a market price -- one clean base sale out of
-           thirteen is not a valuation.
+        const s = sold || {};
+        const contaminated = !!s.soldContaminated;
 
-           Only contamination was rejected here. A limited result could
-           still reach current_price whenever soldRaw held three or more
-           records, because that branch is read before soldMedian and
-           does not consult the verdict at all. The card then carried a
-           number the pricing engine had already declined to stand
-           behind, written overnight with nobody watching.
-
-           Price history already refuses both. This makes the nightly
-           refresh consistent with it: same two verdicts, same answer,
-           keep yesterday's price rather than write a weak one. */
-        const limited = !!sold.soldLimited;
+        /* LIMITED IS A REFUSAL TOO. Contaminated means the wrong
+           records got in. Limited means the filtering worked and what
+           survived is too thin to call a market price -- one clean base
+           sale out of thirteen is not a valuation. Price history
+           already refuses both; this keeps the nightly refresh
+           consistent with it. */
+        const limited = !!s.soldLimited;
 
         const soldMed = (contaminated || limited) ? 0 : safeNumber(
-          (sold.soldRaw && sold.soldRaw.count >= 3 ? sold.soldRaw.median : 0) || sold.soldMedian, 0);
+          (s.soldRaw && s.soldRaw.count >= 3 ? s.soldRaw.median : 0) || s.soldMedian, 0);
         const newPrice = soldMed;
 
         if (!newPrice) {
-          if (limited) {
-            console.log("[watchlist-refresh] skipped limited sold result — " + item.card_name);
+          if (contaminated) {
+            console.log("[watchlist-refresh] skipped CONTAMINATED — " + item.card_name);
+          } else if (limited) {
+            console.log("[watchlist-refresh] skipped LIMITED — " + item.card_name);
           }
           skipped++;
 
           /* STAMP THE ROW EVEN WHEN THE PRICE IS REFUSED.
 
-             last_checked_at used to be written only alongside a
-             successful price, so a card whose comps were too thin kept
-             a timestamp from whenever it last had a clean number --
-             sometimes weeks earlier.
-
-             That made the field mean two different things at once, and
-             it cost real time: the whole watchlist read as "last run 23
-             August" and looked like a cron that had stopped firing. It
-             was impossible to tell that apart from a job running nightly
-             and skipping every card, which is exactly what the new
-             soldLimited rule makes more likely, not less.
-
              current_price is deliberately untouched -- yesterday's
              number stands, which is the entire point of the skip. Only
-             the timestamp moves, and it now answers the question it
-             appears to answer: when did we last look at this card. */
+             the timestamp moves, so the field answers the question it
+             appears to answer: when did we last look at this card.
+
+             It also drives the ordering above, so a skipped card goes
+             to the back of the queue rather than being retried every
+             night at the expense of cards that have not been seen. */
           try {
             await supabaseAdmin
               .from("watchlist_items")
@@ -5144,33 +5135,46 @@ async function refreshWatchlistPrices() {
           } catch (e) {
             console.warn("[watchlist-refresh] could not stamp skipped card " + item.id + ":", e.message);
           }
-          continue;
-        }
-
-        const { error: updateError } = await supabaseAdmin
-          .from("watchlist_items")
-          .update({
-            current_price: newPrice,
-            last_checked_at: new Date().toISOString()
-          })
-          .eq("id", item.id);
-
-        if (updateError) {
-          console.error(`[watchlist-refresh] update failed for ${item.id}:`, updateError.message);
-          failed++;
         } else {
-          updated++;
-        }
+          const { error: updateError } = await supabaseAdmin
+            .from("watchlist_items")
+            .update({
+              current_price:   newPrice,
+              last_checked_at: new Date().toISOString()
+            })
+            .eq("id", item.id);
 
-        await new Promise(resolve => setTimeout(resolve, 1000));
+          if (updateError) {
+            console.error(`[watchlist-refresh] update failed for ${item.id}:`, updateError.message);
+            failed++;
+          } else {
+            updated++;
+          }
+        }
       } catch (e) {
         console.error(`[watchlist-refresh] error on card ${item.id}:`, e.message);
         failed++;
       }
+
+      /* Paced on EVERY path, not just the success path.
+
+         The old placement sat inside the else branch and was skipped
+         entirely by the refusal path, so a run where every card was
+         refused hit eBay 113 times with no gap at all -- which is
+         exactly what the 81-second run was. Every card costs an eBay
+         call whether or not a price gets written, so the pacing has to
+         cover every card too. */
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
     const elapsed = Math.round((Date.now() - startTime) / 1000);
-    console.log(`[watchlist-refresh] done. updated=${updated} skipped=${skipped} (kept previous price) failed=${failed} elapsed=${elapsed}s`);
+    console.log(
+      "[watchlist-refresh] done. updated=" + updated +
+      " skipped=" + skipped + " (kept previous price)" +
+      " failed=" + failed +
+      (budgetStopped ? " STOPPED-ON-BUDGET" : "") +
+      " elapsed=" + elapsed + "s"
+    );
   } catch (e) {
     console.error("[watchlist-refresh] fatal error:", e.message);
   }
