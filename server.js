@@ -5052,8 +5052,40 @@ async function refreshWatchlistPrices() {
            price rather than taking an asking price. A stale number is
            honest about being old; an asking price wearing a sold
            label is not. */
+        /* SOLD COMPS HAVE TO BE FETCHED, NOT READ OFF THE MARKET OBJECT.
+
+           This was `const sold = market.sold || {}`, and
+           getEbayCardMarket() has never returned a `sold` key --
+           summarizeListings() and EMPTY_MARKET() both return active
+           listing data only. Sold comps come from getSoldComps(), which
+           this function never called.
+
+           So `sold` was always {}, soldMed was always 0, and every card
+           fell into the `if (!newPrice)` skip. The job has been running
+           nightly and repricing nothing since the day it was written.
+
+           It hid well. The old code only stamped last_checked_at
+           alongside a successful write, so the whole watchlist read as
+           "last run 23 August" -- which looked like a cron that had
+           stopped firing. Yesterday's change to stamp skipped rows too
+           removed that symptom and made the run look healthy: 113 rows
+           freshly dated, none of them repriced. The timing gives it
+           away -- the success path sleeps a second per card, so 113
+           real updates cannot finish in 81 seconds.
+
+           Everything downstream was quietly disabled by this.
+           runPriceAlerts compares current_price to a baseline that
+           never moves, so no card ever crosses the 10% threshold. The
+           weekly digest sums the same frozen numbers. Three cron jobs
+           and a SendGrid integration, all working correctly on data
+           that stopped changing.
+
+           Same call the scan endpoint makes, with the same query
+           normalisation, so a watchlist price is computed exactly the
+           way the price on the card's own page was. */
         const market = await getEbayCardMarket(item.card_name);
-        const sold   = market.sold || {};
+        const soldQ  = market.searchQuery || normalizeCardQuery(item.card_name);
+        const sold   = (await getSoldComps(soldQ, market.avgPrice)) || {};
         const contaminated = !!sold.soldContaminated;
 
         /* LIMITED IS A REFUSAL TOO, AND IT WAS MISSING.
