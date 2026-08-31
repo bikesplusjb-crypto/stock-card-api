@@ -1303,11 +1303,11 @@ function buildQueryTiers(ai) {
     // variant is deliberately left out of the keywords.
     tight = joinParts(["pokemon", lang, player, set, num, auto, patch, grade]);
     core  = joinParts(["pokemon", lang, player, num, auto, patch, grade]);
-    loose = joinParts(["pokemon", lang, player, auto]);
+    loose = joinParts(["pokemon", lang, player, auto, patch]);
   } else {
     tight = joinParts([year, brand, set, player, par, num, auto, patch, grade]);
     core  = joinParts([year, brand, player, num, auto, patch, grade]);
-    loose = joinParts([year, brand, player, auto]);
+    loose = joinParts([year, brand, player, auto, patch]);
   }
 
   /* THE SET IS THE LAST THING TO DROP, NOT THE FIRST.
@@ -1545,6 +1545,12 @@ function buildDisplayName(ai) {
   if (par && !GENERIC_SET.test(par)) n += " " + par;
   const s = cleanVal(ai.serialNumber);
   if (s && /\d+\s*\/\s*\d+/.test(s)) n += " " + s.replace(/\s+/g, "");
+  /* A saved record that does not say "Auto" describes a different, far
+     cheaper card. This name is what lands in the binder and what the
+     fallback query uses when no tier could be built, so leaving it off
+     understated the card in both places. */
+  if (ai.isPatch)     n += " Patch";
+  if (ai.isAutograph) n += " Auto";
   /* Pokemon has no rookies. "RC" on a Charizard is wrong on its face and
      it also rides into the eBay keywords through the display name. */
   if (ai.isRookie && !isPokemon(ai)) n += " RC";
@@ -1816,7 +1822,7 @@ const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
    The cost is one fresh API call per card tomorrow instead of a cache
    hit. Today's usage was around 2% of the daily allowance, so this is
    not the thing to economise on. */
-const SOLD_LOGIC_VERSION = 3;
+const SOLD_LOGIC_VERSION = 4;
 
 /* The cache key must carry the limit. Without it a 50-record compact pull
    gets stored under the same key as a full lookup and is then served back
