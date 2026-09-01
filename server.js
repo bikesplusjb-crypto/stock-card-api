@@ -5367,9 +5367,38 @@ app.get("/api/set-checklist", async (req, res) => {
 
     const missing = cards.filter(c => !have.has(normCardNumber(c.card_number)));
 
+    /* THE WHOLE SET, TICKED -- not just what is absent.
+
+       The missing list answers "what do I still need", which is the
+       harder question and the one this was built for. It is also,
+       on a set somebody has just started, a screen listing 110 things
+       they do not own. That reads as a wall.
+
+       The same data ordered the other way reads as progress: five
+       ticks among a hundred is a collection begun, and the ticks are
+       the reason to add a sixth. Same rows, same match, one extra
+       boolean -- no additional catalog records, since this is the
+       list already in hand.
+
+       Behind ?full=1 rather than always sent: the missing list is
+       capped at 500 for a reason, and a 792-card set is a much larger
+       payload that only the checklist view needs. */
+    const full = String(req.query.full || "") === "1";
+    const checklist = full
+      ? cards.slice(0, 1200).map(c => ({
+          card_number: c.card_number,
+          subject:     c.subject,
+          is_rookie:   c.is_rookie === true,
+          print_run:   c.print_run,
+          have:        have.has(normCardNumber(c.card_number))
+        }))
+      : null;
+
     res.set("Cache-Control", "no-store");
     res.json({
       success:  true,
+      checklist: checklist,
+      checklistTruncated: !!(full && cards.length > 1200),
       complete: !!built.complete,
       /* Stated plainly when the list is partial. A missing-card list
          built from half a checklist is worse than none — it names cards
