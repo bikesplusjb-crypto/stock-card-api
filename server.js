@@ -589,7 +589,24 @@ function stripQueryJunk(q) {
      zeros from BOTH sides of any digit/digit fraction found anywhere
      in the text; a genuine "0" (from "000/999") survives since \d+
      still needs at least one digit left after the zeros are consumed. */
-  out = out.replace(/\b0*(\d+)\s*\/\s*0*(\d+)\b/g, "$1/$2");
+  /* NOTE the missing \s* before the slash, and why it matters.
+
+     This used to allow whitespace on BOTH sides, which meant it also
+     joined two tokens that were never one fraction. A real scan
+     produced:
+
+       2023 Panini Select Suite Level Michael Strahan Prizm #472/25
+
+     from a card numbered #472 with a print run of /25. Those entered
+     the query as separate tokens -- "#472 /25" -- and this rule fused
+     them into a card number that does not exist. The query returned
+     nothing and the card showed no price.
+
+     Nobody types "004 / 130" with a leading space; they type
+     "004/130". Requiring the slash to follow the digits directly keeps
+     the padding fix working and stops it reaching across a gap into
+     the next token. */
+  out = out.replace(/\b0*(\d+)\/\s*0*(\d+)\b/g, "$1/$2");
 
   return out.replace(/\s+/g, " ").trim();
 }
