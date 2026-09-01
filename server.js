@@ -4248,7 +4248,17 @@ const CATALOG_TIMEOUT   = 20000;
    A version stamp means better logic automatically retires worse
    answers. Old rows are ignored rather than deleted, so a rollback
    still has its cache. */
-const CATALOG_LOGIC_VERSION = 6;
+/* v6 -> v7 (2026-09-01). The Catalog add-on was cancelled for several
+   days and then renewed. Every lookup made while it was off returned
+   nothing and was cached as found:false -- a recorded failure that would
+   succeed now. Those rows are the reason the instruments page showed 16
+   of 18 sets unmatched; the real hit rate on answers cached while the
+   add-on WAS active is 12 of 17.
+
+   Bumping the version discards the whole cache rather than trying to
+   distinguish a genuine miss from an outage, which is not something the
+   stored row can tell us. Same reasoning as the sold-comps bump. */
+const CATALOG_LOGIC_VERSION = 7;
 /* v6: Pokemon sets now resolve against TCGdex. Every Pokemon lookup
    before this was cached as a miss against thecardapi. */
 /* v5: set names are translated to the catalog's vocabulary before the
@@ -4740,6 +4750,9 @@ async function verifyAgainstCatalog(ai) {
     confidence:null,       // high | medium | low
     ucid:      null,
     note:      "",
+    /* Set when the catalog found the same product under a different
+       year. The caller can re-price against it. */
+    yearCorrected: null,
     candidates: []
   };
 
@@ -4769,7 +4782,88 @@ async function verifyAgainstCatalog(ai) {
     if (ai.sport)  params.set("sport", catalogSport(ai.sport));
 
     const setRes = await catalogFetch("/sets?" + params.toString());
-    const sets = Array.isArray(setRes.body && setRes.body.data) ? setRes.body.data : [];
+    let sets = Array.isArray(setRes.body && setRes.body.data) ? setRes.body.data : [];
+
+    /* THE SET ISN'T THERE. ASK WHETHER THE YEAR IS WRONG.
+
+       This used to give up here, and giving up was expensive. A real
+       scan read a Nick Kurtz as "2020 Topps Tier One" -- Kurtz was
+       drafted in 2024, so no such card was ever printed. Every query
+       returned nothing, the broadening chain found nothing, and the
+       card ended with no price at all.
+
+       The listing-based year correction cannot help in that case. It
+       needs three or more active listings that agree on a different
+       year, and a card that does not exist has no listings to agree.
+
+       The catalog does not need listings. It knows what was printed. So
+       when the set cannot be found for the claimed year, ask the
+       catalog for the same brand and set WITHOUT a year and see what
+       years it actually comes back with. One year, or one clearly
+       dominant year, is the answer.
+
+       Deliberately narrow. It only runs when the first lookup found
+       nothing at all, it requires a card number to have been read, and
+       it only adopts a year when the catalog is unambiguous. A guess
+       here would price a different card, which is the failure this
+       whole system exists to avoid. */
+    let yearFixed = null;
+    if (!sets.length && (brand || setNm)) {
+      try {
+        /* A MUCH WIDER SAMPLE THAN THE VERIFY LOOKUP, ON PURPOSE.
+
+           VERIFY_MAX_CANDIDATES is 5, which is right for "does this
+           card number exist in this set" -- but wrong here. This query
+           asks the catalog for every year a product ran, and a product
+           like Topps Chrome or Tier One has run for a decade. Five
+           arbitrary rows out of twenty would let whichever years
+           happened to come back first look like a majority, and the
+           card would be "corrected" to a year on no real evidence.
+
+           Twenty-five is enough to see the shape of a normal product's
+           run. If the catalog still returns a full page, the sample is
+           truncated and the distribution cannot be trusted -- see the
+           unanimity requirement below. */
+        const YEAR_SCAN_LIMIT = 25;
+        const p2 = new URLSearchParams({
+          q: [brand, setNm].filter(Boolean).join(" ").trim(),
+          limit: String(YEAR_SCAN_LIMIT)
+        });
+        if (ai.sport) p2.set("sport", catalogSport(ai.sport));
+        const anyYear = await catalogFetch("/sets?" + p2.toString());
+        const cand = Array.isArray(anyYear.body && anyYear.body.data) ? anyYear.body.data : [];
+
+        const years = {};
+        cand.forEach(c => { const y = Number(c.year); if (y >= 1860 && y <= 2100) years[y] = (years[y] || 0) + 1; });
+        const distinct = Object.keys(years);
+
+        /* One year, or one that outnumbers the rest two to one. Any
+           closer than that and the catalog is not actually telling us
+           which card this is. */
+        if (distinct.length) {
+          distinct.sort((a, b) => years[b] - years[a]);
+          const top = Number(distinct[0]);
+
+          /* A full page back means there are probably more we did not
+             see, so the counts are a slice rather than the picture. In
+             that case only unanimity counts -- if every row we got says
+             the same year, the ones we missed are unlikely to disagree.
+             Otherwise the ordinary two-to-one margin applies. */
+          const truncated = cand.length >= YEAR_SCAN_LIMIT;
+          const clear = distinct.length === 1
+                     || (!truncated && years[top] >= 2 * (years[distinct[1]] || 0));
+
+          if (clear && top !== year) {
+            sets = cand.filter(c => Number(c.year) === top);
+            yearFixed = { from: year || null, to: top, sets: sets.length };
+            out.yearCorrected = yearFixed;
+            console.log("[verify] catalog year correction: " + (year || "?") + " -> " + top +
+                        " for " + [brand, setNm].filter(Boolean).join(" "));
+          }
+        }
+      } catch (e) { /* the original answer stands */ }
+    }
+
     if (!sets.length) {
       out.checked = true;
       out.note = "That set isn't in the card catalog, so we couldn't confirm it.";
