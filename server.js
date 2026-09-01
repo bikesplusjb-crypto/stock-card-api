@@ -4244,7 +4244,18 @@ app.get("/api/vs-market", async (req, res) => {
    answers "how many", which costs almost nothing and is most of what
    people want.
    ─────────────────────────────────────────────────────────────── */
-const CATALOG_BASE      = "https://www.thecardapi.com/api/v1/catalog";
+/* No www, deliberately, and matching CARDAPI_BASE.
+
+   This read https://www.thecardapi.com/... while the pricing side
+   uses the bare domain. If www redirects to the apex, that is a
+   CROSS-ORIGIN redirect, and fetch drops custom headers across
+   origins -- so x-api-key never arrives and the catalog answers 401.
+   The scan then reports "not checked" and the add-on looks dead
+   while being perfectly active.
+
+   The pricing calls have always worked on the bare domain, which is
+   the evidence that it is the right host. */
+const CATALOG_BASE      = "https://thecardapi.com/api/v1/catalog";
 const CATALOG_PAGE_SIZE = 5;      // records per lookup — see note 1 above
 /* 9s was too tight. Real lookups against thecardapi were aborting
    mid-flight, and the abort surfaced to the user as "we can't match
@@ -4773,7 +4784,10 @@ async function verifyAgainstCatalog(ai) {
     candidates: []
   };
 
-  if (!CARDAPI_KEY) return out;
+  if (!CARDAPI_KEY) {
+    out.note = "No card-catalog key is configured on the server.";
+    return out;
+  }
 
   const number = String(ai.cardNumber || "").trim();
   const year   = parseInt(ai.year, 10);
@@ -4944,8 +4958,19 @@ async function verifyAgainstCatalog(ai) {
 
   } catch (e) {
     /* Allowance gone, catalog down, not on the plan. The scan stands as
-       it was; a second opinion we could not get is not an error. */
+       it was; a second opinion we could not get is not an error.
+
+       But SAY WHICH. The result line reads "Card catalog: not checked"
+       and, with no reason attached, that looked identical whether the
+       add-on had lapsed, the day's allowance was gone, or the network
+       simply failed. Diagnosing it meant going to the server log for a
+       message the app already had in its hand. */
     console.warn("[verify] skipped:", e.message);
+    out.note = String(e && e.message || "").indexOf("plan") > -1
+      ? "The card catalog isn't active on this API key."
+      : (String(e && e.message || "").indexOf("allowance") > -1
+          ? "The card catalog's daily allowance is used up."
+          : "The card catalog didn't answer (" + (e && e.message || "unknown") + ").");
     return out;
   }
 }
