@@ -5744,6 +5744,260 @@ function buildAlertEmailHtml(rows) {
   );
 }
 
+/* ══════════════════════════════════════════════════════════════
+   PRICE ALERTS WITHOUT AN ACCOUNT
+
+   The account was the only way to receive anything, and the account
+   costs an emailed code: enter an address, leave the app, find the
+   mail, copy six digits, come back. Measured over 30 days, 25 people
+   started that and 6 finished. Three quarters of the intent was spent
+   on the round trip, not on the decision.
+
+   So the address is now enough on its own. One field, no code, no
+   password. The card is already kept on the device by then, so this
+   buys exactly one thing and says so: we tell you when it moves.
+
+   WHAT THIS DELIBERATELY IS NOT: an account. There is no login, no
+   binder, no sync to another phone. Those still need the real thing,
+   and the difference is the honest reason to sign up later rather
+   than a wall in front of the first useful moment.
+
+   NO CONFIRMATION STEP, WHICH IS THE WHOLE POINT AND ALSO THE RISK.
+   A double opt-in is an emailed link, which is the same round trip
+   this exists to remove. Instead: every message carries a one-click
+   unsubscribe on a per-row token, addresses are never displayed back
+   to anyone, and the table is service-role only. If somebody typos a
+   stranger's address, that stranger gets one email with a working
+   unsubscribe rather than a stream of them.
+══════════════════════════════════════════════════════════════ */
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+app.post("/api/watch-email", async (req, res) => {
+  try {
+    if (!supabaseAdmin) return res.json({ success: false, error: "Not configured" });
+
+    const email = String((req.body && req.body.email) || "").trim().toLowerCase();
+    const card  = String((req.body && req.body.cardName) || "").trim().slice(0, 200);
+    const query = String((req.body && req.body.query) || "").trim().slice(0, 280) || null;
+    const price = safeNumber(req.body && req.body.price, 0) || null;
+
+    if (!EMAIL_RE.test(email) || email.length > 254) {
+      return res.json({ success: false, error: "That doesn't look like an email address." });
+    }
+    if (!card) return res.json({ success: false, error: "No card to watch." });
+
+    /* ALREADY HAS AN ACCOUNT? SAY SO RATHER THAN BUILDING A SHADOW ONE.
+
+       Two places holding alerts for the same person is how somebody
+       ends up getting the same card twice, and unsubscribing from one
+       of them. The account is the better record, so it wins. */
+    let hasAccount = false;
+    try {
+      const { data: pro } = await supabaseAdmin
+        .from("pro_users").select("id").eq("email", email).maybeSingle();
+      hasAccount = !!(pro && pro.id);
+    } catch (e) {}
+
+    const { error } = await supabaseAdmin.from("email_watches").upsert({
+      email:            email,
+      card_name:        card,
+      card_query:       query,
+      price_when_added: price,
+      current_price:    price,
+      source:           String((req.body && req.body.source) || "scanner").slice(0, 40),
+      unsubscribed:     false
+    }, { onConflict: "email,card_name", ignoreDuplicates: false });
+
+    /* The unique index is on lower(email), lower(card_name), which
+       onConflict cannot name directly. A duplicate is not a failure --
+       they already asked for this card -- so it is reported as success
+       rather than as an error the person can do nothing about. */
+    if (error && String(error.message || "").indexOf("duplicate") < 0) {
+      console.log("[watch-email] insert failed:", error.message);
+      return res.json({ success: false, error: "Couldn't save that just now." });
+    }
+
+    try {
+      await supabaseAdmin.rpc("log_scan_event", {
+        p_event: "email_watch_added", p_card_name: card,
+        p_used_back: false, p_is_owner: false
+      });
+    } catch (e) {}
+
+    return res.json({ success: true, hasAccount: hasAccount });
+  } catch (e) {
+    console.error("[watch-email] error:", e.message);
+    return res.json({ success: false, error: "Couldn't save that just now." });
+  }
+});
+
+/* One click, no login, no confirmation screen that asks again. The
+   token identifies the address; every row for it stops. Anything less
+   than that is not really an unsubscribe. */
+app.get("/api/email-unsub", async (req, res) => {
+  const token = String(req.query.t || "").trim();
+  res.set("Content-Type", "text/html");
+  if (!supabaseAdmin || !token) {
+    return res.send("<p style='font-family:sans-serif;padding:40px'>Invalid link.</p>");
+  }
+  try {
+    const { data } = await supabaseAdmin
+      .from("email_watches").select("email").eq("unsub_token", token).maybeSingle();
+    if (!data || !data.email) {
+      return res.send("<p style='font-family:sans-serif;padding:40px'>That link has expired.</p>");
+    }
+    await supabaseAdmin.from("email_watches")
+      .update({ unsubscribed: true }).eq("email", data.email);
+    try {
+      await supabaseAdmin.rpc("log_scan_event", {
+        p_event: "email_watch_unsub", p_card_name: null,
+        p_used_back: false, p_is_owner: false
+      });
+    } catch (e) {}
+    res.send("<div style=\"font-family:sans-serif;padding:40px;max-width:420px;margin:0 auto\">"
+      + "<h2>Unsubscribed</h2><p>You won't get any more price alerts from CardGauge. "
+      + "Nothing else to do.</p></div>");
+  } catch (e) {
+    res.send("<p style='font-family:sans-serif;padding:40px'>Something went wrong.</p>");
+  }
+});
+
+function buildWatchAlertHtml(rows, token) {
+  const unsub = "https://stock-card-api.onrender.com/api/email-unsub?t=" + encodeURIComponent(token);
+  const body = rows.map(function (r) {
+    const up = r.pct >= 0;
+    return '<tr style="border-bottom:1px solid #1e2d45;">'
+      + '<td style="padding:10px 0;color:#f1f5f9;font-family:sans-serif;font-size:14px;">'
+        + String(r.item.card_name || "Card") + '</td>'
+      + '<td style="padding:10px 0;text-align:right;color:' + (up ? "#22c55e" : "#ef4444")
+        + ';font-family:monospace;font-size:14px;font-weight:700;white-space:nowrap;">'
+        + (up ? "\u25B2 " : "\u25BC ") + Math.abs(Math.round(r.pct)) + '%</td>'
+      + '</tr>';
+  }).join("");
+
+  return '<div style="background:#0a0e1a;padding:32px 16px;font-family:Arial,sans-serif;">'
+    + '<div style="max-width:480px;margin:0 auto;background:#111827;border:1px solid #1e2d45;border-radius:14px;padding:28px;">'
+    + '<div style="font-size:20px;font-weight:800;color:#f1f5f9;margin-bottom:4px;">CARD<span style="color:#f59e0b;">GAUGE</span></div>'
+    + '<p style="color:#94a3b8;font-size:13px;margin:0 0 20px;">'
+      + rows.length + ' card' + (rows.length === 1 ? '' : 's') + ' you\u2019re watching moved.</p>'
+    + '<table style="width:100%;border-collapse:collapse;">' + body + '</table>'
+    + '<div style="margin-top:22px;padding:14px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.25);border-radius:10px;">'
+      + '<div style="color:#22c55e;font-weight:700;font-size:12.5px;margin-bottom:4px;">Want them in a binder?</div>'
+      + '<div style="color:#94a3b8;font-size:11.5px;line-height:1.5;">Right now we just email you. '
+      + 'A free account keeps your cards across phones and shows what a set is missing.</div></div>'
+    + '<a href="https://www.cardgauge.com" style="display:block;margin-top:20px;background:#22c55e;color:#052e16;text-decoration:none;text-align:center;padding:13px;border-radius:10px;font-weight:800;font-size:14px;">Open CardGauge \u2192</a>'
+    + '<p style="color:#64748b;font-size:11px;line-height:1.6;margin-top:20px;">'
+      + 'You asked us to watch these cards. <a href="' + unsub + '" style="color:#64748b;">Unsubscribe</a></p>'
+    + '</div></div>';
+}
+
+/* Same shape as runPriceAlerts, same threshold, same per-row baseline
+   so a card that moved once is not reported every night afterwards.
+   Runs on its own rather than inside that function because the two
+   read different tables and neither should be able to break the
+   other. */
+const WATCH_REFRESH_MAX = Number(process.env.WATCH_REFRESH_MAX || 60);
+
+async function runEmailWatchAlerts() {
+  if (!supabaseAdmin || !SENDGRID_API_KEY) return;
+  console.log("[watch-alerts] starting\u2026");
+
+  try {
+    const { data: rows, error } = await supabaseAdmin
+      .from("email_watches")
+      .select("id,email,card_name,card_query,price_when_added,current_price,last_alerted_price,unsub_token")
+      .eq("unsubscribed", false)
+      .order("last_checked_at", { ascending: true, nullsFirst: true })
+      .limit(WATCH_REFRESH_MAX);
+
+    if (error) { console.error("[watch-alerts] fetch:", error.message); return; }
+    if (!rows || !rows.length) return;
+
+    const movers = {};
+    let priced = 0;
+
+    for (const row of rows) {
+      try {
+        const q = row.card_query || row.card_name;
+        const market = await getEbayCardMarket(q);
+        const sold   = await getSoldComps(q, market.avgPrice);
+
+        if (sold && sold.rateLimited) {
+          console.log("[watch-alerts] allowance reached \u2014 stopping early");
+          break;
+        }
+
+        const s = sold || {};
+        /* Refuses contaminated and limited pools, exactly as the
+           watchlist refresh does. An alert is a push notification
+           about money; a median the engine already declined to stand
+           behind must not become one. */
+        const usable = !s.soldContaminated && !s.soldLimited;
+        const newPrice = usable ? safeNumber(
+          (s.soldRaw && s.soldRaw.count >= 3 ? s.soldRaw.median : 0) || s.soldMedian, 0) : 0;
+
+        const patch = { last_checked_at: new Date().toISOString() };
+        if (newPrice) { patch.current_price = newPrice; priced++; }
+        await supabaseAdmin.from("email_watches").update(patch).eq("id", row.id);
+
+        if (newPrice) {
+          const base = safeNumber(row.last_alerted_price, 0) || safeNumber(row.price_when_added, 0);
+          if (base) {
+            const pct = ((newPrice - base) / base) * 100;
+            if (Math.abs(pct) >= PRICE_ALERT_PCT) {
+              const k = row.email;
+              (movers[k] = movers[k] || []).push({ item: row, pct: pct, newPrice: newPrice });
+            }
+          }
+        }
+      } catch (e) {
+        console.error("[watch-alerts] card error:", e.message);
+      }
+      await new Promise(r => setTimeout(r, 1000));
+    }
+
+    let sent = 0;
+    for (const email of Object.keys(movers)) {
+      const list = movers[email];
+      const subject = list.length === 1
+        ? (list[0].pct >= 0 ? "\uD83D\uDCC8 " : "\uD83D\uDCC9 ") + list[0].item.card_name
+            + " moved " + Math.abs(Math.round(list[0].pct)) + "%"
+        : list.length + " cards you're watching moved";
+
+      const ok = await sendResendEmail(email, subject,
+        buildWatchAlertHtml(list, list[0].item.unsub_token));
+
+      if (ok) {
+        sent++;
+        for (const m of list) {
+          await supabaseAdmin.from("email_watches").update({
+            last_alerted_price: m.newPrice,
+            last_alerted_at:    new Date().toISOString()
+          }).eq("id", m.item.id);
+        }
+      }
+    }
+
+    console.log("[watch-alerts] done. checked=" + rows.length + " priced=" + priced + " sent=" + sent);
+  } catch (e) {
+    console.error("[watch-alerts] fatal:", e.message);
+  }
+}
+
+/* 4:45am ET \u2014 after the watchlist refresh and the account price
+   alerts, so the three never contend for the record allowance. */
+cron.schedule("45 4 * * *", runEmailWatchAlerts, { timezone: "America/New_York" });
+console.log("Email-only watch alerts scheduled for 4:45 AM ET");
+
+app.get("/api/run-watch-alerts", async (req, res) => {
+  if (!process.env.REFRESH_SECRET || req.query.key !== process.env.REFRESH_SECRET) {
+    return res.status(403).json({ success: false, error: "Forbidden" });
+  }
+  res.json({ success: true, message: "Watch alerts started \u2014 check server logs" });
+  runEmailWatchAlerts();
+});
+
 async function runPriceAlerts() {
   if (!supabaseAdmin) {
     console.log("[price-alerts] skipped — no Supabase client");
@@ -6087,9 +6341,23 @@ function buildWeeklyDigestHtml(opts) {
         '<div style="margin-top:22px;padding-top:18px;border-top:1px solid #1e2d45;color:#94a3b8;font-family:monospace;font-size:12px;">' +
           opts.cardCount + ' card' + (opts.cardCount === 1 ? '' : 's') +
         '</div>' +
+        /* THE PROMO SLOT GOES TO WHOEVER IS READING.
+
+           This is a digest for somebody who saves cards, so the thing
+           advertised in it should be the thing a card-saver would use
+           next. Set completion is that: it reads their binder, matches
+           on card number, and tells them what is still missing from a
+           set they are already part-way through.
+
+           The shop tools are deliberately NOT here. Multi-Scan is for
+           a breaker processing hundreds of cards after a box, and
+           putting a $49.99 business pitch in front of nine collectors
+           spends the only email audience there is on an ask that does
+           not fit the reader. That pitch belongs in the shop outreach
+           list, where the audience is right. */
         '<div style="margin-top:18px;padding:14px;background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.25);border-radius:10px;">' +
-          '<div style="color:#fbbf24;font-weight:700;font-size:12.5px;margin-bottom:4px;">\ud83d\udcc7 New: scan a PSA barcode</div>' +
-          '<div style="color:#94a3b8;font-size:11.5px;line-height:1.5;">Already graded? Skip the photo \u2014 scan the barcode on the label and we\u2019ll pull the card, grade and price straight from PSA\u2019s own record.</div>' +
+          '<div style="color:#fbbf24;font-weight:700;font-size:12.5px;margin-bottom:4px;">\ud83d\udcd2 Finish a set</div>' +
+          '<div style="color:#94a3b8;font-size:11.5px;line-height:1.5;">Pick a set in your binder and we\u2019ll show you the full checklist \u2014 which cards you already have, and exactly which ones you still need.</div>' +
         '</div>' +
         '<a href="https://www.cardgauge.com/my-binder" style="display:block;margin-top:20px;background:#22c55e;color:#052e16;text-decoration:none;text-align:center;padding:13px;border-radius:10px;font-weight:800;font-size:14px;">View your binder \u2192</a>' +
         '<p style="color:#64748b;font-size:11px;line-height:1.6;margin-top:20px;">' +
