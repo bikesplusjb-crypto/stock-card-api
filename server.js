@@ -4627,7 +4627,14 @@ app.get("/api/set-lookup", async (req, res) => {
     const rows = Array.isArray(body && body.data) ? body.data : [];
 
     let sets = rows.map(r => ({
-      ucid:        r.ucid || r.set_ucid || null,
+      /* usid FIRST. Their set responses now return "usid" (US-...);
+         "ucid" was the older field name and set_ucid an older one still.
+         Reading only the old names mapped every set row to null, the
+         filter below dropped them all, and the query cached as
+         found:false -- a set that exists recorded permanently as one
+         that does not. All three are accepted so this works either
+         side of their rename. */
+      ucid:        r.usid || r.ucid || r.set_ucid || null,
       set_name:    r.set_name || r.name || "",
       year:        r.year != null ? Number(r.year) : null,
       sport:       r.sport || null,
@@ -4831,7 +4838,7 @@ async function verifyAgainstCatalog(ai) {
     const cacheSetAnswer = async function (best) {
       if (!cacheOk) return;
       try {
-        const bestUcid = best ? (best.ucid || best.set_ucid || null) : null;
+        const bestUcid = best ? (best.usid || best.ucid || best.set_ucid || null) : null;
         if (best && bestUcid) {
           await supabaseAdmin.from("catalog_sets").upsert([{
             ucid:        bestUcid,
@@ -5026,7 +5033,10 @@ async function verifyAgainstCatalog(ai) {
       return sc(b) - sc(a);
     });
     const set = sets[0];
-    const setUcid = set.ucid || set.set_ucid;
+    /* usid first -- see the note in /api/set-lookup. A cached row read
+       back from catalog_sets carries "ucid" because that is the column
+       name, so both have to work here. */
+    const setUcid = set.usid || set.ucid || set.set_ucid;
     if (!setUcid) {
       /* Also a bare return before this, which printed "not checked"
          with nothing after it. */
