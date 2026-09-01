@@ -4244,18 +4244,7 @@ app.get("/api/vs-market", async (req, res) => {
    answers "how many", which costs almost nothing and is most of what
    people want.
    ─────────────────────────────────────────────────────────────── */
-/* No www, deliberately, and matching CARDAPI_BASE.
-
-   This read https://www.thecardapi.com/... while the pricing side
-   uses the bare domain. If www redirects to the apex, that is a
-   CROSS-ORIGIN redirect, and fetch drops custom headers across
-   origins -- so x-api-key never arrives and the catalog answers 401.
-   The scan then reports "not checked" and the add-on looks dead
-   while being perfectly active.
-
-   The pricing calls have always worked on the bare domain, which is
-   the evidence that it is the right host. */
-const CATALOG_BASE      = "https://thecardapi.com/api/v1/catalog";
+const CATALOG_BASE      = "https://www.thecardapi.com/api/v1/catalog";
 const CATALOG_PAGE_SIZE = 5;      // records per lookup — see note 1 above
 /* 9s was too tight. Real lookups against thecardapi were aborting
    mid-flight, and the abort surfaced to the user as "we can't match
@@ -4802,18 +4791,128 @@ async function verifyAgainstCatalog(ai) {
   }
 
   try {
-    /* Find the set first. This is the same lookup the set-size feature
-       uses and it shares the same cache, so for any set somebody has
-       already looked up it costs nothing at all. */
+    /* THE COMMENT HERE USED TO SAY THIS SHARED THE SET-SIZE CACHE.
+       IT DID NOT.
+
+       It claimed that any set somebody had already looked up cost
+       nothing here. The code underneath called catalogFetch directly
+       and never touched catalog_set_queries -- not to read it, not to
+       write it. So every scan paid 5 records for a set lookup that
+       /api/set-lookup had already answered and stored, 3 more for the
+       card, and up to 25 more again when the year scan ran. Around 33
+       records per scan against a 500/day catalog allowance: roughly
+       fifteen scans to exhaust the day.
+
+       That is what emptied the allowance on 1 September, with the v7
+       cache wipe removing the one thing that would have softened it.
+
+       The cache is now genuinely read and genuinely written, against
+       the same table and the same key shape /api/set-lookup uses, so
+       the two share entries in both directions. */
     const setQuery = [year || "", brand, setNm].filter(Boolean).join(" ").trim();
-    if (!setQuery) return out;
+    if (!setQuery) {
+      /* Was a bare return, which surfaced as "not checked" with no
+         reason at all -- indistinguishable from a catalog failure. */
+      out.note = "Not enough of the set was read to look it up.";
+      return out;
+    }
 
-    const params = new URLSearchParams({ q: setQuery, limit: String(VERIFY_MAX_CANDIDATES) });
-    if (year)      params.set("year", String(year));
-    if (ai.sport)  params.set("sport", catalogSport(ai.sport));
+    /* Same key shape as /api/set-lookup. Sport is part of it because
+       "1986 Topps" is 792 cards in baseball and 396 in football, and
+       one cached answer for both would hand a football collector a
+       target they can never reach. */
+    const sportRaw = String(ai.sport || "").trim();
+    const cacheQ   = normaliseSetQuery(setQuery + (sportRaw ? " :" + sportRaw : ""));
+    const cacheOk  = !!supabaseAdmin && cacheQ.length >= 3;
 
-    const setRes = await catalogFetch("/sets?" + params.toString());
-    let sets = Array.isArray(setRes.body && setRes.body.data) ? setRes.body.data : [];
+    /* Write-through, used from two places below: once when the set was
+       found, once when it was not. Both record the FINAL answer -- see
+       the note at the miss branch for why that matters. */
+    const cacheSetAnswer = async function (best) {
+      if (!cacheOk) return;
+      try {
+        const bestUcid = best ? (best.ucid || best.set_ucid || null) : null;
+        if (best && bestUcid) {
+          await supabaseAdmin.from("catalog_sets").upsert([{
+            ucid:        bestUcid,
+            set_name:    best.set_name || best.name || "",
+            year:        best.year != null ? Number(best.year) : null,
+            sport:       best.sport || null,
+            card_count:  Number(best.card_count || best.total_cards || best.cards || 0) || null,
+            parent_name: best.parent_set_name || best.parent_name || null,
+            slug:        best.slug || null,
+            fetched_at:  new Date().toISOString()
+          }], { onConflict: "ucid" });
+        }
+        await supabaseAdmin.from("catalog_set_queries").upsert({
+          q:             cacheQ,
+          ucid:          bestUcid,
+          found:         !!bestUcid,
+          logic_version: CATALOG_LOGIC_VERSION,
+          fetched_at:    new Date().toISOString()
+        }, { onConflict: "q" });
+      } catch (e) {
+        console.warn("[verify] cache write failed:", e.message);
+      }
+    };
+
+    /* null = nobody has answered yet. [] = answered, and the answer
+       was nothing. The difference decides whether the year scan below
+       is worth 25 records. */
+    let sets      = null;
+    let fromCache = false;
+
+    if (cacheOk) {
+      try {
+        const hit = await supabaseAdmin
+          .from("catalog_set_queries")
+          .select("ucid,found,logic_version")
+          .eq("q", cacheQ)
+          .maybeSingle();
+
+        /* An answer produced by logic we have since decided was wrong
+           is not trusted -- the same rule /api/set-lookup applies, and
+           the reason CATALOG_LOGIC_VERSION exists. */
+        if (hit.data && Number(hit.data.logic_version || 0) >= CATALOG_LOGIC_VERSION) {
+          if (!hit.data.found) {
+            fromCache = true;
+            sets = [];
+          } else if (hit.data.ucid) {
+            const row = await supabaseAdmin
+              .from("catalog_sets")
+              .select("ucid,set_name,year,sport,card_count,parent_name")
+              .eq("ucid", hit.data.ucid)
+              .maybeSingle();
+            if (row.data) {
+              fromCache = true;
+              sets = [row.data];
+              /* THE YEAR CORRECTION HAS TO SURVIVE A CACHE HIT.
+
+                 If the stored set sits under a different year than the
+                 model read, that IS the correction -- it is the reason
+                 this query was recorded as found rather than missed.
+                 Losing it on the second scan of the same card would
+                 make the fix look intermittent. */
+              if (year && row.data.year && Number(row.data.year) !== year) {
+                out.yearCorrected = { from: year, to: Number(row.data.year), sets: 1 };
+              }
+            }
+          }
+        }
+      } catch (e) {
+        /* A cache that is down is a slower scan, not a broken one. */
+        console.warn("[verify] cache read failed:", e.message);
+      }
+    }
+
+    if (sets === null) {
+      const params = new URLSearchParams({ q: setQuery, limit: String(VERIFY_MAX_CANDIDATES) });
+      if (year)      params.set("year", String(year));
+      if (ai.sport)  params.set("sport", catalogSport(ai.sport));
+
+      const setRes = await catalogFetch("/sets?" + params.toString());
+      sets = Array.isArray(setRes.body && setRes.body.data) ? setRes.body.data : [];
+    }
 
     /* THE SET ISN'T THERE. ASK WHETHER THE YEAR IS WRONG.
 
@@ -4838,8 +4937,16 @@ async function verifyAgainstCatalog(ai) {
        it only adopts a year when the catalog is unambiguous. A guess
        here would price a different card, which is the failure this
        whole system exists to avoid. */
+    /* !fromCache MATTERS AND IS NOT DEFENSIVE PADDING.
+
+       A cached miss is written AFTER this branch has run, so a stored
+       found:false means the direct lookup and the year scan both came
+       back empty. Re-running the scan on it would spend 25 records to
+       learn the same nothing, on every scan of every card in a set the
+       catalog does not carry -- which is the most expensive shape this
+       function has. */
     let yearFixed = null;
-    if (!sets.length && (brand || setNm)) {
+    if (!sets.length && !fromCache && (brand || setNm)) {
       try {
         /* A MUCH WIDER SAMPLE THAN THE VERIFY LOOKUP, ON PURPOSE.
 
@@ -4896,6 +5003,16 @@ async function verifyAgainstCatalog(ai) {
     }
 
     if (!sets.length) {
+      /* CACHE THE MISS, and cache it HERE rather than before the year
+         scan, so what gets stored is the final answer: the set was not
+         found under the claimed year and the catalog could not name a
+         better one. A later hit can then skip both calls without
+         losing anything.
+
+         Same reasoning /api/set-lookup already applies to its own
+         misses -- without it, a set the catalog does not carry is
+         re-queried on every scan of every card in it. */
+      if (!fromCache) await cacheSetAnswer(null);
       out.checked = true;
       out.note = "That set isn't in the card catalog, so we couldn't confirm it.";
       return out;
@@ -4910,14 +5027,103 @@ async function verifyAgainstCatalog(ai) {
     });
     const set = sets[0];
     const setUcid = set.ucid || set.set_ucid;
-    if (!setUcid) return out;
+    if (!setUcid) {
+      /* Also a bare return before this, which printed "not checked"
+         with nothing after it. */
+      out.note = "The card catalog returned a set with no id, so it couldn't be checked.";
+      return out;
+    }
 
-    /* Now the actual question: is there a card with this number in that
-       set? One record if it exists, zero if it doesn't. */
-    const cardRes = await catalogFetch("/?" + new URLSearchParams({
-      set_id: setUcid, card_number: number, limit: "3"
-    }).toString());
-    const cards = Array.isArray(cardRes.body && cardRes.body.data) ? cardRes.body.data : [];
+    /* Written after the sort, not before it, so what is cached is the
+       set this function actually used -- not whichever row the catalog
+       happened to return first. */
+    if (!fromCache) await cacheSetAnswer(set);
+
+    /* THE CHECKLIST ALREADY HOLDS THIS ANSWER, FOR NOTHING.
+
+       buildChecklist() stores every card of a set in catalog_cards and
+       records in catalog_checklist_progress whether the list is
+       finished. Where a checklist exists, "is there a #274 in this
+       set" is a Supabase read rather than 3 catalog records -- and for
+       Pokemon it is always free, because those checklists come from
+       TCGdex and never touched the allowance in the first place.
+
+       THE TWO DIRECTIONS ARE NOT EQUALLY SAFE, so they are not treated
+       the same:
+
+       - A local HIT is always trustworthy. The row is in the table
+         because the catalog put it there.
+       - A local MISS is only trustworthy when the checklist is
+         COMPLETE. A half-built list is missing cards that genuinely
+         exist, and answering "no" off one would tell somebody their
+         correct scan was wrong -- the exact failure this function was
+         written to catch, produced by the function itself.
+
+       So an incomplete checklist falls through to the paid lookup,
+       exactly as before. Matching uses sameCardNumber(), the same
+       normaliser the rest of this file uses, rather than trying to
+       guess which formatting the row was stored under. */
+    let cards = null;
+
+    if (supabaseAdmin) {
+      try {
+        const LOCAL_CAP = 2000;
+        const local = await supabaseAdmin
+          .from("catalog_cards")
+          .select("ucid,card_number,subject")
+          .eq("set_ucid", setUcid)
+          .limit(LOCAL_CAP);
+        const rows = (local.data || []);
+        const found = rows.filter(c => sameCardNumber(c.card_number, number));
+
+        if (found.length) {
+          cards = found.slice(0, 3);
+        } else if (rows.length && rows.length < LOCAL_CAP) {
+          /* Nothing matched, and we know we saw the whole stored list
+             rather than the first 2000 of it. Only a checklist marked
+             complete makes that absence meaningful. */
+          const prog = await supabaseAdmin
+            .from("catalog_checklist_progress")
+            .select("complete")
+            .eq("set_ucid", setUcid)
+            .maybeSingle();
+          if (prog.data && prog.data.complete === true) cards = [];
+        }
+      } catch (e) {
+        console.warn("[verify] checklist read failed:", e.message);
+      }
+    }
+
+    if (cards === null) {
+      const cardRes = await catalogFetch("/?" + new URLSearchParams({
+        set_id: setUcid, card_number: number, limit: "3"
+      }).toString());
+      cards = Array.isArray(cardRes.body && cardRes.body.data) ? cardRes.body.data : [];
+
+      /* Keep what was paid for. The same card scanned twice should not
+         cost records twice, and these rows are the same shape
+         buildChecklist writes, so a checklist built later merges with
+         them rather than fighting them. */
+      if (supabaseAdmin && cards.length) {
+        try {
+          const rows = cards.map(c => ({
+            ucid:        c.ucid,
+            set_ucid:    setUcid,
+            card_number: c.card_number != null ? String(c.card_number) : null,
+            subject:     c.subject || null,
+            is_rookie:   c.is_rookie === true,
+            print_run:   c.print_run != null ? Number(c.print_run) : null,
+            image_url:   c.image_url_front || null,
+            fetched_at:  new Date().toISOString()
+          })).filter(c => c.ucid);
+          if (rows.length) {
+            await supabaseAdmin.from("catalog_cards").upsert(rows, { onConflict: "ucid" });
+          }
+        } catch (e) {
+          console.warn("[verify] card cache write failed:", e.message);
+        }
+      }
+    }
 
     out.checked = true;
 
