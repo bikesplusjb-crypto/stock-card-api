@@ -1314,6 +1314,18 @@ function buildQueryTiers(ai) {
   const auto  = ai.isAutograph ? "auto"  : "";
   const patch = ai.isPatch     ? "patch" : "";
 
+  /* THE PRINT CODE, WHERE IT CAN ACTUALLY CHANGE THE ANSWER.
+
+     TIGHT ONLY, and for the same reason the serial number is tight
+     only: if this term finds nothing, the broadening chain falls back
+     to a query without it and the person still gets a price. A wrong
+     variation call costs one empty query rather than a wrong number.
+
+     ai.printCode is set by the scan handler from lookupPrintCode().
+     Nothing else populates it, so a typed search or a card from a
+     product we have no codes for carries no term at all. */
+  const variation = variationSearchTerm(ai.printCode);
+
   /* THE SERIAL DENOMINATOR IS THE MOST IDENTIFYING TOKEN ON THE CARD,
      AND IT WAS ONLY EVER USED TO FILTER, NEVER TO SEARCH.
 
@@ -1347,7 +1359,7 @@ function buildQueryTiers(ai) {
     core  = joinParts(["pokemon", lang, player, num, auto, patch, grade]);
     loose = joinParts(["pokemon", lang, player, auto]);
   } else {
-    tight = joinParts([year, brand, set, player, par, num, serial, auto, patch, grade]);
+    tight = joinParts([year, brand, set, player, par, num, serial, variation, auto, patch, grade]);
     core  = joinParts([year, brand, player, num, auto, patch, grade]);
     loose = joinParts([year, brand, player, auto]);
   }
@@ -1374,7 +1386,7 @@ function buildQueryTiers(ai) {
      "set-noNum" is tried before anything drops the set. */
   const setNoNum = poke
     ? joinParts(["pokemon", lang, player, set, auto, patch, grade])
-    : joinParts([year, brand, set, player, auto, patch, grade]);
+    : joinParts([year, brand, set, player, variation, auto, patch, grade]);
 
   const tiers = [];
   if (tight) tiers.push({ tier: "tight", query: tight });
@@ -1931,6 +1943,20 @@ function summarizeSold(records, query, limitUsed) {
      The query carries the parallel terms, so it answers this directly. */
   const targetIsParallel = titleLooksParallel(query, "");
 
+  /* A VARIATION IS NOT A BASE CARD EITHER.
+
+     targetIsSpecial already stops NOT_THE_CARD emptying the pool when
+     the card being priced IS an auto or a patch. A variation needs the
+     same protection for a different reason: titleLooksParallel() sees
+     the word "Variation" and drops the sale as a parallel, so a query
+     that finally found the right comps would have them filtered out
+     one step later.
+
+     Read off the QUERY, exactly as the other two guards are, so it
+     only fires when the variation term genuinely made it into the
+     search rather than on anything the model merely guessed. */
+  const targetIsVariation = /\b(variation|ssp|sssp)\b/i.test(String(query || ""));
+
   /* Whatever the card IS, its own kind must not be filtered out.
 
      NOT_THE_CARD keeps four-figure autographs out of a BASE card's
@@ -1954,7 +1980,7 @@ function summarizeSold(records, query, limitUsed) {
      meaning what its label says is worse than a number with a caveat. */
   const filt = { rawBase: 0, rawAll: 0, rawFellBack: false, rawThin: false };
   const narrow = function (group, tag) {
-    if (targetIsParallel || targetIsSpecial) return group;
+    if (targetIsParallel || targetIsSpecial || targetIsVariation) return group;
     const base = group.filter(looksBaseSale);
     if (tag === "raw") { filt.rawBase = base.length; filt.rawAll = group.length; }
     if (base.length >= MIN_GROUP) return base;
@@ -3023,6 +3049,16 @@ app.post(
 
       const cleanCardName = buildDisplayName(ai);
 
+      /* RESOLVED BEFORE THE MARKET LOOKUP, NOT AFTER.
+
+         lookupPrintCode() is pure -- a table read, no network -- so it
+         costs nothing to run here, and buildQueryTiers() needs the
+         answer to put the variation into the search. Resolving it
+         afterwards (which is where it started life, purely for
+         display) meant the price was already wrong by the time we knew
+         what the card was. */
+      ai.printCode = lookupPrintCode(ai.printCode, ai.year, ai.brand, ai.set);
+
       /* Verification runs alongside the price lookup rather than before
          it. Sequencing them would add its latency to every scan for a
          check that usually passes; in parallel it is nearly free in
@@ -3349,7 +3385,9 @@ app.post(
            Null rather than an empty object when there is nothing to
            report, so the frontend can tell "unread" from "read and
            unknown" — those need different prompts to the user. */
-        printCode:         lookupPrintCode(ai.printCode, ai.year, ai.brand, ai.set),
+        /* Already resolved above so the query could use it -- passed
+           straight through rather than looked up a second time. */
+        printCode:         ai.printCode,
         parallelCertain:   (function(){
           var claimed  = ai.parallelCertain === true;
           var hasPar   = !!String(ai.parallel || "").trim();
@@ -4854,7 +4892,18 @@ const PRINT_CODES = {
      knowing which set it came off. */
   "2025|topps chrome":   { "560": "Image Variation SP" },
   // ChecklistInsider, 2025 Topps Chrome Update Series: #CMP115697.
-  "2025|topps chrome update": { "697": "Image Variation SP" }
+  "2025|topps chrome update": { "697": "Image Variation SP" },
+  /* The best-sourced entry here. Beckett's variations guide and an
+     SI.com piece both state it outright: "if the number ends in 715,
+     this is just a base card... a card ending in 853, you have one of
+     the 25 players that have a variation."
+
+     Kept separate from 2024 Topps Chrome (the flagship), which is a
+     DIFFERENT product with different codes. Conflating the two is an
+     easy mistake -- one AI-written guide gave these same 715/853
+     figures for 2024-25 Chrome BASKETBALL, which is a third product
+     again and almost certainly wrong. */
+  "2024|topps chrome update": { "715": "Base / Refractor", "853": "Image Variation SP" }
 };
 
 /* The key has to survive how differently the same product gets named.
@@ -4926,6 +4975,44 @@ app.get("/api/print-code", (req, res) => {
   if (!r) return res.json({ success: false, error: "Give us at least three digits." });
   res.json(Object.assign({ success: true }, r));
 });
+
+/* THE CODE WAS BEING DISPLAYED AND THEN IGNORED.
+
+   lookupPrintCode() resolves "this is an Image Variation SP" and the
+   scanner prints it. The query never saw it -- so a card confirmed as
+   an SSP was still priced against base comps, which is the exact
+   failure the feature exists to prevent.
+
+   It is the same bug isAutograph had in August: a field read correctly
+   off the card, reported to the user, and then dropped before the
+   search. A four-figure auto priced off a $70 base card, because the
+   query never carried the word "auto".
+
+   VARIATIONS ARE WORSE THAN AUTOS ON THIS, not better. An image
+   variation is visually identical to the base card from the front, so
+   nothing downstream can catch the mistake -- there is no spread
+   warning, no contamination check, no ladder gap. The pool looks clean
+   because it IS clean; it is just the wrong card's pool.
+
+   ONLY A CONFIRMED CODE FROM A KNOWN PRODUCT EARNS A TERM. An unknown
+   product, an unlisted code, or a base-card code all return nothing.
+   A guess here prices a common as a short print, which is wrong by a
+   multiple in the direction that flatters. */
+function variationSearchTerm(pc) {
+  if (!pc || !pc.known || !pc.label) return "";
+  if (pc.isBase) return "";            // base is the default; adding it narrows for nothing
+
+  /* Sellers do not write "Image Variation SP" in a title. They write
+     "Image Variation", "SP", "SSP", or "Variation". Mapped to the
+     words that actually appear on eBay rather than to our own label. */
+  var L = String(pc.label).toLowerCase();
+  if (L.indexOf("super short print") > -1 || /\bsssp\b/.test(L)) return "SSP Variation";
+  if (/\bssp\b/.test(L))                                          return "SSP Variation";
+  if (L.indexOf("image variation") > -1)                          return "Image Variation";
+  if (L.indexOf("advanced stats") > -1)                           return "Advanced Stats";
+  if (L.indexOf("variation") > -1 || /\bsp\b/.test(L))            return "Variation";
+  return "";
+}
 
 const VERIFY_MAX_CANDIDATES = 5;
 
