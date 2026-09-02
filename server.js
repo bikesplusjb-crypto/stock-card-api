@@ -4838,9 +4838,23 @@ const PRINT_CODES = {
   // Cardboard Connection, 2022 Topps Series 1 / 2023 Topps Series 1 guides
   "2023|topps series 1": { "565": "Base", "585": "SSP Variation",
                            "587": "Advanced Stats (/300)" },
-  // Beckett, "2026 Topps Chrome Baseball Variations Guide"
+  // Beckett, otia.com and Sports Card Portal all give the same three
+  // for 2026 Chrome -- the best-corroborated entry in this table.
   "2026|topps chrome":   { "539": "Base Refractor", "752": "Image Variation SP",
-                           "156": "Super Short Print Image Variation" }
+                           "156": "Super Short Print Image Variation" },
+  /* ChecklistInsider, 2025 Topps Chrome: Image Variations carry
+     #CMP104560. No base code found in any guide, which is why only the
+     variation is listed -- a table that guesses a base code would
+     report every base card as "unlisted" and look broken.
+
+     NOTE THE COLLISION, IT IS REAL AND NOT A MISTAKE: 560 is also the
+     SP Variation code in 2022 Topps Series 1. Two unrelated products,
+     same three digits. That is the whole reason this table is keyed by
+     product rather than by code -- a bare "560" means nothing without
+     knowing which set it came off. */
+  "2025|topps chrome":   { "560": "Image Variation SP" },
+  // ChecklistInsider, 2025 Topps Chrome Update Series: #CMP115697.
+  "2025|topps chrome update": { "697": "Image Variation SP" }
 };
 
 /* The key has to survive how differently the same product gets named.
@@ -4853,6 +4867,13 @@ function printCodeKey(year, brand, setName) {
   var t = (String(brand || "") + " " + String(setName || "")).toLowerCase()
     .replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
   t = t.replace(/\bseries one\b/g, "series 1").replace(/\bseries two\b/g, "series 2");
+  /* Update BEFORE plain Chrome. "2025 Topps Chrome Update Series"
+     contains "chrome", so testing chrome first would swallow it and
+     report Update cards against the wrong product's codes -- which,
+     given 560 and 697 are different variations, would be a confidently
+     wrong short-print call. */
+  if (/\btopps\b/.test(t) && /\bchrome\b/.test(t) && /\bupdate\b/.test(t))
+    return y + "|topps chrome update";
   if (/\btopps\b/.test(t) && /\bchrome\b/.test(t))    return y + "|topps chrome";
   if (/\btopps\b/.test(t) && /\bseries 1\b/.test(t))  return y + "|topps series 1";
   if (/\btopps\b/.test(t) && /\bupdate\b/.test(t))    return y + "|topps update";
