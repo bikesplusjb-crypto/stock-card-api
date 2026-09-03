@@ -3417,6 +3417,36 @@ app.post(
            yearCorrection below. Separate field so nothing has to
            infer which search produced which number. */
         soldQuery:         soldQuery,
+        /* A SERIAL READ OFF THE CARD AND THEN DROPPED BEFORE THE PRICE.
+           THIS IS THE $2 BUG.
+
+           serialDenominator() correctly turns "03/20" into "/20" and
+           puts it in the TIGHT query. When that query finds nothing --
+           and eBay frequently will not match "/20" -- the broadening
+           chain falls back to set-noNum, core or loose, none of which
+           carry the serial. The card then prices against base copies.
+
+           The comment above the tier builder claims a misread serial
+           "costs one empty query rather than a wrong price." That is
+           wrong, and this is the proof: a real user saved a 2025 Topps
+           Finest Bo Nix 03/20 on 23 August and CardGauge valued it at
+           $2. A numbered /20 rookie is not a $2 card. They put 25
+           high-end cards in that day and never came back.
+
+           It is the same shape as an unverified parallel being dropped
+           and the same shape as the auto bug in August: a field the
+           model read CORRECTLY, removed before the search, and the
+           fallback silently prices a different card. Nothing downstream
+           catches it, because the comps really are clean -- they are
+           just the wrong card's comps.
+
+           So say it. The flag is true only when a serial was actually
+           read AND the query that produced the price does not contain
+           it -- never on a guess, never on a card with no serial. */
+        serialDropped:     !!(serialDenominator(ai)
+                              && String(soldQuery || "").indexOf(serialDenominator(ai)) < 0
+                              && String(searchQuery || "").indexOf(serialDenominator(ai)) >= 0),
+        serialRead:        serialDenominator(ai) || "",
         yearCorrection:    yearCorrection,
         soldBroadened:     soldBroadened,
         sold:              sold || null,
