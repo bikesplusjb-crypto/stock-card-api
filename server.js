@@ -1053,10 +1053,43 @@ function hasWord(hay, word) {
 }
 
 /* True when a listing is something other than the card itself. */
-function notTheCard(title) {
+function notTheCardWord(title) {
   const t = " " + String(title || "").toLowerCase().replace(/[^a-z0-9 -]/g, " ")
                     .replace(/\s+/g, " ") + " ";
-  return NOT_THE_CARD.some(w => hasWord(t, w));
+  return NOT_THE_CARD.find(w => hasWord(t, w)) || null;
+}
+
+function notTheCard(title) {
+  return notTheCardWord(title) !== null;
+}
+
+const REJECT_LABELS = [
+  [/\blot\b|\blots\b|\bbundle\b|\bset of\b|\bcards?\b\s*\d+\s*\bcount\b/i, "Multi-card lot"],
+  [/auto|sign/i,        "Autograph"],
+  [/patch|relic|jersey|memorabilia|game.?used/i, "Relic or patch"],
+  [/reprint|custom|proxy|aceo|novelty/i,         "Reprint or custom"],
+  [/redemption/i,       "Redemption"],
+  [/break|repack|mystery|pack\b|box\b|case\b/i, "Break or repack"]
+];
+
+function rejectLabelFor(word) {
+  const w = String(word || "");
+  for (let i = 0; i < REJECT_LABELS.length; i++) {
+    if (REJECT_LABELS[i][0].test(w)) return REJECT_LABELS[i][1];
+  }
+  return "Not this card";
+}
+
+function saleRejectReason(r) {
+  if (r.printRun != null && r.printRun > 0) {
+    return { rule: "print_run", reason: "Numbered /" + r.printRun };
+  }
+  const w = notTheCardWord(r.title);
+  if (w) return { rule: "not_the_card:" + w, reason: rejectLabelFor(w) };
+  if (titleLooksParallel(r.title, "")) {
+    return { rule: "parallel", reason: "Different parallel" };
+  }
+  return null;
 }
 
 function cleanVal(v) {
@@ -1979,9 +2012,18 @@ function summarizeSold(records, query, limitUsed) {
      is recorded here and reported below. A number that quietly stopped
      meaning what its label says is worse than a number with a caveat. */
   const filt = { rawBase: 0, rawAll: 0, rawFellBack: false, rawThin: false };
+  const rejected = [];
   const narrow = function (group, tag) {
     if (targetIsParallel || targetIsSpecial || targetIsVariation) return group;
-    const base = group.filter(looksBaseSale);
+    const base = [];
+    group.forEach(function (r) {
+      const why = saleRejectReason(r);
+      if (!why) { base.push(r); return; }
+      if (tag === "raw") {
+        rejected.push({ price: r.price, title: r.title,
+                        rule: why.rule, reason: why.reason });
+      }
+    });
     if (tag === "raw") { filt.rawBase = base.length; filt.rawAll = group.length; }
     if (base.length >= MIN_GROUP) return base;
     /* THE FALLBACK NO LONGER RUNS FOR THE RAW BASE POOL.
@@ -2191,6 +2233,46 @@ function summarizeSold(records, query, limitUsed) {
     soldBasis:     limited ? "limited" : basis,
     soldWarning:   warning,
     soldContaminated: contaminated,
+    /* COMPGUARD — the sales that were NOT used, and why.
+
+       Every one of these was already being excluded; the only change is
+       that the reason is kept instead of discarded. Nothing new is
+       fetched. `verified` is deliberately not called "exact": these
+       sales passed the rejection rules, which is a weaker and more
+       honest claim than establishing identical identity.
+
+       Graded sales are listed as excluded rather than rejected when the
+       headline is raw — they are a different condition of the same card,
+       not the wrong card. */
+    compGuard: (function () {
+      const groups = {};
+      rejected.forEach(function (x) {
+        if (!groups[x.reason]) groups[x.reason] = { reason: x.reason, count: 0, rules: {} };
+        groups[x.reason].count++;
+        groups[x.reason].rules[x.rule] = (groups[x.reason].rules[x.rule] || 0) + 1;
+      });
+      if (basis === "raw" && gradedAll.length) {
+        gradedAll.forEach(function (r) {
+          const label = "Graded" + (r.grader ? " " + r.grader : "") +
+                        (r.grade ? " " + r.grade : "");
+          if (!groups[label]) groups[label] = { reason: label, count: 0, rules: {} };
+          groups[label].count++;
+          groups[label].rules["graded"] = (groups[label].rules["graded"] || 0) + 1;
+        });
+      }
+      const reasons = Object.keys(groups).map(function (k) { return groups[k]; })
+        .sort(function (a, b) { return b.count - a.count; });
+      const leftOut = reasons.reduce(function (a, g) { return a + g.count; }, 0);
+      return {
+        verified:  headline.length,
+        considered: clean.length,
+        leftOut:   leftOut,
+        reasons:   reasons,
+        samples:   rejected.slice(0, 6).map(function (x) {
+                     return { price: x.price, reason: x.reason };
+                   })
+      };
+    })(),
     soldMedianAll: median(prices),
     soldCountUsed: headline.length,
     /* The frontend prints "100+" when the count hits the limit, because a
