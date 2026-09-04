@@ -2392,12 +2392,50 @@ async function writeSoldCache(key, query, payload) {
 // builds its own price history without paying for deep lookback.
 async function recordPriceHistory(key, query, sold, askMedian) {
   if (!supabaseAdmin || !sold || !sold.soldCount) return;
+
+  /* THE MEDIAN AND THE COUNTS ARE TWO DIFFERENT DECISIONS.
+
+     Both gates below still refuse to write a median, for the reasons
+     they give. But they used to return before writing ANYTHING, and the
+     rejection counts are most interesting on exactly the scans they
+     reject: a contaminated pool is a pool full of wrong cards, and a
+     limited one is a pool the rules emptied. Those are the rows that
+     say what CompGuard is actually catching, and they were the rows
+     being thrown away.
+
+     So the counts are written on every scan with sold data. The median
+     stays gated. A row with counts and a null median is not a gap in
+     the series -- it is the record of a day the number could not
+     honestly be called. */
+  const guard = (sold && sold.compGuard) || null;
+  const guardCols = guard ? {
+    verified_count:   guard.verified,
+    considered_count: guard.considered,
+    left_out_count:   guard.leftOut,
+    reasons:          guard.reasons || null
+  } : {};
+
+  async function writeCountsOnly(why) {
+    if (!guard) return;
+    try {
+      await supabaseAdmin.from("card_price_history").upsert(Object.assign({
+        cache_key:  key,
+        card_query: query,
+        sale_date:  new Date().toISOString().slice(0, 10),
+        sold_count: sold.soldCount || 0
+        /* No median, no low, no high. Withheld on purpose -- see the
+           gate that sent us here. */
+      }, guardCols), { onConflict: "cache_key,sale_date" });
+      console.log("[history] counts-only row for " + query + " — " + why);
+    } catch (e) {}
+  }
   /* A contaminated median must not enter the permanent series. The
      cached payload expires in twelve hours; a history row does not, and
      a bad point poisons every movement arrow computed against it. */
   if (sold.soldContaminated) {
     console.log("[history] skipped CONTAMINATED median for " + query +
                 " — wrong cards remain in the headline pool");
+    await writeCountsOnly("contaminated");
     return;
   }
   /* Limited is a different reason for the same decision, and it needs
@@ -2416,6 +2454,7 @@ async function recordPriceHistory(key, query, sold, askMedian) {
   if (sold.soldLimited) {
     console.log("[history] skipped LIMITED median for " + query +
                 " — comps were clean but too thin to price from");
+    await writeCountsOnly("limited");
     return;
   }
   try {
@@ -2429,7 +2468,11 @@ async function recordPriceHistory(key, query, sold, askMedian) {
       sold_count:    sold.soldCount || 0,
       ask_median:    safeNumber(askMedian, 0) || null,
       raw_median:    (sold.soldRaw && sold.soldRaw.median) || null,
-      graded_median: (sold.soldGraded && sold.soldGraded.median) || null
+      graded_median: (sold.soldGraded && sold.soldGraded.median) || null,
+      verified_count:   guard ? guard.verified   : null,
+      considered_count: guard ? guard.considered : null,
+      left_out_count:   guard ? guard.leftOut    : null,
+      reasons:          guard ? (guard.reasons || null) : null
     }, { onConflict: "cache_key,sale_date" });
   } catch (e) {}
 }
