@@ -912,17 +912,40 @@ function resolvePokemonSet(ai) {
 
 function isLikelyCardListing(title) {
   const t = String(title || "").toLowerCase();
+  /* A SEALED BOX IS NOT A CARD, AND IT USED TO PASS AS ONE.
+
+     "hobby box" and "sealed" sat in the POSITIVE list, so a $1 listing
+     for a 2025 Bowman Pro Debut hobby box counted as a listing for the
+     single card being scanned. On a card with no completed sales that
+     one box became the entire ask pool, and the app built a full
+     recommendation on it: "not worth selling, fees cost more than the
+     card", a grade ladder of $1/$1/$3/$7, and a sell calculation --
+     for a green /99 autograph.
+
+     Wrong in the most damaging direction. A hobby box costs more than
+     most singles, so it can just as easily invent a card that is worth
+     hundreds. Sealed product, packs, cases, breaks and lots all price
+     on entirely different logic and none of them are the card in
+     somebody's hand. */
   const positive = [
     "card","cards","psa","bgs","cgc","sgc","rookie","rc",
     "topps","bowman","panini","prizm","select","optic",
-    "pokemon","pokémon","holo","reverse holo","booster",
-    "hobby box","sealed","chrome","refractor","auto","autograph",
+    "pokemon","pokémon","holo","reverse holo",
+    "chrome","refractor","auto","autograph",
     "patch","parallel","graded","slab"
   ];
   const negative = [
     "poster","plush","figure","toy","shirt","t-shirt","costume",
     "sticker only","keychain","funko","blanket","pillow","wallet",
-    "phone case","digital","code card only"
+    "phone case","digital","code card only",
+    /* Sealed product and multi-card listings. Negative wins over
+       positive below, so these override a title that also says
+       "topps" or "chrome" -- which every box does. */
+    "hobby box","blaster box","mega box","booster box","booster bundle",
+    "booster pack","factory sealed","sealed box","sealed case","hobby case",
+    "wax pack","wax box","fat pack","hanger box","tin sealed",
+    "break slot","random team","case break","box break",
+    "lot of","card lot","bulk lot","repack","mystery box","mystery pack"
   ];
   return positive.some(w => t.includes(w)) && !negative.some(w => t.includes(w));
 }
