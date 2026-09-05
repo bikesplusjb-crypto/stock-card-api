@@ -3529,6 +3529,75 @@ app.post(
          calls -- one per remaining tier -- and only on cards that would
          otherwise show no price at all. It stops at the first tier that
          produces a usable number, so the common case is one. */
+      /* ── EVERYTHING CAME BACK EMPTY. TRY THIS YEAR. ──────────────
+
+         Measured across three consecutive scans on 5 Sept: a Kevin
+         McGonigle Chrome rookie read as 2023, a Nolan Ryan retro
+         insert as 2021, a Pete Alonso as 2023. All three are 2026
+         cards. The McGonigle is the clean proof -- "2023 topps kevin
+         mcgonigle #16" returned 3 sales and no usable median, and
+         "2026 topps kevin mcgonigle #16" returned ONE HUNDRED sales at
+         a $17 median. One number was the whole difference.
+
+         The cause is not retro designs or anniversary names, which is
+         what two rounds of prompt instruction assumed. It is simpler:
+         the model's training ended before 2026 products existed, so it
+         does not reach for the current year even when the copyright
+         line says so. No wording fixes a year it will not consider.
+
+         detectListingYear() already corrects this WHEN THERE ARE
+         LISTINGS to vote -- three or more carrying a year, none
+         supporting the claimed one. On these cards there were zero
+         listings, so it could never fire. An empty result is exactly
+         the case it cannot see.
+
+         But empty IS the signal. When every tier finds nothing at all,
+         the year is the likeliest reason, and there is one obvious
+         candidate to try. Costs one extra call, and only on cards that
+         would otherwise show no price whatsoever.
+
+         ADOPTED ONLY ON REAL SALES, same rule the listing-based
+         correction uses. A retry that also finds nothing proves
+         nothing and the original stands. And the identification is
+         left alone -- this changes which sales were counted, not what
+         the card is claimed to be. */
+      let yearGuess = null;
+      if (!sold || !sold.soldCount) {
+        const claimed = parseInt(ai.year, 10);
+        const nowYear = new Date().getFullYear();
+        /* Only worth trying when the model named a year at all, and
+           only when that year is in the past. A card already read as
+           this year has nothing to correct to. */
+        if (claimed >= 1860 && claimed < nowYear) {
+          for (const tryYear of [nowYear, nowYear - 1]) {
+            if (tryYear === claimed) continue;
+            const q = swapYearInQuery(searchQuery, String(claimed), String(tryYear));
+            if (!q || q === searchQuery) continue;
+            const alt = await getSoldComps(q, market.avgPrice);
+            /* The same bar the broadening retry applies: real sales,
+               a usable median, and a pool the engine will stand
+               behind. A contaminated or limited result is not an
+               answer, it is a different way of having none. */
+            if (alt && alt.soldCount > 0 && !alt.soldLimited && !alt.soldContaminated
+                && Number(alt.soldMedian) > 0) {
+              sold      = alt;
+              soldQuery = q;
+              yearGuess = {
+                claimedYear: String(claimed),
+                triedYear:   String(tryYear),
+                found:       alt.soldCount,
+                note: "No sales exist for a " + claimed + " version of this card, but " +
+                      alt.soldCount + " came back for " + tryYear + ". The year on the " +
+                      "back is the one to trust \u2014 tap the year box if this is wrong."
+              };
+              console.log("[scan] empty-result year guess: " + claimed + " -> " + tryYear +
+                          " (" + alt.soldCount + " sales)");
+              break;
+            }
+          }
+        }
+      }
+
       let soldBroadened = null;
       if ((!sold || !sold.soldCount) && !yearCorrection) {
         const tiers   = buildQueryTiers(ai) || [];
@@ -3750,6 +3819,11 @@ app.post(
                               && String(searchQuery || "").indexOf(serialDenominator(ai)) >= 0),
         serialRead:        serialDenominator(ai) || "",
         yearCorrection:    yearCorrection,
+        /* Reported separately from yearCorrection, which is the
+           listing-vote path. This one fired because NOTHING came back
+           at all, which is a different piece of evidence and deserves
+           its own field rather than being blended into one. */
+        yearGuess:         yearGuess,
         soldBroadened:     soldBroadened,
         sold:              sold || null,
         askVsSold:         askVsSold(market, sold),
