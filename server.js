@@ -2064,7 +2064,18 @@ const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
    The cost is one fresh API call per card tomorrow instead of a cache
    hit. Today's usage was around 2% of the daily allowance, so this is
    not the thing to economise on. */
-const SOLD_LOGIC_VERSION = 3;
+/* v3 -> v4 (2026-09-05). The parallel word list gained short prints
+   and the 2026 flagship finishes -- ssp, variation, mirror,
+   sandglitter, diamante, sun and the rest. Every v3 row was computed
+   by a filter that let those through as base cards, so serving them
+   back hides the fix completely.
+
+   Caught the hard way: the Eldridge was rescanned immediately after
+   the filter change and returned the same $400 median, because the
+   cache key had not moved. That is precisely what this constant
+   exists to prevent, and it was left at 3 while the logic underneath
+   it changed. */
+const SOLD_LOGIC_VERSION = 4;
 
 /* The cache key must carry the limit. Without it a 50-record compact pull
    gets stored under the same key as a full lookup and is then served back
