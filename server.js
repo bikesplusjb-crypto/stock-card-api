@@ -1975,7 +1975,37 @@ function summarizeSold(records, query, limitUsed) {
       grade:       r.grade != null ? String(r.grade) : null,
       printRun:    r.print_run != null ? Number(r.print_run) : null,
       platform:    r.platform || null,
-      url:         r.listing_url || null,
+      /* THE SALE ROWS WERE THE ONLY UNTAGGED LINKS ON THE PAGE.
+
+         Traced from a real conversion on 4 Sept: somebody scanned a
+         Bobby Witt Jr., read the result, clicked THREE individual sale
+         rows, and then clicked "Shop this card on eBay" and bought a
+         $400 card. Only that last click carried the affiliate tag. The
+         three that came first -- the ones where they were actually
+         deciding -- went to eBay for nothing.
+
+         Every other outbound link in this app goes through
+         addAffiliateToUrl(). These came straight from thecardapi's
+         listing_url and were rendered as-is, which is easy to miss
+         because they look identical to the person clicking.
+
+         TAGGED ONLY WHEN THE DESTINATION IS EBAY. thecardapi aggregates
+         several marketplaces and carries the source in `platform`;
+         appending eBay campaign parameters to a Goldin or PWCC URL
+         would be meaningless at best and could break the link. The host
+         is checked rather than trusting the platform string, since the
+         URL is what actually decides where the click lands. */
+      url:         (function () {
+                     var u = r.listing_url || null;
+                     if (!u) return null;
+                     try {
+                       var h = new URL(u).hostname.toLowerCase();
+                       if (h === "ebay.com" || h.endsWith(".ebay.com")) {
+                         return addAffiliateToUrl(u);
+                       }
+                     } catch (e) { /* not a URL we can parse — leave it alone */ }
+                     return u;
+                   })(),
       image:       r.thumbnail_url || r.image_url || null,
       confirmed:   r.price_confirmed !== false
     }))
