@@ -1217,6 +1217,70 @@ function cardNumberToken(ai) {
 
 // The serial DENOMINATOR is searchable ("/99"). The copy number is not.
 // "/1" is excluded because it substring-matches /10, /15, /199 etc.
+
+/* ── A SERIAL THAT CANNOT EXIST ─────────────────────────────────
+
+   Read off a real card, 5 Sept: a 2026 Topps Chrome retro insert
+   numbered 24/25 came back as serialNumber "26/25". Copy 26 of a print
+   run of 25 -- there is no such card. The 26 is almost certainly the
+   COPYRIGHT YEAR bleeding into the field: the model was looking at
+   2026 and put it where the serial goes.
+
+   That nonsense then travelled everywhere at once, because three
+   separate things read this field: buildDisplayName() put "26/25" in
+   the card name, serialDenominator() put "/25" in the query, and the
+   response handed both to the scanner. Sanitising at any one of those
+   would leave the other two wrong, so it happens here, once, before
+   anything reads it.
+
+   THE SAME RULE THE TYPED PATH ALREADY ENFORCES. parseSerialInput() in
+   the scanner refuses a numerator larger than its denominator, because
+   somebody typing 26/25 has made a mistake. Nothing applied that test
+   to what the MODEL returned -- so a person could not enter an
+   impossible serial, but the scanner could hand them one.
+
+   Dropped rather than corrected. We know 26/25 is wrong; we do not
+   know whether the truth is 24/25, 25/25 or 6/25, and guessing which
+   would put a different wrong number on the card. An empty serial
+   makes the scanner's own serial box appear in its "type it in" state,
+   which is the honest outcome: the person is holding the card. */
+function sanitiseSerial(ai) {
+  const raw = String((ai && ai.serialNumber) || "").trim();
+  if (!raw) return { value: "", dropped: false, reason: "" };
+
+  const m = raw.match(/(\d{1,5})\s*\/\s*(\d{1,5})/);
+  if (!m) {
+    /* No fraction in it at all. Not necessarily wrong -- "1/1" and
+       "One of One" both arrive in odd shapes -- so anything without
+       digits on both sides of a slash is left exactly as read. */
+    return { value: raw, dropped: false, reason: "" };
+  }
+
+  const num = parseInt(m[1], 10);
+  const den = parseInt(m[2], 10);
+
+  if (!den) {
+    return { value: "", dropped: true, reason: "denominator of zero" };
+  }
+  if (num > den) {
+    return { value: "", dropped: true,
+             reason: "copy " + num + " of a print run of " + den };
+  }
+  if (num === 0) {
+    return { value: "", dropped: true, reason: "copy zero" };
+  }
+
+  /* A print run in the thousands is nearly always a SET TOTAL that has
+     been mistaken for serial numbering -- Pokemon's 4/102, a card
+     numbered 113/250 in a 250-card set. The frontend applies the same
+     ceiling to typed input; this applies it to what was read. */
+  if (den > 999) {
+    return { value: "", dropped: true, reason: "print run of " + den + " (likely a set total)" };
+  }
+
+  return { value: raw, dropped: false, reason: "" };
+}
+
 function serialDenominator(ai) {
   const s = cleanVal(ai.serialNumber);
   const m = s.match(/(\d+)\s*\/\s*(\d+)/);
@@ -1577,6 +1641,21 @@ function selectListings(ai, byTier) {
   const isParallel = terms.length > 0 || !!denom;
   const MIN = 4;
 
+  /* IS THE CARD ITSELF AN AUTO, A PATCH, OR A ONE-OF-ONE?
+
+     notTheCard() removes autographs, patches, relics, lots and
+     reprints from a pool, which is right for an ordinary card and
+     catastrophic for a card that IS one of those -- it would empty the
+     pool of the only comps that describe it.
+
+     Read from the scan's own flags rather than from the query string,
+     because the query is not always carrying them: a parallel that is
+     also an auto builds a tight query from year, brand, set, player,
+     parallel and number, and the word "auto" may or may not survive
+     the tier that got used. The flags are what the model read off the
+     card. */
+  const targetIsSpecial = !!(ai && (ai.isAutograph || ai.isPatch));
+
   const tight = byTier.tight || [];
 
   // For a BASE card the tight query is identical to the core query, so it
@@ -1588,6 +1667,28 @@ function selectListings(ai, byTier) {
       if (tightBase.length >= 3) {
         return { listings: tightBase, matchQuality: "exact", tierUsed: "tight-base",
                  note: "Priced from base-card listings; parallels excluded." };
+      }
+    } else if (!targetIsSpecial) {
+      /* A PARALLEL IS NOT AUTOMATICALLY AN AUTOGRAPH, AND THIS BRANCH
+         USED TO TREAT IT AS IF IT MIGHT BE.
+
+         A base card got autos, patches, lots and reprints stripped out
+         above. A parallel fell straight through to the return below
+         with none of that applied -- so an Orange Parallel with no
+         signature on it was priced against "Orange Parallel Auto"
+         listings sitting in the same results. Reported from a real
+         scan: the card is not an auto and the comps were.
+
+         titleLooksParallel is deliberately NOT applied here. Filtering
+         parallels out of a parallel's own pool would leave nothing,
+         which is the reason this branch skipped filtering in the first
+         place. But "is this a different FINISH of my card" and "is
+         this a signed version of my card" are separate questions, and
+         only the first one had to be skipped. */
+      const tightSame = tight.filter(l => !notTheCard(l.title));
+      if (tightSame.length >= 3) {
+        return { listings: tightSame, matchQuality: "exact", tierUsed: "tight-parallel",
+                 note: "Priced from listings for this parallel; autos, relics and lots excluded." };
       }
     }
     return { listings: tight, matchQuality: "exact", tierUsed: "tight",
@@ -1605,6 +1706,15 @@ function selectListings(ai, byTier) {
              .forEach(l => { ids[l.title] = l; });
       matched = Object.keys(ids).map(k => ids[k]);
     }
+    /* Same gap, one tier wider. matched only asks whether the parallel
+       words appear -- so "Green Refractor Auto" passes as a Green
+       Refractor. An auto is a different card at a different price, and
+       unless the card in hand is one, it does not belong in the pool. */
+    if (!targetIsSpecial) {
+      const clean = matched.filter(l => !notTheCard(l.title));
+      if (clean.length >= 2) matched = clean;
+    }
+
     if (matched.length >= 2) {
       const thin = matched.length < 4;
       return { listings: matched,
@@ -3214,6 +3324,17 @@ app.post(
       if (!front) return res.status(400).json({ success: false, error: "Front image required" });
 
       const ai = await scanWithOpenAI(front, back);
+
+      /* BEFORE ANYTHING READS IT. The display name, the query builder
+         and the response all consume ai.serialNumber independently, so
+         an impossible value has to be removed at the source or two of
+         the three keep it. */
+      const serialCheck = sanitiseSerial(ai);
+      if (serialCheck.dropped) {
+        console.log("[scan] dropped impossible serial \"" + (ai.serialNumber || "") +
+                    "\" — " + serialCheck.reason);
+        ai.serialNumber = "";
+      }
 
       /* An insert is not the base card and does not trade like one. The
          model now reports it separately; folding it into `set` is what
