@@ -3686,12 +3686,50 @@ async function fetchPsaCert(certNumber) {
   const clean = String(certNumber || "").replace(/[^0-9]/g, "");
   if (!clean) return { ok: false, reason: "No cert number provided" };
 
+  /* A PASTED TOKEN CAN CARRY WHITESPACE, AND IT GOES STRAIGHT INTO THE
+     HEADER. Copying from a web page into Render's environment field
+     routinely picks up a trailing newline or space. The value looks
+     correct in the dashboard and produces a malformed Authorization
+     header that no amount of regenerating fixes. Costs nothing to rule
+     out. */
+  const token = String(PSA_API_TOKEN).trim();
+
   try {
     const r = await fetch(PSA_API_BASE + "/cert/GetByCertNumber/" + clean, {
-      headers: { Authorization: "bearer " + PSA_API_TOKEN }
+      /* THE REQUEST WAS TECHNICALLY CORRECT AND STILL REFUSED.
+
+         PSA's own documentation says a 4xx means the request path is
+         wrong -- and it is not: a freshly generated token, a valid cert
+         number and the documented URL all returned 403, repeatedly,
+         from Render.
+
+         What the old request did NOT send is everything a normal client
+         sends. node-fetch identifies itself as "node-fetch/1.0" and
+         supplies no Accept header at all. Coming from a datacenter IP,
+         that is the exact signature a WAF drops before the application
+         ever sees it -- which is consistent with a 403 that ignores the
+         credentials entirely.
+
+         PSA's own examples are jQuery and curl, both of which send an
+         ordinary client identity. This makes the request look like the
+         examples they document. If it still 403s, the block is on the
+         IP or the account and no header will move it. */
+      headers: {
+        Authorization: "bearer " + token,
+        "Accept":       "application/json",
+        "Content-Type": "application/json",
+        "User-Agent":   "CardGauge/1.0 (+https://www.cardgauge.com)"
+      }
     });
     if (!r.ok) {
-      console.log("[psa] HTTP " + r.status + " for cert " + clean);
+      /* The body usually says WHY. A WAF block reads as an HTML
+         challenge page; an application-level refusal reads as JSON with
+         a message. Those need completely different responses and the
+         old log could not tell them apart. */
+      let detail = "";
+      try { detail = (await r.text()).slice(0, 300).replace(/\s+/g, " "); } catch (e) {}
+      console.log("[psa] HTTP " + r.status + " for cert " + clean +
+                  (detail ? " | body: " + detail : " | (empty body)"));
       return { ok: false, reason: "PSA API returned " + r.status };
     }
     const body = await r.json();
