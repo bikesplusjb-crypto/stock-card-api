@@ -1000,7 +1000,35 @@ const TEXTURE_WORDS = [
   "refractor","xfractor","x-fractor","superfractor","holo","holofoil","foil",
   "shimmer","wave","mojo","disco","hyper","ice","cracked","laser","scope",
   "velocity","pulsar","sparkle","atomic","negative","speckle","vinyl",
-  "reactive","genesis","asia","choice","dragon","tiger","zebra"
+  "reactive","genesis","asia","choice","dragon","tiger","zebra",
+
+  /* ── SHORT PRINTS AND THE 2026 FLAGSHIP FINISHES ──────────────
+     A NUMBERED PARALLEL IS CAUGHT BY print_run. AN UNNUMBERED SHORT
+     PRINT IS CAUGHT BY NOTHING, AND THAT WAS THE HOLE.
+
+     Measured on a Bryce Eldridge base rookie, 5 Sept. Ten sold
+     records came back. The four numbered Golds and Bronzes were
+     correctly removed -- print_run did its job. What survived was a
+     "Golden Mirror SSP" at $400, a "Rookie Number Variation SSP" at
+     $450, and four genuine base sales between $2.25 and $5. Neither
+     SSP carries a print run, so nothing stopped them, and the base
+     card reported a $400 median. It trades around $2.
+
+     Same shape as the White Sox bug: a word list that did not know a
+     term, so a different card walked into the base pool. The finishes
+     below are the ones 2026 Topps flagship actually prints, read off
+     the listing titles rather than guessed.
+
+     "sun", "mirror" and "variation" are the ones to be careful with,
+     since each is an ordinary English word. hasWord() matches on word
+     boundaries, so "Sunday" and "Summer" do not trigger "sun" -- but
+     a title genuinely containing the standalone word would, and that
+     is the intended behaviour: in a card title, a bare "Sun" beside a
+     card number IS the parallel. */
+  "ssp","sssp","short print","variation","image variation",
+  "mirror","golden mirror","sandglitter","diamante","diamant\u00e9",
+  "sun","moon","aurora","prism","glitter","sapphire","emerald",
+  "flare","royal","chrome flare"
 ];
 /* Pokemon variants that move price as much as a Panini colour parallel
    does, and that were entirely missing here. 1st Edition vs Unlimited on
