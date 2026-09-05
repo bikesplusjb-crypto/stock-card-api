@@ -3730,7 +3730,39 @@ async function fetchPsaCert(certNumber) {
       try { detail = (await r.text()).slice(0, 300).replace(/\s+/g, " "); } catch (e) {}
       console.log("[psa] HTTP " + r.status + " for cert " + clean +
                   (detail ? " | body: " + detail : " | (empty body)"));
-      return { ok: false, reason: "PSA API returned " + r.status };
+
+      /* SAY WHAT HAPPENED IN WORDS SOMEBODY CAN ACT ON.
+
+         "PSA API returned 403" told the person nothing and told us
+         nothing either -- it took a body log to discover PSA's actual
+         answer: {"Message":"Access to this API is limited to approved
+         customers."} The account is not approved for API use. A token
+         generates for anyone signed in; using it needs permission we do
+         not have, which is why this has never worked since the day it
+         shipped.
+
+         Nothing here can fix that. What this CAN do is stop the app
+         looking broken over somebody else's permission setting, and
+         point at the path that still works -- the cert number and grade
+         are printed on the label, so typing the card in loses very
+         little. */
+      if (r.status === 403 || /approved customers/i.test(detail)) {
+        return { ok: false, unavailable: true,
+                 reason: "PSA lookup isn't available right now. The grade and card details "
+                       + "are printed on the label \u2014 type the card in and it'll price "
+                       + "the same way." };
+      }
+      if (r.status === 429) {
+        return { ok: false, unavailable: true,
+                 reason: "PSA is rate-limiting lookups right now. Try again shortly, or type "
+                       + "the card in from the label." };
+      }
+      if (r.status >= 500) {
+        return { ok: false, unavailable: true,
+                 reason: "PSA's server isn't responding. Type the card in from the label "
+                       + "and it'll price the same way." };
+      }
+      return { ok: false, reason: "PSA couldn't look that cert up (" + r.status + ")." };
     }
     const body = await r.json();
 
@@ -3776,7 +3808,10 @@ app.get("/api/psa-cert", async (req, res) => {
 
   const psa = await fetchPsaCert(certNumber);
   if (!psa.ok) {
-    return res.json({ success: false, error: psa.reason });
+    /* unavailable distinguishes "PSA is not answering us" from "that
+       cert does not exist". The first is our problem and should not
+       look like the person typed something wrong. */
+    return res.json({ success: false, error: psa.reason, unavailable: !!psa.unavailable });
   }
 
   const d = psa.data;
