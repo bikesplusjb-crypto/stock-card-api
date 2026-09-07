@@ -1724,7 +1724,13 @@ function selectListings(ai, byTier) {
                               : "Priced from listings for this exact card." };
   }
 
-  const wide = (byTier.core && byTier.core.length ? byTier.core : (byTier.loose || []));
+  /* SET-PRESERVING FIRST. getCardMarketForCard now fetches set-noNum
+     between tight and core; without naming it here, that fetch would
+     be paid for and then ignored, and the function would keep reaching
+     for core -- the tier that drops the set. Order is narrowest-first:
+     same set beats same player. */
+  const wide = (byTier.setNoNum && byTier.setNoNum.length ? byTier.setNoNum
+              : (byTier.core && byTier.core.length ? byTier.core : (byTier.loose || [])));
 
   if (isParallel && wide.length) {
     let matched = wide.filter(l => titleHasParallel(l.title, terms));
@@ -1969,19 +1975,58 @@ async function getCardMarketForCard(ai) {
 
   // Only widen when the tight search came back thin.
   if (!byTier.tight || byTier.tight.length < 4) {
-    const coreTier = tiers.find(t => t.tier === "core");
-    if (coreTier) byTier.core = await fetchEbayListings(coreTier.query);
-    if (!byTier.core || byTier.core.length < 4) {
-      const looseTier = tiers.find(t => t.tier === "loose");
-      if (looseTier) byTier.loose = await fetchEbayListings(looseTier.query);
+    /* THE SET-PRESERVING TIER WAS BUILT AND NEVER FETCHED.
+
+       buildQueryTiers() has produced a "set-noNum" tier for weeks --
+       year, brand, SET, player, minus the card number -- and this
+       function stepped straight past it from tight to core. Core drops
+       the set entirely, so the fix existed in the tier builder and was
+       only ever used by the sold-comps broadening chain. The listings
+       side never saw it.
+
+       Caught on a real scan, 7 Sept:
+
+         2023 Topps Bowman Chrome Sal Stewart Pink Parallel 258/299 RC
+         q = "2023 Topps Sal Stewart #6"   <- Bowman Chrome gone
+         tier = core-base, sold $1
+
+       A numbered Bowman Chrome parallel priced against Topps paper
+       base cards. Bowman Chrome and Topps flagship are different
+       products at different prices, and the card number is the term
+       sellers most often leave out of a title -- so dropping the set
+       and the number together is the worst possible order.
+
+       The comment above set-noNum in buildQueryTiers already says
+       exactly this: it was added after dropping the set in one step
+       swept a relic, a Foilboard and a 1987 insert into one pool. That
+       reasoning applies identically here.
+
+       Costs one extra eBay call, and only on cards where the tight
+       query already came back thin. */
+    const setTier = tiers.find(t => t.tier === "set-noNum");
+    if (setTier) byTier.setNoNum = await fetchEbayListings(setTier.query);
+
+    if (!byTier.setNoNum || byTier.setNoNum.length < 4) {
+      const coreTier = tiers.find(t => t.tier === "core");
+      if (coreTier) byTier.core = await fetchEbayListings(coreTier.query);
+      if (!byTier.core || byTier.core.length < 4) {
+        const looseTier = tiers.find(t => t.tier === "loose");
+        if (looseTier) byTier.loose = await fetchEbayListings(looseTier.query);
+      }
     }
   }
 
   const picked = selectListings(ai, byTier);
+  /* Which query the shown price actually came from. set-noNum has to
+     be named here too, or a card priced from the set tier would report
+     the core query -- and the "open this exact search" link would show
+     a different, broader set of results than the number above it. */
   const usedQuery =
     picked.tierUsed.indexOf("tight") === 0 ? (tightTier ? tightTier.query : tiers[0].query)
     : picked.tierUsed.indexOf("loose") === 0 ? ((tiers.find(t => t.tier === "loose") || tiers[0]).query)
-    : ((tiers.find(t => t.tier === "core") || tiers[0]).query);
+    : (byTier.setNoNum && byTier.setNoNum.length
+        ? ((tiers.find(t => t.tier === "set-noNum") || tiers[0]).query)
+        : ((tiers.find(t => t.tier === "core") || tiers[0]).query));
 
   if (!picked.listings.length) {
     return Object.assign(EMPTY_MARKET(usedQuery, "No clean card listings found"), {
