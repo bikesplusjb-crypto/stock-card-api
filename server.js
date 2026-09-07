@@ -1172,6 +1172,41 @@ function trimOverlap(setName, brandName) {
     .join(" ").trim();
 }
 
+
+/* ── "TOPPS BOWMAN CHROME" IS NOT A PRODUCT ANYBODY SELLS ────────
+
+   Bowman is a Topps property, and the copyright line on the back says
+   Topps, so the model reads brand=Topps and set=Bowman Chrome and both
+   are defensible. Joined together they produce "2023 Topps Bowman
+   Chrome Sal Stewart", which appears in no listing title anywhere:
+   sellers write "2023 Bowman Chrome Sal Stewart".
+
+   This was invisible until the set-preserving tier started reaching the
+   eBay query on 7 Sept. Before that the set was dropped entirely on the
+   fallback path, so the wrong prefix was dropped along with it -- wrong
+   in a way that accidentally matched. Now that the set survives, the
+   prefix has to be right.
+
+   catalogSetQuery() has done exactly this translation for the catalog
+   lookup for weeks, with a comment explaining that Bowman is a separate
+   brand in every catalog. That reasoning was never applied to the
+   search that actually finds the comps.
+
+   DISPLAY IS LEFT ALONE deliberately. The card really is a Topps
+   product and the binder sorts on brand; this changes only the string
+   used to ASK eBay, exactly as the catalog version does. */
+function brandForQuery(brand, setName) {
+  const b = String(brand || "").trim();
+  const s = String(setName || "").trim();
+  if (!b || !s) return b;
+  /* Bowman, Donruss and Panini's own lines carry their own name in the
+     set. Only Bowman collides this way in practice -- Topps prints it
+     and sellers file it under Bowman -- so the list stays at one entry
+     rather than guessing at others. */
+  if (/^topps$/i.test(b) && /^bowman\b/i.test(s)) return "";
+  return b;
+}
+
 function cardNumberToken(ai) {
   const n = cleanVal(ai.cardNumber);
   if (!n) return "";
@@ -1412,7 +1447,9 @@ function isPokemon(ai) {
 
 function buildQueryTiers(ai) {
   const year   = cleanVal(ai.year);
-  const brand  = cleanVal(ai.brand);
+  /* The brand as it will be SEARCHED, which is not always the brand as
+     it is displayed -- see brandForQuery. */
+  const brand  = brandForQuery(cleanVal(ai.brand), cleanVal(ai.set));
   const player = cleanVal(ai.player);
   const setRaw = cleanVal(ai.set);
   const poke   = isPokemon(ai);
