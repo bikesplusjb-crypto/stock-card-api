@@ -9,15 +9,11 @@
 ================================ */
 
 const express = require("express");
-/* BUYMAX — the buy-side decision engine.
-
-   Mounted at the bottom of this file rather than called inline
-   anywhere, so the existing scan and pricing routes are untouched by
-   it. buymax-adapter is not optional plumbing: it translates
-   CardGauge's refusals (soldContaminated, soldLimited) into the shape
-   BuyMax's provider recognises. Without it a contaminated pool would
-   arrive as an ordinary median and BuyMax would quote a buy ceiling
-   off sales this file already refuses to publish. */
+/* BuyMax — the buy-side decision engine. buymax-adapter translates
+   this file's own refusals (soldContaminated, soldLimited) into the
+   shape BuyMax expects; without it a contaminated pool would arrive as
+   an ordinary median and BuyMax would quote a ceiling off sales this
+   file already refuses to publish. */
 const { mountBuyMax } = require("./buymax");
 const { makeCardGaugeHook } = require("./buymax-adapter");
 const cors = require("cors");
@@ -8151,18 +8147,23 @@ app.post("/api/sendgrid-webhook", async (req, res) => {
 });
 
 
+/* BEFORE THE CATCH-ALL, WHICH IS THE WHOLE POINT.
+
+   Express matches in registration order, so anything mounted after the
+   404 below is registered, correct, and never reached. Mounted after
+   it once during setup: the service booted clean, both requires
+   resolved, and every BuyMax route returned this file's own "Endpoint
+   not found". A working mount and an unreachable one look identical
+   from the logs. */
+mountBuyMax(app, {
+  local: { getSoldComps: makeCardGaugeHook(getSoldComps) }
+});
+
 app.use((req, res) => {
   res.status(404).json({ success: false, error: "Endpoint not found" });
 });
 
 const PORT = process.env.PORT || 3000;
-
-/* Reads getSoldComps directly -- no HTTP hop back into this same
-   service, no second cache, and the same refusals the scanner applies.
-   Placed here because getSoldComps must already be defined. */
-mountBuyMax(app, {
-  local: { getSoldComps: makeCardGaugeHook(getSoldComps) }
-});
 
 app.listen(PORT, () => {
   console.log(`CardGauge backend running on port ${PORT}`);
