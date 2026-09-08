@@ -3531,6 +3531,122 @@ function swapYearInQuery(query, fromYear, toYear) {
   return q.replace(new RegExp("\\b" + fromYear + "\\b", "g"), toYear);
 }
 
+
+/* ══════════════════════════════════════════════════════════════
+   LEARNING FROM CORRECTIONS
+
+   68 corrections were made in five days -- a typed year, a chosen
+   parallel, a serial entered by hand -- and every one was logged as
+   loose text and never read again. Each is a labelled example where
+   the truth came from somebody holding the physical card, which is
+   the rarest data in this system and the only kind no competitor can
+   copy.
+
+   THE INSIGHT IS THAT A MODEL'S MISTAKES REPEAT. When GPT reads a
+   2026 Topps Chrome 70th Anniversary insert as 2021, it does not do
+   that once -- it does it every time, because the card is designed to
+   look like 1991 and the model's training ended before 2026 existed.
+   So a correction is not personal. The first person to fix it can fix
+   it for everybody after them.
+
+   APPLIED AS A SUGGESTION, NEVER A SILENT REWRITE. Same principle as
+   verifyAgainstCatalog: the read is reported as the model gave it,
+   and the correction is offered alongside with how many people made
+   it. A system that quietly changes what somebody scanned, on the
+   word of strangers, is worse than one that occasionally reads a year
+   wrong -- because nobody can see it happening.
+
+   TWO PEOPLE MINIMUM before it is surfaced at all. One correction
+   could be a typo, a different card that scanned similarly, or
+   somebody experimenting. Two independent people making the identical
+   correction to the identical misread is a pattern. */
+const CORRECTION_MIN_AGREEMENT = 2;
+
+async function recordCorrection(read, field, correctedTo, session) {
+  if (!supabaseAdmin) return;
+  try {
+    await supabaseAdmin.rpc("record_scan_correction", {
+      p_year:        String(read.year || ""),
+      p_brand:       String(read.brand || ""),
+      p_set:         String(read.set || ""),
+      p_card_number: String(read.cardNumber || ""),
+      p_player:      String(read.player || ""),
+      p_field:       field,
+      p_corrected_to: String(correctedTo || ""),
+      p_session:     String(session || "").slice(0, 64)
+    });
+  } catch (e) {
+    /* A correction that fails to save costs one data point. It must
+       never surface to the person, who has already been helped by
+       their own correction regardless of whether we learned from it. */
+    console.log("[learn] could not record correction:", e.message);
+  }
+}
+
+async function lookupCorrections(ai) {
+  if (!supabaseAdmin) return null;
+  try {
+    const { data, error } = await supabaseAdmin.rpc("get_scan_corrections", {
+      p_year:        String(ai.year || ""),
+      p_brand:       String(ai.brand || ""),
+      p_set:         String(ai.set || ""),
+      p_card_number: String(ai.cardNumber || ""),
+      p_player:      String(ai.player || "")
+    });
+    if (error || !Array.isArray(data) || !data.length) return null;
+
+    const trusted = data.filter(r => Number(r.times_seen) >= CORRECTION_MIN_AGREEMENT);
+    if (!trusted.length) return null;
+
+    /* One suggestion per field, the most-agreed. Two different
+       corrections to the same field means people disagree, and the
+       right answer there is to show the popular one rather than to
+       average two card numbers together. */
+    const byField = {};
+    trusted.forEach(function (r) {
+      if (!byField[r.field]) byField[r.field] = r;
+    });
+
+    return Object.keys(byField).map(function (k) {
+      return {
+        field: k,
+        suggested: byField[k].corrected_to,
+        agreement: Number(byField[k].times_seen),
+        note: byField[k].agreement === 1 ? "" :
+              byField[k].times_seen + " people scanning this card corrected the " +
+              k.replace("_", " ") + " to " + byField[k].corrected_to + "."
+      };
+    });
+  } catch (e) {
+    console.log("[learn] correction lookup failed:", e.message);
+    return null;
+  }
+}
+
+/* POST /api/correction
+   Called by the scanner when somebody fixes a read. Fire-and-forget
+   from the caller's side -- the correction has already been applied
+   locally and the person is not waiting on us to remember it. */
+app.post("/api/correction", async (req, res) => {
+  try {
+    const b = req.body || {};
+    const field = String(b.field || "");
+    if (["year","serial","parallel","card_number","set","player"].indexOf(field) < 0) {
+      return res.json({ success: false, error: "unknown field" });
+    }
+    await recordCorrection({
+      year:       b.readYear,
+      brand:      b.readBrand,
+      set:        b.readSet,
+      cardNumber: b.readCardNumber,
+      player:     b.readPlayer
+    }, field, b.correctedTo, b.session);
+    res.json({ success: true });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
 // ── /api/scan-card ─────────────────────────────────────────────
 app.post(
   "/api/scan-card",
@@ -3879,6 +3995,12 @@ app.post(
 
       const verification  = await verifyPromise;
 
+      /* What other people corrected on this same misread. Looked up
+         AFTER pricing rather than before, deliberately: this is a
+         second opinion offered alongside the result, not something
+         that silently changes the search. Costs one indexed lookup. */
+      const knownCorrections = await lookupCorrections(ai);
+
       console.log(
         "[scan] " + cleanCardName +
         " | back=" + (back ? "yes" : "no") +
@@ -4049,6 +4171,10 @@ app.post(
                               && String(soldQuery || "").indexOf(serialDenominator(ai)) < 0
                               && String(searchQuery || "").indexOf(serialDenominator(ai)) >= 0),
         serialRead:        serialDenominator(ai) || "",
+        /* Corrections other people made to this exact misread. Null
+           when nobody has, or when only one person has -- see
+           CORRECTION_MIN_AGREEMENT. */
+        knownCorrections:  knownCorrections,
         yearCorrection:    yearCorrection,
         /* Reported separately from yearCorrection, which is the
            listing-vote path. This one fired because NOTHING came back
@@ -4323,6 +4449,296 @@ app.get("/api/psa-cert", async (req, res) => {
     summary: "Identified from PSA cert " + d.certNumber + " — grade and card details are PSA's own record, not an AI guess.",
     timestamp: Date.now()
   });
+});
+
+
+/* ══════════════════════════════════════════════════════════════
+   PROFIT GUARD + PRICE HEALTH  —  CardGauge Business
+
+   THE ARITHMETIC IS DETERMINISTIC AND STAYS THAT WAY. Every figure
+   below comes from columns the shop already owns: cost and ask on the
+   card, fee percent, shipping and target margin on the shop. No model
+   is consulted, because a model that invents a margin is worse than no
+   margin at all -- the same reason this file refuses a median it
+   cannot stand behind.
+
+   An LLM's job here, if one is ever added, is to rank and explain what
+   these numbers already say. Not to produce them.
+
+   WHY BOTH RUN IN ONE PASS: they read the same rows and the same shop
+   settings. Splitting them would double the query for two answers a
+   shop reads on the same screen. */
+
+/* Net proceeds on a sale, after the platform's cut and shipping.
+   Shipping is subtracted flat rather than as a percentage because that
+   is how it is actually charged -- a $4 sleeve-and-stamp costs the
+   same on a $5 card and a $500 one, which is precisely why low-value
+   cards lose money and the shop needs telling. */
+function netOnSale(price, feePct, shipCost) {
+  const p = Number(price) || 0;
+  const f = Number(feePct) || 0;
+  const s = Number(shipCost) || 0;
+  if (p <= 0) return 0;
+  return p - (p * f / 100) - s;
+}
+
+/* The price at which a sale breaks even against what was paid for the
+   card. Solved rather than iterated: net = p(1 - f/100) - s = cost. */
+function breakEvenPrice(cost, feePct, shipCost) {
+  const c = Number(cost) || 0;
+  const f = Number(feePct) || 0;
+  const s = Number(shipCost) || 0;
+  const denom = 1 - (f / 100);
+  if (denom <= 0) return 0;                 // a 100% fee has no answer
+  return (c + s) / denom;
+}
+
+/* The price that clears a target margin on cost. Margin is expressed
+   against COST, not against sale price -- shops quote "I need 30% on
+   what I paid", and computing it the other way silently returns a
+   lower number than they asked for. */
+function targetMarginPrice(cost, feePct, shipCost, targetPct) {
+  const c = Number(cost) || 0;
+  const t = Number(targetPct) || 0;
+  const wanted = c * (1 + t / 100);
+  return breakEvenPrice(wanted, feePct, shipCost);
+}
+
+/* The most that can be paid for a card and still clear target margin
+   when it sells at its expected price. This is the number a shop needs
+   with a customer standing at the counter. */
+function maxAcquisition(expectedSale, feePct, shipCost, targetPct) {
+  const net = netOnSale(expectedSale, feePct, shipCost);
+  const t = Number(targetPct) || 0;
+  if (net <= 0) return 0;
+  return net / (1 + t / 100);
+}
+
+/* Below this, a card is bulk rather than a listing. Deliberately a
+   default rather than a constant: a card shop and a high-end breaker
+   draw this line in very different places, so shops.bulk_threshold
+   overrides it once that column exists. */
+const BULK_THRESHOLD_DEFAULT = 8;
+
+function profitGuard(card, shop) {
+  const feePct = Number(shop.default_fee_percent) || 0;
+  const ship   = Number(shop.default_shipping_cost) || 0;
+  const target = Number(shop.default_target_margin) || 0;
+  const BULK_THRESHOLD = Number(shop.bulk_threshold) > 0
+    ? Number(shop.bulk_threshold) : BULK_THRESHOLD_DEFAULT;
+
+  const cost   = Number(card.cost) || 0;
+  const ask    = Number(card.ask) || 0;
+  const market = Number(card.market_price) || 0;
+
+  /* Priced from the ask when there is one, the market when there is
+     not. Stated in the response so nothing downstream has to guess
+     which number the margin was computed against. */
+  const salePrice = ask > 0 ? ask : market;
+  const basis     = ask > 0 ? "ask" : (market > 0 ? "market" : "none");
+
+  const net    = netOnSale(salePrice, feePct, ship);
+  const profit = salePrice > 0 ? net - cost : 0;
+  /* Margin on COST, matching targetMarginPrice above. A card acquired
+     free -- a break hit, a giveaway -- has no cost to divide by, so
+     margin is reported null rather than as infinity. */
+  const margin = cost > 0 ? (profit / cost) * 100 : null;
+
+  let verdict = "unknown", reason = "";
+  if (salePrice <= 0) {
+    verdict = "unknown";
+    reason  = "No asking price and no market price on this card yet.";
+  } else if (salePrice < BULK_THRESHOLD) {
+    /* A DOLLAR CARD IS NOT A FAILED SALE, IT IS THE WRONG UNIT.
+
+       Run against a real test shop this flagged 59 of 70 cards as
+       "losing money". All of them were dollar-bin commons: average ask
+       around $3, against $4 shipping and 13% fees. The arithmetic was
+       right and the answer was useless -- it told a shop fifty-nine
+       times that a $3 card cannot be posted on its own at a profit,
+       which every shop already knows.
+
+       Worse, it buried the signal. One genuinely overpriced card sat
+       underneath a wall of red that nobody would scroll through.
+
+       So a card below the threshold gets its own verdict. Shipping is
+       not charged against it, because a shop does not ship these
+       singly -- they go in a bulk lot, a repack, a show box or a dime
+       box, and the economics of THAT are a different calculation on a
+       different unit.
+
+       The threshold is a shop setting where one exists, because a card
+       shop and a high-end breaker draw this line in different places. */
+    verdict = "bulk";
+    reason  = "At $" + salePrice.toFixed(2) + " this is bulk, not a single listing \u2014 " +
+              "$" + ship + " shipping alone would take most of it. Price it in a lot, " +
+              "a repack or a show box.";
+  } else if (profit < 0) {
+    verdict = "loss";
+    reason  = "Sells below what it cost once " + feePct + "% fees and $" +
+              ship + " shipping come out.";
+  } else if (margin !== null && margin < target) {
+    verdict = "thin";
+    reason  = "Clears " + Math.round(margin) + "% against a " + target +
+              "% target.";
+  } else {
+    verdict = "good";
+    reason  = margin === null
+      ? "No cost recorded, so this is all profit as far as we can tell."
+      : "Clears " + Math.round(margin) + "%, at or above target.";
+  }
+
+  return {
+    salePrice: Math.round(salePrice * 100) / 100,
+    priceBasis: basis,
+    cost: cost,
+    feeAmount: Math.round((salePrice * feePct / 100) * 100) / 100,
+    shipping: ship,
+    net: Math.round(net * 100) / 100,
+    profit: Math.round(profit * 100) / 100,
+    margin: margin === null ? null : Math.round(margin * 10) / 10,
+    breakEven:      Math.round(breakEvenPrice(cost, feePct, ship) * 100) / 100,
+    targetPrice:    Math.round(targetMarginPrice(cost, feePct, ship, target) * 100) / 100,
+    maxAcquisition: Math.round(maxAcquisition(market || ask, feePct, ship, target) * 100) / 100,
+    verdict: verdict,
+    reason: reason
+  };
+}
+
+const HEALTH_STALE_PRICE_DAYS = 60;   // price untouched this long is stale
+const HEALTH_AGING_DAYS       = 90;   // sitting in inventory this long
+
+function daysSince(ts) {
+  if (!ts) return null;
+  const t = new Date(ts).getTime();
+  if (!isFinite(t)) return null;
+  return Math.floor((Date.now() - t) / 86400000);
+}
+
+function priceHealth(card) {
+  const ask    = Number(card.ask) || 0;
+  const market = Number(card.market_price) || 0;
+  const pricedAgo = daysSince(card.price_updated_at);
+  const heldAgo   = daysSince(card.created_at);
+
+  /* Every flag this card earns, rather than the first one found. A
+     card can be simultaneously overpriced AND aging, and reporting one
+     of those hides the other -- which is exactly the combination that
+     matters most. */
+  const flags = [];
+  let gapPct = null;
+
+  if (ask > 0 && market > 0) {
+    gapPct = ((ask - market) / market) * 100;
+    if (gapPct >= 20)  flags.push({ code: "overpriced",
+      note: "Listed " + Math.round(gapPct) + "% above market." });
+    if (gapPct <= -20) flags.push({ code: "underpriced",
+      note: "Listed " + Math.round(Math.abs(gapPct)) + "% below market \u2014 may sell fast, or may be a mistake." });
+  }
+  if (ask <= 0)    flags.push({ code: "unpriced", note: "No asking price set." });
+  if (market <= 0) flags.push({ code: "no_market", note: "No market price on file to compare against." });
+
+  if (pricedAgo !== null && pricedAgo >= HEALTH_STALE_PRICE_DAYS) {
+    flags.push({ code: "stale_price",
+      note: "Price hasn\u2019t changed in " + pricedAgo + " days." });
+  }
+  if (heldAgo !== null && heldAgo >= HEALTH_AGING_DAYS &&
+      String(card.status || "").toLowerCase() !== "sold") {
+    flags.push({ code: "aging",
+      note: "In inventory " + heldAgo + " days." });
+  }
+
+  return {
+    askVsMarketPct: gapPct === null ? null : Math.round(gapPct),
+    pricedDaysAgo:  pricedAgo,
+    inventoryDays:  heldAgo,
+    flags: flags,
+    /* Worst-first so a caller can sort on one field. Loss and
+       overpriced-and-aging are the ones costing money today. */
+    severity: flags.some(f => f.code === "overpriced") && flags.some(f => f.code === "aging") ? 3
+            : flags.some(f => f.code === "overpriced" || f.code === "aging") ? 2
+            : flags.length ? 1 : 0
+  };
+}
+
+/* GET /api/shop-health?shopId=...&key=...
+   One pass over a shop's inventory returning both readings per card
+   plus the totals a shop actually asks about: cash tied up, how much
+   is aging, and what the whole lot would clear if it sold today. */
+app.get("/api/shop-health", async (req, res) => {
+  if (!supabaseAdmin) return res.json({ success: false, error: "Not configured" });
+  const shopId = String(req.query.shopId || "").trim();
+  if (!shopId) return res.status(400).json({ success: false, error: "shopId required" });
+
+  try {
+    const { data: shop, error: shopErr } = await supabaseAdmin
+      .from("shops")
+      .select("id,name,default_target_margin,default_fee_percent,default_shipping_cost")
+      .eq("id", shopId)
+      .maybeSingle();
+    if (shopErr) throw new Error(shopErr.message);
+    if (!shop) return res.json({ success: false, error: "Shop not found" });
+
+    const { data: rows, error: invErr } = await supabaseAdmin
+      .from("shop_inventory")
+      .select("id,card_name,cost,ask,market_price,status,created_at,price_updated_at,market_checked_at")
+      .eq("shop_id", shopId)
+      .limit(5000);
+    if (invErr) throw new Error(invErr.message);
+
+    const cards = (rows || []).map(function (c) {
+      return {
+        id: c.id,
+        cardName: c.card_name,
+        status: c.status,
+        profit: profitGuard(c, shop),
+        health: priceHealth(c)
+      };
+    });
+
+    const live = cards.filter(c => String(c.status || "").toLowerCase() !== "sold");
+    const sum  = (arr, f) => arr.reduce((a, x) => a + (f(x) || 0), 0);
+
+    return res.json({
+      success: true,
+      shop: { id: shop.id, name: shop.name,
+              targetMargin: shop.default_target_margin,
+              feePercent:   shop.default_fee_percent,
+              shipping:     shop.default_shipping_cost },
+      totals: {
+        cards:        live.length,
+        cashTiedUp:   Math.round(sum(live, c => c.profit.cost)),
+        askValue:     Math.round(sum(live, c => c.profit.salePrice)),
+        netIfSoldToday: Math.round(sum(live, c => c.profit.net)),
+        profitIfSoldToday: Math.round(sum(live, c => c.profit.profit)),
+        losing:  live.filter(c => c.profit.verdict === "loss").length,
+        thin:    live.filter(c => c.profit.verdict === "thin").length,
+        /* Reported separately, never inside `losing`. These are not a
+           problem to fix one card at a time -- they are a pile to
+           handle as a pile, and mixing them into the loss count is
+           what made the first version unreadable. */
+        bulk:    live.filter(c => c.profit.verdict === "bulk").length,
+        bulkAskValue: Math.round(sum(
+          live.filter(c => c.profit.verdict === "bulk"), c => c.profit.salePrice)),
+        aging:   live.filter(c => c.health.flags.some(f => f.code === "aging")).length,
+        stalePrice: live.filter(c => c.health.flags.some(f => f.code === "stale_price")).length,
+        /* Capital in cards that are BOTH aging and overpriced -- the
+           clearest cash-recovery candidates, and the only "trapped"
+           figure here that rests on facts rather than a guess about
+           what would sell. */
+        trappedInAgingOverpriced: Math.round(sum(
+          live.filter(c => c.health.severity === 3), c => c.profit.cost))
+      },
+      /* Worst first, so the top of the list is the work worth doing. */
+      cards: cards.sort(function (a, b) {
+        if (b.health.severity !== a.health.severity) return b.health.severity - a.health.severity;
+        return a.profit.profit - b.profit.profit;
+      })
+    });
+  } catch (e) {
+    console.error("[shop-health]", e.message);
+    return res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 // ── /api/grade-estimate ────────────────────────────────────────
