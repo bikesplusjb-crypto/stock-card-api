@@ -1115,6 +1115,9 @@ function notTheCard(title) {
 }
 
 const REJECT_LABELS = [
+  [/complete set|factory set|full set|team set|sticker set|multi.?card lot|set of/i, "Not one card"],
+  [/digital|bunt|nft/i,        "Digital card"],
+  [/damage|crease|bent|warped|miscut|torn|stained|as.?is|read description/i, "Damaged copy"],
   [/\blot\b|\blots\b|\bbundle\b|\bset of\b|\bcards?\b\s*\d+\s*\bcount\b/i, "Multi-card lot"],
   [/auto|sign/i,        "Autograph"],
   [/patch|relic|jersey|memorabilia|game.?used/i, "Relic or patch"],
@@ -1135,6 +1138,14 @@ function saleRejectReason(r) {
   if (r.printRun != null && r.printRun > 0) {
     return { rule: "print_run", reason: "Numbered /" + r.printRun };
   }
+  /* A damaged copy, a complete set or a digital card is not this card
+     whether it sold or is for sale. Checked here as well as on the ask
+     side so CompGuard reports these to the person rather than the
+     median quietly absorbing them -- a $2,900 complete set inside a
+     single-card pool is exactly the sort of thing the receipt exists
+     to show. */
+  const lr = listingReject(r.title);
+  if (lr) return lr;
   const w = notTheCardWord(r.title);
   if (w) return { rule: "not_the_card:" + w, reason: rejectLabelFor(w) };
   if (titleLooksParallel(r.title, "")) {
@@ -1699,6 +1710,124 @@ function looksBaseSale(r) {
   return true;
 }
 
+
+/* ── WHAT THE LISTING FILTERS NEVER CHECKED ─────────────────────
+
+   notTheCard() removes autos, patches, relics, lots and reprints.
+   titleLooksParallel() removes a different finish. Between them they
+   cover "is this a different CARD" fairly well.
+
+   Neither asks "is this the same card in a state I would not pay the
+   same money for", and that is the gap an opportunity agent would fall
+   straight into. A listing 30% under market is far more often a
+   damaged copy, a digital card or a whole set than it is a deal.
+
+   Read off real sold rows on 8 Sept:
+
+     "1987-88 Fleer Basketball Complete Set 132 ... Jordan PSA 8"  $2,900
+     "2022 Topps Tribute ... NOLAN RYAN (Topps MLB Bunt DigitalCard)" $10.50
+     "1986-87 Fleer Michael Jordan #8 (RC) Sticker ... No CREASES."   $999
+
+   The first is 132 cards priced as one. The second is not a physical
+   object at all. The third is the reason this cannot be a plain
+   keyword list: it contains the word CREASES and is a card in good
+   condition. A naive filter throws away the good listing and keeps the
+   set.
+
+   NEGATION IS CHECKED FIRST, DELIBERATELY. Sellers describe condition
+   by denying faults far more often than by admitting them -- "no
+   creases", "crease free", "never played", "no damage". Matching the
+   fault word without looking at what precedes it inverts the filter on
+   exactly the listings it should keep. */
+
+/* Words that mean the card is damaged, and the phrases that negate
+   them. Both lists are short on purpose: a wrong exclusion here is
+   invisible, because the listing simply never appears. */
+const CONDITION_FAULTS = [
+  "damaged","damage","crease","creased","creasing","bent","warped",
+  "water damage","miscut","off center badly","poor condition",
+  "as is","as-is","read description","see photos for condition",
+  "writing on","marked","stained","torn","ripped","corner ding",
+  "surface wear","heavily played","played condition"
+];
+const FAULT_NEGATIONS = [
+  "no ","not ","non ","free of","free from","without","never ",
+  "zero ","0 ","minimal","hardly any","doesn't have","does not have"
+];
+/* Negation that FOLLOWS the fault word instead of preceding it.
+   "crease free" and "damage-free" are as common as "no creases" in
+   listing titles, and checking only what comes before the word missed
+   every one of them -- rejecting cards whose sellers were advertising
+   the absence of the fault. Caught in testing, not in review. */
+const FAULT_NEGATIONS_AFTER = ["free", "less", "none"];
+
+/* Not a single card at all. Priced as one, they wreck a median in
+   both directions -- a complete set drags it up, a digital card drags
+   it down. */
+const NOT_A_SINGLE_CARD = [
+  "complete set","factory set","full set","set of","team set",
+  "digital card","digitalcard","topps bunt","nft","digital only",
+  "sticker set","binder","album","storage box","display case",
+  "empty box","wrapper","pack fresh lot"
+];
+
+/* True when the title says the card is damaged, allowing for the fact
+   that most condition language is a denial. */
+function titleSaysDamaged(title){
+  /* Hyphens become spaces here, unlike elsewhere in this file.
+     "damage-free" and "crease-free" are written both ways by sellers,
+     and leaving the hyphen in meant the negation check looked at
+     "-free" and did not recognise it. The negation list uses "non "
+     rather than "non-" for the same reason. */
+  const t = " " + String(title || "").toLowerCase()
+                    .replace(/[^a-z0-9 ']/g, " ")
+                    .replace(/\s+/g, " ") + " ";
+  for (let i = 0; i < CONDITION_FAULTS.length; i++) {
+    const w = CONDITION_FAULTS[i];
+    let from = 0, at;
+    while ((at = t.indexOf(" " + w, from)) > -1) {
+      /* Look back far enough to catch "free of" and "does not have",
+         which sit further from the fault word than "no". */
+      const before = t.slice(Math.max(0, at - 16), at + 1);
+      /* Enough room after the word for "creases free" as well as
+         "crease free"; hyphens are already spaces by this point. */
+      const after  = t.slice(at + 1 + w.length, at + 1 + w.length + 8);
+      const negated =
+           FAULT_NEGATIONS.some(n => before.indexOf(n) > -1)
+        || FAULT_NEGATIONS_AFTER.some(n => after.trim().indexOf(n) === 0
+             || after.trim().indexOf("s " + n) === 0);
+      if (!negated) return w;
+      from = at + 1;
+    }
+  }
+  return null;
+}
+
+function titleNotASingleCard(title){
+  const t = " " + String(title || "").toLowerCase()
+                    .replace(/[^a-z0-9 '-]/g, " ")
+                    .replace(/\s+/g, " ") + " ";
+  const hit = NOT_A_SINGLE_CARD.find(w => t.indexOf(" " + w) > -1);
+  if (hit) return hit;
+  /* "lot of 4", "4 card lot", "(5) cards" -- a count beside the word
+     card or lot means several objects at one price. */
+  if (/\b\d{1,3}\s*(card|cards)\s*(lot|bundle|set)\b/.test(t)) return "multi-card lot";
+  if (/\blot\s*of\s*\d{1,3}\b/.test(t)) return "multi-card lot";
+  return null;
+}
+
+/* One call for the whole check, so callers cannot apply half of it.
+   Returns null when the listing looks like an ordinary single copy. */
+function listingReject(title){
+  const notSingle = titleNotASingleCard(title);
+  if (notSingle) return { rule: "not_a_single_card:" + notSingle,
+                          reason: "Not one card \u2014 " + notSingle };
+  const damaged = titleSaysDamaged(title);
+  if (damaged) return { rule: "damaged:" + damaged,
+                        reason: "Seller describes damage \u2014 " + damaged };
+  return null;
+}
+
 function selectListings(ai, byTier) {
   const terms = parallelTerms(ai);
   const denom = serialDenominator(ai);
@@ -1728,7 +1857,7 @@ function selectListings(ai, byTier) {
   // card gets priced off refractors sitting in the same results.
   if (tight.length >= MIN) {
     if (!isParallel) {
-      const tightBase = tight.filter(l => !titleLooksParallel(l.title, brand) && !notTheCard(l.title));
+      const tightBase = tight.filter(l => !titleLooksParallel(l.title, brand) && !notTheCard(l.title) && !listingReject(l.title));
       if (tightBase.length >= 3) {
         return { listings: tightBase, matchQuality: "exact", tierUsed: "tight-base",
                  note: "Priced from base-card listings; parallels excluded." };
@@ -1750,7 +1879,7 @@ function selectListings(ai, byTier) {
          place. But "is this a different FINISH of my card" and "is
          this a signed version of my card" are separate questions, and
          only the first one had to be skipped. */
-      const tightSame = tight.filter(l => !notTheCard(l.title));
+      const tightSame = tight.filter(l => !notTheCard(l.title) && !listingReject(l.title));
       if (tightSame.length >= 3) {
         return { listings: tightSame, matchQuality: "exact", tierUsed: "tight-parallel",
                  note: "Priced from listings for this parallel; autos, relics and lots excluded." };
@@ -1782,7 +1911,7 @@ function selectListings(ai, byTier) {
        Refractor. An auto is a different card at a different price, and
        unless the card in hand is one, it does not belong in the pool. */
     if (!targetIsSpecial) {
-      const clean = matched.filter(l => !notTheCard(l.title));
+      const clean = matched.filter(l => !notTheCard(l.title) && !listingReject(l.title));
       if (clean.length >= 2) matched = clean;
     }
 
@@ -1800,7 +1929,7 @@ function selectListings(ai, byTier) {
                note: "Only " + tight.length + " listing" + (tight.length === 1 ? "" : "s") +
                      " found for this parallel — treat this price as a rough guide." };
     }
-    const base = wide.filter(l => !titleLooksParallel(l.title, brand) && !notTheCard(l.title));
+    const base = wide.filter(l => !titleLooksParallel(l.title, brand) && !notTheCard(l.title) && !listingReject(l.title));
     if (base.length >= 3) {
       return { listings: base, matchQuality: "base_fallback", tierUsed: "core-base",
                note: "No listings found for this parallel. Showing BASE card prices — a parallel is usually worth more." };
@@ -1810,7 +1939,7 @@ function selectListings(ai, byTier) {
   }
 
   if (!isParallel && wide.length) {
-    const base = wide.filter(l => !titleLooksParallel(l.title, brand) && !notTheCard(l.title));
+    const base = wide.filter(l => !titleLooksParallel(l.title, brand) && !notTheCard(l.title) && !listingReject(l.title));
     if (base.length >= 3) {
       return { listings: base, matchQuality: "exact", tierUsed: "core-base",
                note: "Priced from base-card listings; parallels excluded." };
