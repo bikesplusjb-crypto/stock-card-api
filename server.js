@@ -4039,6 +4039,17 @@ app.post(
         (sold && sold.soldContaminated ? " | CONTAMINATED" : "") +
         (yearCorrection ? " | YEAR? " + yearCorrection.claimedYear + "->" + yearCorrection.listingYear +
            (yearCorrection.adopted ? " (adopted)" : yearCorrection.retried ? " (retried, no sales)" : " (not retried)") : "") +
+        /* Says whether the corrections lookup found anything, and on
+           which key. Added after two rounds of guessing why a hint did
+           not appear -- the first because the key was too strict, the
+           second because an old instance was still serving. Neither
+           was visible from the outside, and both would have been
+           obvious from one field in this line. */
+        (knownCorrections && knownCorrections.length
+          ? " | LEARNED " + knownCorrections.map(function(c){
+              return c.field + "->" + c.suggested + "(" + c.agreement + "," + c.matchKind + ")";
+            }).join(" ")
+          : " | learned=none") +
         " | verified=" + (verification.checked
             ? (verification.exists === true ? "yes" : verification.exists === false ? "NO" : "?")
             : "skipped")
