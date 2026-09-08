@@ -9,6 +9,17 @@
 ================================ */
 
 const express = require("express");
+/* BUYMAX — the buy-side decision engine.
+
+   Mounted at the bottom of this file rather than called inline
+   anywhere, so the existing scan and pricing routes are untouched by
+   it. buymax-adapter is not optional plumbing: it translates
+   CardGauge's refusals (soldContaminated, soldLimited) into the shape
+   BuyMax's provider recognises. Without it a contaminated pool would
+   arrive as an ordinary median and BuyMax would quote a buy ceiling
+   off sales this file already refuses to publish. */
+const { mountBuyMax } = require("./buymax");
+const { makeCardGaugeHook } = require("./buymax-adapter");
 const cors = require("cors");
 const multer = require("multer");
 const fetch = require("node-fetch");
@@ -8145,6 +8156,14 @@ app.use((req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
+/* Reads getSoldComps directly -- no HTTP hop back into this same
+   service, no second cache, and the same refusals the scanner applies.
+   Placed here because getSoldComps must already be defined. */
+mountBuyMax(app, {
+  local: { getSoldComps: makeCardGaugeHook(getSoldComps) }
+});
+
 app.listen(PORT, () => {
   console.log(`CardGauge backend running on port ${PORT}`);
   console.log(`eBay EPN affiliate active — campid: ${EPN_CAMPAIGN_ID}`);
