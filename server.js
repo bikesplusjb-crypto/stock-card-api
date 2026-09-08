@@ -1591,9 +1591,39 @@ function buildQueryTiers(ai) {
     ? joinParts(["pokemon", lang, player, set, auto, patch, grade])
     : joinParts([year, brand, set, player, variation, auto, patch, grade]);
 
+  /* DROP THE GRADE BEFORE THE SET.
+
+     A graded insert has almost no listings of its own, so set-noNum
+     comes back thin and the chain falls to core -- which drops the set
+     and KEEPS the grade. That is the worst possible pair to keep: it
+     discards the thing that makes the card valuable and retains the
+     thing that shrinks the pool.
+
+     Seen on a real card, 8 Sept. A 2025 Topps Chrome Lightning Leaders
+     Ohtani in a PSA 8 slab:
+
+       q = "2025 Topps Shohei Ohtani PSA 8"   tier=core   no usable price
+
+     while the same card without the grade read:
+
+       q = "2025 Topps Chrome Lightning Leaders Shohei Ohtani"
+       tier=tight   $76 from 20 sales
+
+     Every graded sale is a sale of that card, and the grade ladder is
+     built separately from soldGradeBreakdown -- so dropping the grade
+     here loses nothing the answer needs, while dropping the set loses
+     the card itself. */
+  const setNoGrade = grade
+    ? (poke ? joinParts(["pokemon", lang, player, set, auto, patch])
+            : joinParts([year, brand, set, player, variation, auto, patch]))
+    : "";
+
   const tiers = [];
   if (tight) tiers.push({ tier: "tight", query: tight });
   if (setNoNum && setNoNum !== tight) tiers.push({ tier: "set-noNum", query: setNoNum });
+  if (setNoGrade && setNoGrade !== tight && setNoGrade !== setNoNum) {
+    tiers.push({ tier: "set-noGrade", query: setNoGrade });
+  }
   if (core && core !== tight && core !== setNoNum) tiers.push({ tier: "core", query: core });
   if (loose && loose !== core && loose !== tight && loose !== setNoNum) tiers.push({ tier: "loose", query: loose });
   return tiers;
@@ -1902,8 +1932,12 @@ function selectListings(ai, byTier) {
      be paid for and then ignored, and the function would keep reaching
      for core -- the tier that drops the set. Order is narrowest-first:
      same set beats same player. */
-  const wide = (byTier.setNoNum && byTier.setNoNum.length ? byTier.setNoNum
-              : (byTier.core && byTier.core.length ? byTier.core : (byTier.loose || [])));
+  /* Narrowest first: exact set beats set-without-grade beats player
+     alone. Naming set-noGrade here matters -- an unnamed tier is
+     fetched, paid for and ignored. */
+  const wide = (byTier.setNoNum   && byTier.setNoNum.length   ? byTier.setNoNum
+              : (byTier.setNoGrade && byTier.setNoGrade.length ? byTier.setNoGrade
+              : (byTier.core && byTier.core.length ? byTier.core : (byTier.loose || []))));
 
   if (isParallel && wide.length) {
     let matched = wide.filter(l => titleHasParallel(l.title, terms));
@@ -2179,7 +2213,17 @@ async function getCardMarketForCard(ai) {
     const setTier = tiers.find(t => t.tier === "set-noNum");
     if (setTier) byTier.setNoNum = await fetchEbayListings(setTier.query);
 
+    /* FETCHED, NOT JUST BUILT. set-noNum sat in the tier list for weeks
+       without this function ever asking for it -- the fix existed and
+       only the sold chain used it. Adding set-noGrade without fetching
+       it here would repeat that exactly. */
     if (!byTier.setNoNum || byTier.setNoNum.length < 4) {
+      const ngTier = tiers.find(t => t.tier === "set-noGrade");
+      if (ngTier) byTier.setNoGrade = await fetchEbayListings(ngTier.query);
+    }
+
+    if ((!byTier.setNoNum || byTier.setNoNum.length < 4) &&
+        (!byTier.setNoGrade || byTier.setNoGrade.length < 4)) {
       const coreTier = tiers.find(t => t.tier === "core");
       if (coreTier) byTier.core = await fetchEbayListings(coreTier.query);
       if (!byTier.core || byTier.core.length < 4) {
@@ -2199,7 +2243,9 @@ async function getCardMarketForCard(ai) {
     : picked.tierUsed.indexOf("loose") === 0 ? ((tiers.find(t => t.tier === "loose") || tiers[0]).query)
     : (byTier.setNoNum && byTier.setNoNum.length
         ? ((tiers.find(t => t.tier === "set-noNum") || tiers[0]).query)
-        : ((tiers.find(t => t.tier === "core") || tiers[0]).query));
+        : (byTier.setNoGrade && byTier.setNoGrade.length
+            ? ((tiers.find(t => t.tier === "set-noGrade") || tiers[0]).query)
+            : ((tiers.find(t => t.tier === "core") || tiers[0]).query)));
 
   if (!picked.listings.length) {
     return Object.assign(EMPTY_MARKET(usedQuery, "No clean card listings found"), {
