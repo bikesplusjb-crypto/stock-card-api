@@ -4536,14 +4536,32 @@ function maxAcquisition(expectedSale, feePct, shipCost, targetPct) {
    default rather than a constant: a card shop and a high-end breaker
    draw this line in very different places, so shops.bulk_threshold
    overrides it once that column exists. */
-const BULK_THRESHOLD_DEFAULT = 8;
+/* A FLAT THRESHOLD WAS WRONG BECAUSE SHIPPING IS NOT FLAT.
+
+   $8 was chosen against a shop paying $4 to post a card, where it is
+   about right: half the sale price going to postage means the card
+   belongs in a lot. Run against a shop paying $1, it flagged $5 cards
+   as bulk and told them "$1 shipping alone would take most of it" --
+   which is a fifth of it, and plainly false to anyone reading.
+
+   Derived from the shop's own shipping cost instead. A card is bulk
+   when postage plus fees would eat roughly a third of the sale, which
+   is the point where listing it individually stops being worth the
+   handling. At $4 shipping that lands near the original $8; at $1 it
+   lands near $2, which is the correct answer for that shop.
+
+   The floor exists because a card under a dollar is bulk whatever the
+   postage is. */
+const BULK_SHIPPING_MULTIPLE = 3;
+const BULK_FLOOR = 2;
 
 function profitGuard(card, shop) {
   const feePct = Number(shop.default_fee_percent) || 0;
   const ship   = Number(shop.default_shipping_cost) || 0;
   const target = Number(shop.default_target_margin) || 0;
   const BULK_THRESHOLD = Number(shop.bulk_threshold) > 0
-    ? Number(shop.bulk_threshold) : BULK_THRESHOLD_DEFAULT;
+    ? Number(shop.bulk_threshold)
+    : Math.max(BULK_FLOOR, ship * BULK_SHIPPING_MULTIPLE);
 
   const cost   = Number(card.cost) || 0;
   const ask    = Number(card.ask) || 0;
@@ -4588,9 +4606,14 @@ function profitGuard(card, shop) {
        The threshold is a shop setting where one exists, because a card
        shop and a high-end breaker draw this line in different places. */
     verdict = "bulk";
-    reason  = "At $" + salePrice.toFixed(2) + " this is bulk, not a single listing \u2014 " +
-              "$" + ship + " shipping alone would take most of it. Price it in a lot, " +
-              "a repack or a show box.";
+    /* States the actual proportion rather than asserting "most of it".
+       The first version said that regardless of the numbers and was
+       false on any shop with cheap postage. */
+    const eaten = salePrice > 0
+      ? Math.round(((salePrice * feePct / 100) + ship) / salePrice * 100) : 100;
+    reason  = "At $" + salePrice.toFixed(2) + ", fees and postage take " + eaten +
+              "% of the sale. Worth more in a lot, a repack or a show box than as " +
+              "a single listing.";
   } else if (profit < 0) {
     verdict = "loss";
     reason  = "Sells below what it cost once " + feePct + "% fees and $" +
@@ -4646,22 +4669,34 @@ function priceHealth(card) {
   const flags = [];
   let gapPct = null;
 
-  if (ask > 0 && market > 0) {
+  /* A CARD THAT SOLD WAS NOT OVERPRICED.
+
+     Seen in the first real output: a Shohei Ohtani marked Sold, flagged
+     "listed 233% above market". It sold at that price. Whatever the
+     comp says, the market answered.
+
+     Sold rows were already excluded from aging and should have been
+     excluded from the pricing flags at the same time -- both describe
+     something to act on, and there is nothing to act on once it has
+     gone. Kept in the response with no flags rather than dropped, since
+     a shop reviewing history still wants to see it. */
+  const isSold = String(card.status || "").toLowerCase() === "sold";
+
+  if (!isSold && ask > 0 && market > 0) {
     gapPct = ((ask - market) / market) * 100;
     if (gapPct >= 20)  flags.push({ code: "overpriced",
       note: "Listed " + Math.round(gapPct) + "% above market." });
     if (gapPct <= -20) flags.push({ code: "underpriced",
       note: "Listed " + Math.round(Math.abs(gapPct)) + "% below market \u2014 may sell fast, or may be a mistake." });
   }
-  if (ask <= 0)    flags.push({ code: "unpriced", note: "No asking price set." });
-  if (market <= 0) flags.push({ code: "no_market", note: "No market price on file to compare against." });
+  if (!isSold && ask <= 0)    flags.push({ code: "unpriced", note: "No asking price set." });
+  if (!isSold && market <= 0) flags.push({ code: "no_market", note: "No market price on file to compare against." });
 
-  if (pricedAgo !== null && pricedAgo >= HEALTH_STALE_PRICE_DAYS) {
+  if (!isSold && pricedAgo !== null && pricedAgo >= HEALTH_STALE_PRICE_DAYS) {
     flags.push({ code: "stale_price",
       note: "Price hasn\u2019t changed in " + pricedAgo + " days." });
   }
-  if (heldAgo !== null && heldAgo >= HEALTH_AGING_DAYS &&
-      String(card.status || "").toLowerCase() !== "sold") {
+  if (!isSold && heldAgo !== null && heldAgo >= HEALTH_AGING_DAYS) {
     flags.push({ code: "aging",
       note: "In inventory " + heldAgo + " days." });
   }
