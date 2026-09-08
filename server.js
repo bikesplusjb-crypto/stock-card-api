@@ -3608,13 +3608,20 @@ async function lookupCorrections(ai) {
     });
 
     return Object.keys(byField).map(function (k) {
+      const r = byField[k];
       return {
         field: k,
-        suggested: byField[k].corrected_to,
-        agreement: Number(byField[k].times_seen),
-        note: byField[k].agreement === 1 ? "" :
-              byField[k].times_seen + " people scanning this card corrected the " +
-              k.replace("_", " ") + " to " + byField[k].corrected_to + "."
+        suggested: r.corrected_to,
+        agreement: Number(r.times_seen),
+        /* exact = the same read down to the card number. loose = same
+           year, brand and player, where the model read the number or
+           the set differently this time. Carried through so the UI can
+           be less emphatic about a loose match if it ever needs to be,
+           and so a wrong suggestion can be traced to which key found
+           it. */
+        matchKind: r.match_kind || "exact",
+        note: r.times_seen + " people scanning this card corrected the " +
+              k.replace("_", " ") + " to " + r.corrected_to + "."
       };
     });
   } catch (e) {
