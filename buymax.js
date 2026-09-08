@@ -176,6 +176,13 @@ __def('config', function (module, exports, require) {
       identityBonus: 15,            // scaled by provider identity confidence
       widePenalty: 20,
       degradedProviderPenalty: 25,
+      // IDENTITY PENALTIES. Sold-comp depth cannot buy confidence in a card
+      // nobody has named. Without these, a deep sold pool scored 91/100 on an
+      // item the same response described as unidentified.
+      identityUnknownPenalty: num(process.env.BUYMAX_CONF_IDENTITY_UNKNOWN_PENALTY, 20),
+      identityLowPenalty: num(process.env.BUYMAX_CONF_IDENTITY_LOW_PENALTY, 25),
+      // Hard ceiling on analysis confidence while identity is unknown.
+      maxWithoutIdentity: num(process.env.BUYMAX_CONF_MAX_WITHOUT_IDENTITY, 70),
     },
 
     // ---------------------------------------------------------------------
@@ -631,8 +638,24 @@ __def('core/confidence', function (module, exports, require) {
       if (!market.quality_gate.passed) score -= 15;
     }
 
-    if (Number.isFinite(identityConfidence)) score += Math.round((identityConfidence / 100) * c.identityBonus);
+    // Identity is not a bonus-only input. Twenty completed sales for a card we
+    // cannot name is confident arithmetic on an unknown subject; publishing that
+    // as a high number beside 'the card could not be confidently identified' is
+    // the analysis contradicting itself on screen.
+    let identityUnknown = false;
+    if (Number.isFinite(identityConfidence)) {
+      score += Math.round((identityConfidence / 100) * c.identityBonus);
+      if (identityConfidence < cfg.risk.identityConfidenceFloor) score -= c.identityLowPenalty;
+    } else {
+      score -= c.identityUnknownPenalty;
+      identityUnknown = true;
+    }
+
     if (providerErrors && providerErrors.length) score -= c.degradedProviderPenalty;
+
+    // A cap, not another penalty: no amount of market evidence lifts the
+    // analysis past this while the subject of it is unidentified.
+    if (identityUnknown) score = Math.min(score, c.maxWithoutIdentity);
 
     return clamp(Math.round(score), 0, 100);
   }
@@ -661,7 +684,9 @@ __def('core/calc', function (module, exports, require) {
    *
    *   target_offer      — open here (max buy discounted by the offer band)
    *   maximum_buy_price — the last price that still clears desired profit
-   *   walk_away_above   — one cent past max; nothing above this is worth taking
+   *   walk_away_above   — equal to maximum_buy_price; nothing ABOVE it is worth
+   *                       taking. Kept as a separate key for the panel, but it
+   *                       is the same number, not a third rung.
    *
    * Returns nulls, never guesses, when expected_resale is unavailable.
    */
@@ -698,6 +723,7 @@ __def('core/calc', function (module, exports, require) {
         risk_adjustment: null,
         maximum_buy_price: null,
         target_offer: null,
+        ask_below_target: false,
         walk_away_above: null,
         expected_profit_at_asking: null,
         expected_profit_at_target: null,
@@ -721,8 +747,14 @@ __def('core/calc', function (module, exports, require) {
 
     const maxBuyFloored = Math.max(0, maxBuy);
 
-    // Open below the ceiling so there is somewhere to negotiate to.
-    const targetOffer = maxBuyFloored * (1 - cfg.costs.targetOfferBand);
+    // Open below the ceiling so there is somewhere to negotiate to — but never
+    // above what the seller already asked. A ladder that opens higher than the
+    // ask is not a negotiating position, it is a tip.
+    const askingPrice = request.asking_price;
+    const bandOffer = maxBuyFloored * (1 - cfg.costs.targetOfferBand);
+    const targetOffer = Number.isFinite(askingPrice) && askingPrice > 0
+      ? Math.min(bandOffer, askingPrice)
+      : bandOffer;
 
     const profitAt = (price) => netProceeds - shipping - gradingCost - otherCosts - price;
     const roiAt = (price) => (price > 0 ? profitAt(price) / price : null);
@@ -746,6 +778,9 @@ __def('core/calc', function (module, exports, require) {
       risk_adjustment: round2(riskAdjustment),
       maximum_buy_price: round2(maxBuyFloored),
       target_offer: round2(targetOffer),
+      // True when the ask was already at or under the opening offer, i.e. there
+      // is nothing to negotiate down to. The panel should not draw a ladder.
+      ask_below_target: Number.isFinite(askingPrice) && askingPrice > 0 && askingPrice <= bandOffer,
       walk_away_above: round2(maxBuyFloored),
       expected_profit_at_asking: round2(expectedProfitAtAsking),
       expected_profit_at_target: round2(profitAt(targetOffer)),
@@ -818,9 +853,25 @@ __def('core/explain', function (module, exports, require) {
 
     // --- the negotiating ladder ------------------------------------------
     if (calc.maximum_buy_price !== null) {
-      lines.push(
-        `Open at ${money(calc.target_offer)}. Do not go above ${money(calc.maximum_buy_price)} — past that the profit stops covering the risk.`
-      );
+      if (calc.ask_below_target) {
+        lines.push(
+          `The ask is already below your ceiling of ${money(calc.maximum_buy_price)}, so there is nothing to negotiate down to — ${money(
+            request.asking_price
+          )} is the price.`
+        );
+      } else {
+        lines.push(
+          `Open at ${money(calc.target_offer)}. Do not go above ${money(calc.maximum_buy_price)} — past that the profit stops covering the risk.`
+        );
+      }
+
+      // The haircut moves the ceiling. Left unsaid, the disclosed formula does
+      // not reproduce the disclosed number and the gap looks like a bug.
+      if (Number.isFinite(calc.risk_adjustment) && calc.risk_adjustment > 0) {
+        lines.push(
+          `That ceiling is ${money(calc.risk_adjustment)} lower than the profit target alone would set it — withheld against the risks below, not a market price.`
+        );
+      }
     }
 
     // --- where the number came from ---------------------------------------
@@ -840,10 +891,19 @@ __def('core/explain', function (module, exports, require) {
     }
 
     // --- what was thrown out and why ----------------------------------------
+    // Two different pools. When the resale figure came from completed sales,
+    // the active-listing screen did not produce it, and running the counts
+    // together made the surviving actives look like the priced evidence.
     if (market.listings_rejected > 0) {
-      lines.push(
-        `${market.listings_rejected} of ${market.listings_found} listings were rejected as not the same card, leaving ${market.listings_used} to price against.`
-      );
+      if (market.sold_market_value) {
+        lines.push(
+          `Separately, ${market.listings_rejected} of ${market.listings_found} listings currently for sale were rejected as not the same card, leaving ${market.listings_used}. Those were a depth check only — they did not set the resale figure.`
+        );
+      } else {
+        lines.push(
+          `${market.listings_rejected} of ${market.listings_found} listings were rejected as not the same card, leaving ${market.listings_used} to price against.`
+        );
+      }
     }
 
     // --- the risks, ranked --------------------------------------------------
@@ -1175,6 +1235,9 @@ __def('core/engine', function (module, exports, require) {
         target_offer: calc.target_offer,
         maximum_buy_price: calc.maximum_buy_price,
         walk_away_above: calc.walk_away_above,
+        // walk_away_above is the same number as maximum_buy_price. Do not draw
+        // it as a third rung.
+        ask_below_target: calc.ask_below_target,
       },
 
       economics: {
@@ -1209,7 +1272,7 @@ __def('core/engine', function (module, exports, require) {
 
       meta: {
         elapsed_ms: Date.now() - started,
-        assumptions: assumptionsUsed(resaleBasis, cfg, request),
+        assumptions: assumptionsUsed(resaleBasis, cfg, request, calc, risk),
       },
 
       // Retained for logging and future proprietary signal work, not for display.
@@ -1228,17 +1291,45 @@ __def('core/engine', function (module, exports, require) {
     return { status: 200, payload };
   }
 
-  function assumptionsUsed(basis, cfg, request) {
+  function assumptionsUsed(basis, cfg, request, calc, risk) {
     const a = [];
+    const c = (calc && calc.inputs) || {};
+
     if (basis === 'ebay_active_estimate') {
       a.push(`Active asking prices converted to expected sale price using a ${cfg.market.askToSaleRatio} ratio (assumption, not measured).`);
       a.push('No completed-sale data was used. Active listings are asking prices.');
     }
     if (basis === 'none') a.push('No resale estimate could be produced.');
-    if (request.sell_fee_rate === null) a.push(`Selling fees assumed at ${(cfg.costs.sellFeeRate * 100).toFixed(2)}% plus $${cfg.costs.paymentFixed}.`);
+
+    if (request.sell_fee_rate === null) {
+      a.push(`Selling fees assumed at ${(cfg.costs.sellFeeRate * 100).toFixed(2)}% plus $${cfg.costs.paymentFixed.toFixed(2)}.`);
+    }
+
+    // Postage comes out of the ceiling whether or not anyone mentions it. A
+    // disclosure that lists the fee rate and omits shipping understates the
+    // costs the number was actually built from, and on a cheap card the
+    // omission is most of the decision.
+    if (
+      (request.shipping_cost === null || request.shipping_cost === undefined) &&
+      Number.isFinite(c.shipping_cost) &&
+      c.shipping_cost > 0
+    ) {
+      a.push(`Outbound shipping assumed at $${c.shipping_cost.toFixed(2)}.`);
+    }
+
     if (!Number.isFinite(request.desired_profit) && basis !== 'none') {
       a.push(`Desired profit defaulted to ${(cfg.costs.defaultProfitMargin * 100).toFixed(0)}% of expected resale.`);
     }
+
+    // The risk haircut silently lowered the ceiling. Undisclosed, the published
+    // assumptions did not add up to the published number.
+    if (calc && Number.isFinite(calc.risk_adjustment) && calc.risk_adjustment > 0) {
+      a.push(
+        `A further $${calc.risk_adjustment.toFixed(2)} withheld from the maximum buy price as a risk haircut ` +
+          `(risk score ${risk ? risk.score : '?'} of 100, scaled to at most ${(cfg.risk.maxHaircut * 100).toFixed(0)}% of expected resale).`
+      );
+    }
+
     return a;
   }
 
