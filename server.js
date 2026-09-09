@@ -2383,7 +2383,22 @@ const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
    nothing depends on this bump -- but a v4 row served for twelve hours
    is still an answer from a function that no longer exists, which is
    the whole reason this constant is here. */
-const SOLD_LOGIC_VERSION = 5;
+/* v5 -> v6 (2026-09-09, an hour after v5). summarizeSold now also
+   returns soldWideBase -- whether the base sales span more than one
+   card. Added it to the payload and left this constant at 5, which is
+   the identical mistake the v5 note above describes: shape changed,
+   key did not move, cache kept serving the old shape.
+
+   Cost was immediate and measurable. A full refresh ran with the new
+   flag deployed and NOT ONE payload carried it -- 0 of 2,276 -- because
+   every card came back from a twelve-hour cache written by the previous
+   build. Thirty-six wide-spread rows were written as though the check
+   did not exist, and no WIDE-BASE line appeared in the log.
+
+   Twice in one afternoon. The rule this keeps failing to encode: adding
+   a FIELD to the payload is a logic change, not an additive one, because
+   readers gate on its presence. */
+const SOLD_LOGIC_VERSION = 6;
 
 /* The cache key must carry the limit. Without it a 50-record compact pull
    gets stored under the same key as a full lookup and is then served back
