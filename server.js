@@ -5270,16 +5270,68 @@ app.get("/api/price-history", async (req, res) => {
 
     const key  = cacheKeyFor(query);
     const days = Math.max(1, Math.min(Number(req.query.days || 90), 3650));
-    const { data, error } = await supabaseAdmin
-      .from("card_price_history")
-      .select("sale_date,sold_median,sold_count,ask_median,raw_median,graded_median")
-      .eq("cache_key", key)
-      .gte("sale_date", daysAgoISO(days))
-      .order("sale_date", { ascending: true });
 
-    if (error) throw new Error(error.message);
+    /* TWO SOURCES, AND THE NEWER ONE WINS WHERE IT EXISTS.
+
+       card_price_history records a median at the moment somebody
+       happened to scan, so it averages 1.3 rows per card with gaps of
+       weeks. Useful as an audit trail of what was shown, useless as a
+       series -- which is why every sparkline built on it read "history
+       fills in over time" permanently.
+
+       card_daily_prices is written by the nightly job for every watched
+       card whether anybody looked or not. It started on 8 Sept, so for
+       now it is short, and the old table still carries whatever
+       scattered points exist from before that.
+
+       Merged by day with daily winning, rather than picking one table:
+       a chart that went blank the day the new source started would be
+       a worse answer than one that improves as it fills. */
+    const [dailyRes, legacyRes] = await Promise.all([
+      supabaseAdmin
+        .from("card_daily_prices")
+        .select("day,median,low,high,sale_count,basis")
+        .eq("cache_key", key)
+        .gte("day", daysAgoISO(days))
+        .order("day", { ascending: true }),
+      supabaseAdmin
+        .from("card_price_history")
+        .select("sale_date,sold_median,sold_count,ask_median,raw_median,graded_median")
+        .eq("cache_key", key)
+        .gte("sale_date", daysAgoISO(days))
+        .order("sale_date", { ascending: true })
+    ]);
+    if (dailyRes.error && legacyRes.error) throw new Error(legacyRes.error.message);
+
+    const byDay = {};
+    (legacyRes.data || []).forEach(function (r) {
+      if (!r.sale_date) return;
+      byDay[String(r.sale_date).slice(0, 10)] = {
+        day: String(r.sale_date).slice(0, 10),
+        median: r.sold_median, low: null, high: null,
+        sale_count: r.sold_count, basis: null, source: "scan"
+      };
+    });
+    /* Written second so a day present in both takes the daily row --
+       a scheduled reading beats whenever somebody happened to open the
+       app. */
+    (dailyRes.data || []).forEach(function (r) {
+      if (!r.day) return;
+      byDay[String(r.day).slice(0, 10)] = {
+        day: String(r.day).slice(0, 10),
+        median: r.median, low: r.low, high: r.high,
+        sale_count: r.sale_count, basis: r.basis, source: "daily"
+      };
+    });
+
+    const points = Object.keys(byDay).sort().map(function (k) { return byDay[k]; });
+
     res.json({ success: true, cacheKey: key, query: normalizeCardQuery(query),
-               days: days, points: data || [] });
+               days: days, points: points,
+               /* So a caller can say "one reading so far" honestly
+                  instead of drawing a single dot and calling it a
+                  trend. */
+               dailyDays: (dailyRes.data || []).length });
   } catch (error) {
     res.status(500).json({ success: false, error: "History lookup failed", details: error.message });
   }
@@ -7174,6 +7226,54 @@ async function refreshWatchlistPrices() {
         const soldMed = (contaminated || limited) ? 0 : safeNumber(
           (s.soldRaw && s.soldRaw.count >= 3 ? s.soldRaw.median : 0) || s.soldMedian, 0);
         const newPrice = soldMed;
+
+        /* ── ONE ROW A DAY, FOR THE CHART THAT DOES NOT EXIST YET ──
+
+           The comp API returns a rolling 30-day window and nothing
+           older, so a 52-week view is not something that can be
+           assembled later -- it exists only if the rows were written as
+           the days passed. This loop already runs nightly over every
+           watched card and already has a clean median in hand, so the
+           marginal cost is one insert.
+
+           WRITTEN AFTER THE REFUSALS, NOT BEFORE. newPrice is zero when
+           the pool is contaminated or too thin, and this only fires
+           when it is not -- so a bad day leaves a gap in the series
+           rather than a poisoned point. A gap is honest and draws as
+           nothing; a poisoned point draws as a crash.
+
+           High and low matter as much as the median. A card whose
+           median holds at $76 while its range widens from $70-81 to
+           $8-10,000 is a card whose comp pool broke, and only the
+           spread shows that. */
+        if (newPrice && Array.isArray(s.sales) && s.sales.length) {
+          try {
+            const prices = s.sales
+              .map(r => Number(r && r.price))
+              .filter(n => isFinite(n) && n > 0);
+            if (prices.length) {
+              await supabaseAdmin.rpc("record_daily_price", {
+                /* No limit argument, matching the getSoldComps call above --
+                   cacheKeyFor defaults to CARDAPI_LIMIT, so this lands on the
+                   same key the comps were cached under. Passing a different
+                   limit would silently key the series to a cache entry that
+                   does not exist. */
+                p_cache_key: cacheKeyFor(item.card_name),
+                p_median:    newPrice,
+                p_low:       Math.min.apply(null, prices),
+                p_high:      Math.max.apply(null, prices),
+                p_count:     prices.length,
+                p_basis:     s.soldBasis || null,
+                p_card_name: item.card_name
+              });
+            }
+          } catch (e) {
+            /* A missed day is a gap in a chart nobody is looking at
+               yet. It must never stop the repricing this loop exists
+               to do. */
+            console.log("[daily-price] " + e.message);
+          }
+        }
 
         if (!newPrice) {
           if (contaminated) {
