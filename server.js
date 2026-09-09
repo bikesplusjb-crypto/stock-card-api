@@ -2427,7 +2427,7 @@ function summarizeSold(records, query, limitUsed) {
   if (!clean.length) {
     return {
       soldCount: 0, soldMedian: 0, soldLow: 0, soldHigh: 0,
-      soldRaw: { count: 0, median: 0 }, soldGraded: { count: 0, median: 0 },
+      soldRaw: { count: 0, median: 0, low: null, high: null }, soldGraded: { count: 0, median: 0 },
       soldGradeBreakdown: [], bestOfferCount: 0, lastSaleDate: null,
       sales: [], query: query, lookbackDays: CARDAPI_LOOKBACK,
       limitUsed: limitUsed || CARDAPI_LIMIT,
@@ -2745,7 +2745,24 @@ function summarizeSold(records, query, limitUsed) {
        count sitting exactly at the ceiling is a ceiling and not a total.
        It needs to know what the ceiling actually was. */
     limitUsed:     limitUsed || CARDAPI_LIMIT,
-    soldRaw:    { count: raw.length,    median: rawMed },
+    /* THE POOL THAT PRODUCED THE MEDIAN NOW REPORTS ITS OWN RANGE.
+
+       It used to return only a count and a median, so anything wanting
+       a low and a high had to rebuild one from `sales` -- and `sales`
+       is a DISPLAY SAMPLE (clean.slice(0, 12)), not the evidence the
+       median rests on. Different populations, so the two could not be
+       made to agree by filtering: on a 1986 Fleer Jordan the median was
+       $133 while the sample held no ungraded #57 at all, and on a 2017
+       Judge the median was $30 against a sample whose base sales ran
+       $114 to $152.
+
+       rawP is already computed and sorted a few lines above. Returning
+       its ends costs nothing and means a caller can never again derive
+       a range from a different set of sales than the number it sits
+       beside. */
+    soldRaw:    { count: raw.length,    median: rawMed,
+                  low:  rawP.length ? rawP[0] : null,
+                  high: rawP.length ? rawP[rawP.length - 1] : null },
     soldFixed:   { count: fixedP.length,   median: fixedMed },
     soldAuction: { count: auctionP.length, median: auctionMed },
     soldHeadlineBasis: useFixed ? "fixed_base" : useRaw ? "all_base" : "none",
@@ -7311,16 +7328,42 @@ async function refreshWatchlistPrices() {
                not -- a card with 100 completed sales recorded 12. It is
                now the number of base sales the range was actually built
                from. */
-            const baseSales = s.sales.filter(function (r) {
-              return r && Number(r.price) > 0 && looksBaseSale(r);
-            });
-            const prices = baseSales.map(function (r) { return Number(r.price); });
-            /* Nothing survived the filter. The median came from a pool
-               this sample cannot describe, so there is no honest range
-               to write -- and a row with a median and a made-up range is
-               worse than no row. The day is left as a gap, which is what
-               the refusals above already do. */
-            if (prices.length) {
+            /* THE RANGE COMES FROM THE POOL THAT SET THE MEDIAN.
+
+               This used to build low, high and count from s.sales -- the
+               twelve-record DISPLAY sample -- while p_median came from
+               soldRaw, the CompGuard-filtered base pool. Three different
+               populations in one row, and it showed:
+
+                 2018 topps ohtani          median 126   low 126   high 9000
+                 1986 Fleer Michael Jordan  median 153   low  75   high 17200
+                 2017 topps aaron judge rc  median  35   low  90   high 475
+
+               The $9,000 is a BGS 9.5 and the $17,200 is a BGS 8.5. The
+               Judge row is the proof rather than the symptom: a median
+               BELOW its own low cannot come from one population.
+
+               Filtering the sample was the wrong shape of fix and I
+               shipped it once -- it narrowed the gap and could not close
+               it, because on the Jordan the sample contained no ungraded
+               #57 at all while the median was computed from a pool that
+               did. A sample is not evidence for a range.
+
+               summarizeSold now returns soldRaw.low and soldRaw.high, so
+               the two numbers come from the same sales by construction.
+               Falls back to the headline range when the median came from
+               soldMedian rather than soldRaw -- matching the same choice
+               newPrice makes a few lines above, so the pair can never be
+               mismatched. */
+            const usedRaw = !!(s.soldRaw && s.soldRaw.count >= 3 && s.soldRaw.median);
+            const lo = usedRaw ? s.soldRaw.low  : s.soldLow;
+            const hi = usedRaw ? s.soldRaw.high : s.soldHigh;
+            const n  = usedRaw ? s.soldRaw.count : s.soldCountUsed;
+
+            /* No range means no row. A median with an invented low and
+               high is worse than a gap -- the gap is honest and the
+               refusals above already produce them. */
+            if (Number(lo) > 0 && Number(hi) > 0 && Number(n) > 0) {
               await supabaseAdmin.rpc("record_daily_price", {
                 /* No limit argument, matching the getSoldComps call above --
                    cacheKeyFor defaults to CARDAPI_LIMIT, so this lands on the
@@ -7329,14 +7372,17 @@ async function refreshWatchlistPrices() {
                    does not exist. */
                 p_cache_key: cacheKeyFor(item.card_name),
                 p_median:    newPrice,
-                p_low:       Math.min.apply(null, prices),
-                p_high:      Math.max.apply(null, prices),
-                p_count:     prices.length,
+                p_low:       lo,
+                p_high:      hi,
+                /* Base sales the median rests on -- not the sample size,
+                   which was always 8-12 because of slice(0, 12) and read
+                   as depth on a card with a hundred sales. */
+                p_count:     n,
                 p_basis:     s.soldBasis || null,
                 p_card_name: item.card_name
               });
             } else {
-              console.log("[daily-price] no base sales in the sample for " +
+              console.log("[daily-price] no usable base range for " +
                           item.card_name + " — day left as a gap");
             }
           } catch (e) {
