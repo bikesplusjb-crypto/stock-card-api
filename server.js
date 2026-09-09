@@ -1650,8 +1650,41 @@ function buildQueryTiers(ai) {
             : joinParts([year, brand, set, player, variation, auto, patch]))
     : "";
 
+  /* THE SERIAL SURVIVES ONE STEP PAST TIGHT.
+
+     serialDenominator() has only ever fed the TIGHT query. The moment
+     tight came back thin, the chain fell to set-noNum, then core -- and
+     core drops the set, the parallel AND the serial together. A numbered
+     card then priced against base cards.
+
+     Read off a real scan, 9 Sept:
+
+       2023 Topps Series One Shota Imanaga Blue Parallel 36/75
+       q = "2023 Topps Shota Imanaga #178 auto"
+       tier = core   match = base_fallback   sold = $21
+
+     A /75 blue parallel valued off base comps. Same shape as the Bo Nix
+     03/20 that came back at $2 in August, and the comment above the
+     tight query claims a misread serial "costs one empty query rather
+     than a wrong price" -- which is only true while nothing downstream
+     broadens past it. Something does.
+
+     So the denominator gets its own step. Year, brand, player and "/75"
+     is a narrow, highly identifying query that does not depend on the
+     set name being right or the card number appearing in a title -- the
+     two things sellers most often get wrong or omit. It sits directly
+     after tight, so it is tried before anything drops the serial.
+
+     Only built when a serial was actually read, so a card without one
+     is completely unaffected. */
+  const serialTier = serial
+    ? (poke ? joinParts(["pokemon", lang, player, serial, auto, patch])
+            : joinParts([year, brand, player, serial, auto, patch]))
+    : "";
+
   const tiers = [];
   if (tight) tiers.push({ tier: "tight", query: tight });
+  if (serialTier && serialTier !== tight) tiers.push({ tier: "serial", query: serialTier });
   if (setNoNum && setNoNum !== tight) tiers.push({ tier: "set-noNum", query: setNoNum });
   if (setNoGrade && setNoGrade !== tight && setNoGrade !== setNoNum) {
     tiers.push({ tier: "set-noGrade", query: setNoGrade });
@@ -1967,9 +2000,15 @@ function selectListings(ai, byTier) {
   /* Narrowest first: exact set beats set-without-grade beats player
      alone. Naming set-noGrade here matters -- an unnamed tier is
      fetched, paid for and ignored. */
-  const wide = (byTier.setNoNum   && byTier.setNoNum.length   ? byTier.setNoNum
+  /* Narrowest first, and the serial pool is the narrowest there is: a
+     print run identifies a card more precisely than its set name or its
+     number, both of which sellers routinely leave out of a title. Named
+     here as well as fetched, because an unnamed tier is paid for and
+     then ignored -- which is the failure the comments above describe. */
+  const wide = (byTier.serial     && byTier.serial.length     ? byTier.serial
+              : (byTier.setNoNum   && byTier.setNoNum.length   ? byTier.setNoNum
               : (byTier.setNoGrade && byTier.setNoGrade.length ? byTier.setNoGrade
-              : (byTier.core && byTier.core.length ? byTier.core : (byTier.loose || []))));
+              : (byTier.core && byTier.core.length ? byTier.core : (byTier.loose || [])))));
 
   if (isParallel && wide.length) {
     let matched = wide.filter(l => titleHasParallel(l.title, terms));
@@ -2242,8 +2281,24 @@ async function getCardMarketForCard(ai) {
 
        Costs one extra eBay call, and only on cards where the tight
        query already came back thin. */
-    const setTier = tiers.find(t => t.tier === "set-noNum");
-    if (setTier) byTier.setNoNum = await fetchEbayListings(setTier.query);
+    /* THE SERIAL TIER IS FETCHED, NOT JUST BUILT.
+
+       This function has been caught twice leaving a tier in the list and
+       never asking for it -- set-noNum sat unused for weeks, and the
+       comment below was written after set-noGrade nearly repeated it.
+       Adding a third unfetched tier would make that a pattern rather
+       than an accident.
+
+       Costs one eBay call and only on cards that HAVE a print run and
+       whose tight query already came back thin, which is a small slice
+       of a small slice. An ordinary base card never reaches this line. */
+    const serTier = tiers.find(t => t.tier === "serial");
+    if (serTier) byTier.serial = await fetchEbayListings(serTier.query);
+
+    if (!byTier.serial || byTier.serial.length < 3) {
+      const setTier = tiers.find(t => t.tier === "set-noNum");
+      if (setTier) byTier.setNoNum = await fetchEbayListings(setTier.query);
+    }
 
     /* FETCHED, NOT JUST BUILT. set-noNum sat in the tier list for weeks
        without this function ever asking for it -- the fix existed and
@@ -2273,11 +2328,13 @@ async function getCardMarketForCard(ai) {
   const usedQuery =
     picked.tierUsed.indexOf("tight") === 0 ? (tightTier ? tightTier.query : tiers[0].query)
     : picked.tierUsed.indexOf("loose") === 0 ? ((tiers.find(t => t.tier === "loose") || tiers[0]).query)
+    : (byTier.serial && byTier.serial.length
+        ? ((tiers.find(t => t.tier === "serial") || tiers[0]).query)
     : (byTier.setNoNum && byTier.setNoNum.length
         ? ((tiers.find(t => t.tier === "set-noNum") || tiers[0]).query)
         : (byTier.setNoGrade && byTier.setNoGrade.length
             ? ((tiers.find(t => t.tier === "set-noGrade") || tiers[0]).query)
-            : ((tiers.find(t => t.tier === "core") || tiers[0]).query)));
+            : ((tiers.find(t => t.tier === "core") || tiers[0]).query))));
 
   if (!picked.listings.length) {
     return Object.assign(EMPTY_MARKET(usedQuery, "No clean card listings found"), {
@@ -4269,6 +4326,31 @@ app.post(
         for (let i = 0; i < tiers.length; i++) {
           const q = tiers[i].query;
           if (!q || already.has(q)) continue;
+
+          /* A NUMBERED CARD IS NOT THE BASE CARD, AND A QUERY WITHOUT ITS
+             SERIAL CANNOT TELL THEM APART.
+
+             The loop below walks every tier looking for one that returns
+             sales. On a card with a print run that is a mistake: the
+             tiers past "serial" have dropped the denominator, so they
+             find the base card's sales -- plenty of them, clean, and for
+             a different object. It then adopts that median because it
+             passes every quality gate, since nothing is wrong with the
+             data except that it describes another card.
+
+             The Imanaga above is exactly this: $21 adopted from a query
+             that had lost "/75". No filter downstream can catch it,
+             because the comps really are clean.
+
+             A gap here is the honest outcome. "No completed sales for
+             this numbered card" is true and useful; $21 for a /75 is
+             neither. The asking-price path still runs and still shows a
+             figure with its own caveat. */
+          const serialWanted = serialDenominator(ai);
+          if (serialWanted && String(q).indexOf(serialWanted) < 0) {
+            continue;
+          }
+
           already.add(q);
           const broader = await getSoldComps(q, market.avgPrice);
           /* A broader query only counts as an answer if it produced a
