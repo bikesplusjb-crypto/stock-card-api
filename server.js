@@ -5293,6 +5293,34 @@ app.get("/api/price-history", async (req, res) => {
         .select("day,median,low,high,sale_count,basis")
         .eq("cache_key", key)
         .gte("day", daysAgoISO(days))
+        /* ONE SALE IS A TRANSACTION, NOT A PRICE.
+
+           Seen on a 2025 Chrome Lightning Leaders Ohtani, 9 Sept: the
+           panel drew 8 readings and called it -6%, and four of those
+           seven days rested on a SINGLE sale. The peak the line rose to
+           -- $110 on 27 August -- was one person buying one card. The
+           dip and the recovery either side of it were the same thing.
+           Nothing about that shape describes the market; it describes
+           who happened to click buy that day.
+
+           This is the same judgement summarizeSold() already makes with
+           MIN_GROUP, and the same one movementFrom() makes with
+           MOVE_MIN_SALES: a median of one number is not a median. The
+           chart was the one place still plotting them.
+
+           It does NOT age out on its own. A card trading a few times a
+           month will always produce single-sale days, so waiting for the
+           nightly job to fill the series would give a longer line with
+           the same spikes in it -- and a longer line looks more
+           authoritative, which makes it worse rather than better.
+
+           The row stays in the table. sale_count = 1 is a true fact
+           about that day and other things read it; it is only excluded
+           from the series people look at. On a thin card that drops the
+           reading count below the panel's own floor, and it says "not
+           enough history yet" instead of drawing a peak out of one
+           sale. That is the honest answer. */
+        .gte("sale_count", 2)
         .order("day", { ascending: true }),
       supabaseAdmin
         .from("card_price_history")
