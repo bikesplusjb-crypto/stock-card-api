@@ -7276,9 +7276,50 @@ async function refreshWatchlistPrices() {
            spread shows that. */
         if (newPrice && Array.isArray(s.sales) && s.sales.length) {
           try {
-            const prices = s.sales
-              .map(r => Number(r && r.price))
-              .filter(n => isFinite(n) && n > 0);
+            /* THE MEDIAN AND THE RANGE MUST DESCRIBE THE SAME SALES.
+
+               They did not. newPrice comes from soldRaw.median -- the
+               base pool, after saleRejectReason() has stripped autos,
+               patches, lots, numbered parallels and graded slabs. low
+               and high were computed from s.sales, which is the RAW
+               twelve-record sample with every one of those still in it.
+               Three different populations in one row.
+
+               Read straight off the first run that ever wrote to this
+               table, 9 Sept:
+
+                 2018 topps ohtani            median 126   low 126   high 9000
+                 Bobby Witt Jr. Refractor     median   7   low 0.99  high 197
+                 2017 topps aaron judge rc    median  35   low   90  high 475
+
+               The $9,000 is a graded slab sitting in the sample. And the
+               Judge row is the proof rather than the symptom: a median
+               BELOW its own low is arithmetically impossible from one
+               population, so the two provably came from different ones.
+
+               Every row that run wrote averaged a 44x spread, which made
+               spread_ratio -- the column that exists to catch exactly
+               this -- describe the sample rather than the card.
+
+               Filtered with looksBaseSale(), the same predicate
+               summarizeSold() uses to build the median in the first
+               place, so the range and the median now rest on the same
+               sales by construction rather than by coincidence.
+
+               p_count follows. It was the sample size (always 8-12,
+               capped by sales.slice(0,12)), which read as depth and was
+               not -- a card with 100 completed sales recorded 12. It is
+               now the number of base sales the range was actually built
+               from. */
+            const baseSales = s.sales.filter(function (r) {
+              return r && Number(r.price) > 0 && looksBaseSale(r);
+            });
+            const prices = baseSales.map(function (r) { return Number(r.price); });
+            /* Nothing survived the filter. The median came from a pool
+               this sample cannot describe, so there is no honest range
+               to write -- and a row with a median and a made-up range is
+               worse than no row. The day is left as a gap, which is what
+               the refusals above already do. */
             if (prices.length) {
               await supabaseAdmin.rpc("record_daily_price", {
                 /* No limit argument, matching the getSoldComps call above --
@@ -7294,6 +7335,9 @@ async function refreshWatchlistPrices() {
                 p_basis:     s.soldBasis || null,
                 p_card_name: item.card_name
               });
+            } else {
+              console.log("[daily-price] no base sales in the sample for " +
+                          item.card_name + " — day left as a gap");
             }
           } catch (e) {
             /* A missed day is a gap in a chart nobody is looking at
