@@ -531,6 +531,38 @@ function gradeBreakdown(gradedItems) {
    if you tune one, look at the other. */
 const WIDE_SPREAD_AT = 4;
 
+/* HOW FAR APART THE *BASE* SALES ARE FROM EACH OTHER.
+
+   WIDE_SPREAD_AT above measures ASKING prices. soldContaminated
+   compares the raw median against the graded rung. Neither asks the
+   simplest question there is: do the sales that produced this median
+   look like sales of ONE card?
+
+   Measured on the 9 Sept refresh, after every filter this file has:
+
+     2026 Topps Finest Munetaka Murakami Refractor RC   99 sales   $2.77 - $1,250
+     2025 Topps Chrome Bobby Witt Jr. Refractor         88 sales   $0.99 - $850
+     mahomes                                            33 sales   $0.69 - $800
+
+   Every one of those is genuinely ungraded, un-numbered, not an auto,
+   not a lot -- so print_run, notTheCard and titleLooksParallel all pass
+   them, correctly. They are simply different cards. A refractor query
+   that matches a base card, a case hit and a one-per-case insert has 99
+   sales of breadth, not depth, and the count makes it look like the
+   most evidence in the database.
+
+   Ten was read off the distribution rather than chosen: today's rows
+   cluster at or under 3.4x, then jump to 6.0 and 10.3, then to 16.1 and
+   up. A real card's own sales vary -- condition, timing, luck -- so the
+   line has to sit well above the clean cases. Everything past it spans
+   more than an order of magnitude, which no single card's market does
+   in thirty days.
+
+   Judgement call, stated as one. Too low and honest variance gets
+   flagged; too high and a $5 card keeps reporting a $1,250 neighbour as
+   its own high. */
+const BASE_SPREAD_WIDE = Number(process.env.BASE_SPREAD_WIDE || 10);
+
 function spreadRatio(sortedPrices) {
   if (sortedPrices.length < 4) return 0;
   const r = trimmedRange(sortedPrices);
@@ -2646,6 +2678,7 @@ function summarizeSold(records, query, limitUsed) {
   let warning = "";
   let contaminated = false;
   let limited = false;
+  let wideBase = false;
   const psa9  = ladder.find(g => g.grade === "PSA 9");
   const psa10 = ladder.find(g => g.grade === "PSA 10");
   const rung  = (psa9 && psa9.median) || (psa10 && psa10.median ? psa10.median * 0.34 : 0);
@@ -2679,6 +2712,32 @@ function summarizeSold(records, query, limitUsed) {
               "(median $" + fixedMed + ", only " + fixedP.length + " of them). " +
               "Too thin to call a market price — review before pricing.";
   }
+  /* THE BASE POOL DISAGREES WITH ITSELF.
+
+     Checked after the two above and deliberately not merged into
+     either. Contaminated means the wrong records got in. Limited means
+     the exclusions worked and too little survived. This is a third
+     thing: plenty survived, all of it passed every filter, and it still
+     describes more than one card.
+
+     It does NOT refuse the number. The person gets the median with a
+     sentence saying what it rests on, which is the same trade limited
+     already makes -- a flagged figure they can weigh beats no figure.
+     What it does do is keep the day out of the permanent series, where
+     a number nobody can question would sit forever.
+
+     Trimmed, so a single odd sale cannot trigger it, and gated on five
+     or more sales because a spread across three is not a pattern. */
+  if (!contaminated && !limited && rawP.length >= 5) {
+    const bt = trimmedRange(rawP);
+    if (bt.low > 0 && (bt.high / bt.low) >= BASE_SPREAD_WIDE) {
+      wideBase = true;
+      warning = "These " + rawP.length + " sales run from $" + bt.low + " to $" + bt.high +
+                " — too far apart to be one card. The search is probably matching a base " +
+                "card and a parallel or insert together. Narrow it before trusting this number.";
+    }
+  }
+
   /* LIMITED IS NOT CONTAMINATED. Kept as two separate facts on purpose.
 
      soldContaminated means what it has always meant: records that are
@@ -2800,6 +2859,10 @@ function summarizeSold(records, query, limitUsed) {
     soldAuction: { count: auctionP.length, median: auctionMed },
     soldHeadlineBasis: useFixed ? "fixed_base" : useRaw ? "all_base" : "none",
     soldLimited: limited,
+    /* Its own field rather than folded into soldLimited, so a reader can
+       tell "too little evidence" from "too much of the wrong kind" --
+       they need different answers from the person. */
+    soldWideBase: wideBase,
     soldGraded: { count: graded.length, median: median(grP) },
     soldRawBasis:      filt.rawFellBack ? "ungraded" : "base",
     soldBaseCount:     filt.rawBase,
@@ -2967,6 +3030,18 @@ async function recordPriceHistory(key, query, sold, askMedian) {
      against it inherits the error. The measured case: a Murakami base
      rookie reading $1 off six penny auctions, on a card whose
      fixed-price copies were selling far higher. */
+  /* A pool that spans several cards must not become a permanent point,
+     for the same reason a contaminated or limited one must not: the
+     cached payload expires in twelve hours and a history row never
+     does. Counts are still written, because "99 sales across $2.77 to
+     $1,250" is exactly the kind of thing worth being able to look back
+     at. */
+  if (sold.soldWideBase) {
+    console.log("[history] skipped WIDE-BASE median for " + query +
+                " — the base sales span more than one card");
+    await writeCountsOnly("wide base pool");
+    return;
+  }
   if (sold.soldLimited) {
     console.log("[history] skipped LIMITED median for " + query +
                 " — comps were clean but too thin to price from");
@@ -7876,8 +7951,18 @@ async function runEmailWatchAlerts() {
         /* Refuses contaminated and limited pools, exactly as the
            watchlist refresh does. An alert is a push notification
            about money; a median the engine already declined to stand
-           behind must not become one. */
-        const usable = !s.soldContaminated && !s.soldLimited;
+           behind must not become one.
+
+           soldWideBase is refused HERE but deliberately NOT in the
+           watchlist refresh. The two are different claims. A displayed
+           binder value says "this is roughly what it is worth", and a
+           median stays reasonably honest even when its pool is broad --
+           it is the RANGE that goes meaningless, not the middle. An
+           email says "your card moved 15%", unprompted, and a move
+           computed between two medians of a shifting mixed pool is
+           noise wearing a percentage. Sending that is worse than
+           sending nothing. */
+        const usable = !s.soldContaminated && !s.soldLimited && !s.soldWideBase;
         const newPrice = usable ? safeNumber(
           (s.soldRaw && s.soldRaw.count >= 3 ? s.soldRaw.median : 0) || s.soldMedian, 0) : 0;
 
