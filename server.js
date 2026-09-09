@@ -4668,21 +4668,35 @@ async function fetchPsaCert(certNumber) {
          point at the path that still works -- the cert number and grade
          are printed on the label, so typing the card in loses very
          little. */
+      /* "TYPE THE CARD IN" ASKS FOR WORK THE SCANNER ALREADY DOES.
+
+         All three of these messages sent somebody off to type a year,
+         a set, a player and a grade by hand. The photo scanner reads
+         graded slabs -- the identification prompt says so outright
+         ("If the card is in a graded slab, read the label for company,
+         grade, year, player, set, and card number") and it demonstrably
+         works: a PSA 8 Lightning Leaders Ohtani scanned on 9 Sept came
+         back tight-base with $76 off 20 sales, label and all.
+
+         So the fallback for a cert lookup nobody can reach is not
+         manual entry. It is the thing the product is built around:
+         photograph the slab. Same result, no typing, and it uses the
+         path that already has every guard in this file behind it. */
       if (r.status === 403 || /approved customers/i.test(detail)) {
         return { ok: false, unavailable: true,
-                 reason: "PSA lookup isn't available right now. The grade and card details "
-                       + "are printed on the label \u2014 type the card in and it'll price "
-                       + "the same way." };
+                 reason: "PSA lookup isn't available right now \u2014 but you don't need it. "
+                       + "Photograph the slab with the normal scanner and it reads the label "
+                       + "itself: grade, year, set and player." };
       }
       if (r.status === 429) {
         return { ok: false, unavailable: true,
-                 reason: "PSA is rate-limiting lookups right now. Try again shortly, or type "
-                       + "the card in from the label." };
+                 reason: "PSA is rate-limiting lookups right now. Photograph the slab with "
+                       + "the normal scanner instead \u2014 it reads the label itself." };
       }
       if (r.status >= 500) {
         return { ok: false, unavailable: true,
-                 reason: "PSA's server isn't responding. Type the card in from the label "
-                       + "and it'll price the same way." };
+                 reason: "PSA's server isn't responding. Photograph the slab with the "
+                       + "normal scanner instead \u2014 it reads the label itself." };
       }
       return { ok: false, reason: "PSA couldn't look that cert up (" + r.status + ")." };
     }
