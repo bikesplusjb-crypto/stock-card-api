@@ -2773,8 +2773,29 @@ function summarizeSold(records, query, limitUsed) {
        a range from a different set of sales than the number it sits
        beside. */
     soldRaw:    { count: raw.length,    median: rawMed,
-                  low:  rawP.length ? rawP[0] : null,
-                  high: rawP.length ? rawP[rawP.length - 1] : null },
+                  /* TRIMMED, LIKE EVERY OTHER RANGE IN THIS FILE.
+
+                     These started as the raw min and max of the base
+                     pool, which lets a single listing define the whole
+                     range. Measured on the 9 Sept refresh: a 2018 Ohtani
+                     with 42 clean base sales and a $126 median reported
+                     a high of $1,999.95 -- one sealed hobby box that
+                     survived the base filter -- turning a spread of
+                     about 1.5x into 23x, and putting the row outside the
+                     3x gate that decides whether it can be plotted.
+
+                     soldLow and soldHigh have always used trimmedRange
+                     for exactly this reason. Two range fields in one
+                     response computed by different rules is the same
+                     class of mismatch this whole change set has been
+                     removing, so they now share it: drop the extreme 10%
+                     each end, on pools of five or more.
+
+                     The outlier is not deleted -- it still counts toward
+                     sale_count and toward the median. It just stops
+                     being the ceiling. */
+                  low:  rawP.length ? trimmedRange(rawP).low  : null,
+                  high: rawP.length ? trimmedRange(rawP).high : null },
     soldFixed:   { count: fixedP.length,   median: fixedMed },
     soldAuction: { count: auctionP.length, median: auctionMed },
     soldHeadlineBasis: useFixed ? "fixed_base" : useRaw ? "all_base" : "none",
