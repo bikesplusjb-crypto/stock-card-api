@@ -2339,7 +2339,19 @@ const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
    cache key had not moved. That is precisely what this constant
    exists to prevent, and it was left at 3 while the logic underneath
    it changed. */
-const SOLD_LOGIC_VERSION = 4;
+/* v4 -> v5 (2026-09-09). summarizeSold now returns soldRaw.low and
+   soldRaw.high -- the base pool's own range, which the daily-price
+   series reads so its low and high describe the same sales as its
+   median. Every v4 row lacks those fields, and a reader that expects
+   them gets undefined rather than an answer.
+
+   Measured immediately: a refresh of 80 cards wrote ZERO daily rows,
+   because every card came back from cache in the old shape. The caller
+   now degrades to soldLow/soldHigh when the new fields are absent, so
+   nothing depends on this bump -- but a v4 row served for twelve hours
+   is still an answer from a function that no longer exists, which is
+   the whole reason this constant is here. */
+const SOLD_LOGIC_VERSION = 5;
 
 /* The cache key must carry the limit. Without it a 50-record compact pull
    gets stored under the same key as a full lookup and is then served back
@@ -7356,8 +7368,39 @@ async function refreshWatchlistPrices() {
                newPrice makes a few lines above, so the pair can never be
                mismatched. */
             const usedRaw = !!(s.soldRaw && s.soldRaw.count >= 3 && s.soldRaw.median);
-            const lo = usedRaw ? s.soldRaw.low  : s.soldLow;
-            const hi = usedRaw ? s.soldRaw.high : s.soldHigh;
+
+            /* A CACHED PAYLOAD IS AN OLD-SHAPED PAYLOAD, AND EVERY
+               PAYLOAD IS CACHED FOR TWELVE HOURS.
+
+               soldRaw.low and soldRaw.high were added to summarizeSold
+               in the same change that started reading them here. Every
+               row already in sold_comps_cache was written before that,
+               so it carries soldRaw without them -- and getSoldComps
+               returns the cached object untouched. The guard below then
+               saw undefined for both and wrote nothing at all: an entire
+               refresh of 80 cards produced ZERO rows, including cards
+               with a dozen clean sales.
+
+               This is the failure SOLD_LOGIC_VERSION exists to prevent
+               and it was not bumped, so the cache kept serving answers
+               from a shape that no longer matched the reader. Version
+               bumped alongside this (see the constant), but a version
+               bump only helps the NEXT pull -- anything still cached in
+               an older shape has to degrade rather than vanish.
+
+               soldLow and soldHigh are the right fallback rather than a
+               lucky one: they are trimmedRange(headline), and headline
+               is the base pool too. Not identical to soldRaw's own ends,
+               but drawn from the same sales, which is the whole property
+               that matters. */
+            const num = function (v) {
+              const x = Number(v);
+              return Number.isFinite(x) && x > 0 ? x : null;
+            };
+            const lo = usedRaw ? (num(s.soldRaw.low)  || num(s.soldLow))
+                               : num(s.soldLow);
+            const hi = usedRaw ? (num(s.soldRaw.high) || num(s.soldHigh))
+                               : num(s.soldHigh);
             const n  = usedRaw ? s.soldRaw.count : s.soldCountUsed;
 
             /* No range means no row. A median with an invented low and
@@ -7464,17 +7507,55 @@ async function refreshWatchlistPrices() {
   }
 }
 
-cron.schedule("0 4 * * *", refreshWatchlistPrices, {
+cron.schedule("0 4 * * *", function () { refreshWatchlistPricesGuarded("nightly cron"); }, {
   timezone: "America/New_York"
 });
 console.log("Watchlist daily refresh scheduled for 4:00 AM ET");
+
+/* ONE RUN AT A TIME.
+
+   This endpoint fired refreshWatchlistPrices() on every call with
+   nothing stopping a second one starting while the first was still
+   going. Four triggers in an hour on 9 Sept left four runs interleaved
+   -- the same card logged six times in two seconds, four times the
+   thecardapi spend for one refresh's worth of information, and two runs
+   racing to upsert the same (cache_key, day) row.
+
+   The cron path can collide the same way: a run that overruns its hour
+   would meet the next one.
+
+   A module-level flag rather than a lock in the database, because the
+   thing being protected is this process's own loop and there is one
+   process. If that ever changes, this needs to move to a row. */
+let watchlistRefreshRunning = false;
+
+async function refreshWatchlistPricesGuarded(reason) {
+  if (watchlistRefreshRunning) {
+    console.log("[watchlist-refresh] already running — " + reason + " ignored");
+    return { started: false };
+  }
+  watchlistRefreshRunning = true;
+  try {
+    await refreshWatchlistPrices();
+  } finally {
+    /* finally, not after the await: a throw inside the run would
+       otherwise leave the flag set and block every later run until the
+       service restarts -- a worse failure than the one being fixed. */
+    watchlistRefreshRunning = false;
+  }
+  return { started: true };
+}
 
 app.get("/api/refresh-watchlist", async (req, res) => {
   if (!process.env.REFRESH_SECRET || req.query.key !== process.env.REFRESH_SECRET) {
     return res.status(403).json({ success: false, error: "Forbidden" });
   }
+  if (watchlistRefreshRunning) {
+    return res.json({ success: false, running: true,
+      message: "A refresh is already running — wait for it to finish." });
+  }
   res.json({ success: true, message: "Refresh started — check server logs" });
-  refreshWatchlistPrices();
+  refreshWatchlistPricesGuarded("manual trigger");
 });
 
 /* ══════════════════════════════════════════════════════════════
