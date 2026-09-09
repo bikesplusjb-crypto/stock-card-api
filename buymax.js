@@ -143,7 +143,10 @@ __def('config', function (module, exports, require) {
         wideSpread: 20,             // p90/p10 above maxSpreadRatio
         highRejectRate: 12,         // most candidate listings failed CompGuard
         noSoldData: 15,             // resale derived from asks, not sales
-        providerDegraded: 20,       // one or more providers failed
+        providerDegraded: 20,       // one or more providers FAILED
+        // The upstream deliberately withheld its median. Real information
+        // about the card, and NOT the same event as a provider failing.
+        soldCompsRefused: 12,
       },
       identityConfidenceFloor: num(process.env.BUYMAX_IDENTITY_FLOOR, 60),
       // Share of expected resale withheld as a haircut at risk = 100.
@@ -176,6 +179,9 @@ __def('config', function (module, exports, require) {
       identityBonus: 15,            // scaled by provider identity confidence
       widePenalty: 20,
       degradedProviderPenalty: 25,
+      // Smaller than a provider failure: a refusal means the lookup worked
+      // and the answer was withheld, which is less bad than not knowing.
+      soldRefusedPenalty: 10,
       // IDENTITY PENALTIES. Sold-comp depth cannot buy confidence in a card
       // nobody has named. Without these, a deep sold pool scored 91/100 on an
       // item the same response described as unidentified.
@@ -553,7 +559,7 @@ __def('core/risk', function (module, exports, require) {
 
   const { clamp } = require('./stats');
 
-  function scoreRisk({ identity, identityConfidence, market, screen, soldAvailable, soldCount, providerErrors }, cfg) {
+  function scoreRisk({ identity, identityConfidence, market, screen, soldAvailable, soldCount, soldRefusal, providerErrors }, cfg) {
     const w = cfg.risk.weights;
     const reasons = [];
     const add = (points, code, detail) => { reasons.push({ code, points, detail }); };
@@ -595,6 +601,11 @@ __def('core/risk', function (module, exports, require) {
 
     if (!soldAvailable) add(w.noSoldData, 'no_sold_comps', 'Resale estimate derived from active asks, not completed sales');
 
+    /* The upstream had sold data and would not stand behind it. That is a
+       real finding about the card and belongs in the score -- but under its
+       own name, at its own weight, not as a provider failure. */
+    if (soldRefusal) add(w.soldCompsRefused, 'sold_comps_refused', soldRefusal.reason);
+
     if (providerErrors && providerErrors.length) {
       add(w.providerDegraded, 'provider_degraded', providerErrors.map((e) => e.provider).join(', '));
     }
@@ -621,7 +632,7 @@ __def('core/confidence', function (module, exports, require) {
 
   const { clamp } = require('./stats');
 
-  function scoreConfidence({ market, identityConfidence, soldAvailable, soldCount, basis, providerErrors }, cfg) {
+  function scoreConfidence({ market, identityConfidence, soldAvailable, soldCount, basis, soldRefusal, providerErrors }, cfg) {
     const c = cfg.confidence;
     let score = c.base;
 
@@ -652,6 +663,9 @@ __def('core/confidence', function (module, exports, require) {
     }
 
     if (providerErrors && providerErrors.length) score -= c.degradedProviderPenalty;
+    /* A withheld median is worse than a clean one and better than an
+       outage: the lookup ran and returned a considered answer. */
+    if (soldRefusal) score -= c.soldRefusedPenalty;
 
     // A cap, not another penalty: no amount of market evidence lifts the
     // analysis past this while the subject of it is unidentified.
@@ -822,6 +836,7 @@ __def('core/explain', function (module, exports, require) {
     wide_price_spread: 'comparable prices are spread far apart, which usually means the listings are not really the same card',
     high_reject_rate: 'most listings found did not actually match this card',
     no_sold_comps: 'there is no completed-sale data here, only what sellers are currently asking',
+    sold_comps_refused: 'the completed sales were found and then withheld, because they could not be trusted for this card',
     provider_degraded: 'a data source failed, so this analysis is running on less information than usual',
   };
 
@@ -907,15 +922,47 @@ __def('core/explain', function (module, exports, require) {
     }
 
     // --- the risks, ranked --------------------------------------------------
-    const top = (risk.reasons || []).slice().sort((a, b) => b.points - a.points).slice(0, 3);
+    /* The refusal explains why the figure above is an asking-price estimate
+       at all, so it leads regardless of its weight. At 12 points it was
+       losing a tie for third place and dropping out of the sentence
+       entirely -- the one finding the person can act on. */
+    const ranked = (risk.reasons || []).slice().sort((a, b) => {
+      if (a.code === 'sold_comps_refused') return -1;
+      if (b.code === 'sold_comps_refused') return 1;
+      return b.points - a.points;
+    });
+    const top = ranked.slice(0, 3);
     if (top.length) {
-      const worded = top.map((r) => REASON_TEXT[r.code] || r.code);
+      /* The refusal carries its own sentence from upstream and it is more
+         specific than anything this table can hold -- 'the recent sales
+         describe more than one version of this card' beats a generic line
+         about withheld data. */
+      const worded = top.map((r) =>
+        (r.code === 'sold_comps_refused' && r.detail) ? r.detail : (REASON_TEXT[r.code] || r.code)
+      );
       lines.push(`Main things working against this: ${worded.join('; ')}.`);
     }
 
     // --- honest closing note -------------------------------------------------
+    /* NOT EVERY REVIEW IS A DATA PROBLEM.
+
+       This line fired on every REVIEW, so an ask sitting a few percent
+       above a ceiling built on twenty completed sales was told 'the data
+       is too thin' -- which is false, and sends somebody off to narrow a
+       search that was already fine. The decision already records WHY it
+       declined; the sentence should say the same thing. */
     if (decision.result === 'REVIEW') {
-      lines.push(`Nothing here is a recommendation to buy or to pass — the data is too thin to support either.`);
+      const f = decision.factors || [];
+      const has = (x) => f.indexOf(x) > -1;
+      lines.push(
+        has('borderline')
+          ? `Nothing here is a recommendation either way — the ask is close enough to the ceiling that it comes down to how badly you want the card.`
+          : has('risk_above_buy_ceiling')
+          ? `The price itself works. It is the risks above that stop this being a straight buy.`
+          : has('sold_comps_refused')
+          ? `Nothing here is a recommendation to buy or to pass — the completed sales exist but are not trustworthy for this card, and asking prices alone are not enough to call it.`
+          : `Nothing here is a recommendation to buy or to pass — the data is too thin to support either.`
+      );
     }
 
     return {
@@ -937,7 +984,7 @@ __def('core/decision', function (module, exports, require) {
    * Every threshold comes from config.decision. No magic numbers here.
    */
 
-  function decide({ calc, request, riskScore, confidence, market, evidence, providerErrors, blockers }, cfg) {
+  function decide({ calc, request, riskScore, confidence, market, evidence, soldRefusal, providerErrors, blockers }, cfg) {
     const d = cfg.decision;
 
     if (blockers && blockers.length) {
@@ -949,6 +996,18 @@ __def('core/decision', function (module, exports, require) {
         result: 'REVIEW',
         reason: 'Active marketplace data is insufficient to produce a reliable resale estimate.',
         factors: market.quality_gate.reasons,
+      };
+    }
+
+    /* Same outcome as before -- REVIEW -- but for the true reason. This used
+       to arrive via providerErrors, so a deliberate refusal was reported as
+       a degraded provider. If the upstream will not publish its median,
+       BuyMax will not turn asking prices into a buy or a pass either. */
+    if (soldRefusal) {
+      return {
+        result: 'REVIEW',
+        reason: `Completed-sale data was withheld: ${soldRefusal.reason}. BuyMax will not call this off asking prices alone.`,
+        factors: ['sold_comps_refused'],
       };
     }
 
@@ -1084,6 +1143,9 @@ __def('core/engine', function (module, exports, require) {
       for (const e of intel.errors || []) providerErrors.push({ provider: 'cardgauge', message: e });
     }
 
+    // Carried separately from providerErrors on purpose. See providers/local.
+    const soldRefusal = intel.sold_refused || null;
+
     const identity = mergeIdentity(request.item, intel.identity);
     const query = category.buildQuery(identity);
 
@@ -1127,6 +1189,7 @@ __def('core/engine', function (module, exports, require) {
         screen,
         soldAvailable,
         soldCount: soldAvailable ? intel.sold.count : null,
+        soldRefusal,
         providerErrors,
       },
       cfg
@@ -1140,6 +1203,7 @@ __def('core/engine', function (module, exports, require) {
         soldAvailable,
         soldCount: soldAvailable ? intel.sold.count : null,
         basis: resaleBasis,
+        soldRefusal,
         providerErrors,
       },
       cfg
@@ -1164,6 +1228,7 @@ __def('core/engine', function (module, exports, require) {
         confidence,
         market: activeMarket,
         evidence: { soldAvailable, soldCount: soldAvailable ? intel.sold.count : null },
+        soldRefusal,
         providerErrors,
         blockers,
       },
@@ -1268,6 +1333,8 @@ __def('core/engine', function (module, exports, require) {
       providers: {
         used: providersUsed,
         errors: providerErrors,
+        // Not an error. The upstream answered and withheld its median.
+        sold_refused: soldRefusal,
       },
 
       meta: {
@@ -1798,10 +1865,30 @@ __def('providers/local', function (module, exports, require) {
       try {
         const raw = await hooks.getSoldComps(ctx.item);
 
-        // An upstream refusal is not missing data — it is a finding, and it must
-        // survive the trip so the engine can say why it will not price the card.
+        /* A REFUSAL IS NOT AN OUTAGE, AND out.errors IS THE OUTAGE CHANNEL.
+
+           The comment that used to sit here was right -- a refusal is a
+           finding -- and then filed it in the one place reserved for
+           things that broke. Everything downstream reads out.errors as
+           provider failure: risk adds providerDegraded, confidence
+           subtracts degradedProviderPenalty, decide() forces REVIEW, and
+           explain prints 'a data source failed, so this analysis is
+           running on less information than usual'.
+
+           Nothing failed. The scanner looked, found a contaminated pool,
+           and declined to publish the median -- which is the behaviour the
+           whole product is built on. Scoring that as an outage told the
+           person their data source was down while the page above showed a
+           hundred completed sales, and cost 20 risk points and 25
+           confidence points for being careful.
+
+           Its own channel, so the engine can weigh it as what it is and
+           say the actual reason instead of a generic failure line. */
         if (raw && (raw.refused === true || raw.refusal_reason)) {
-          out.errors.push(`sold comps refused upstream: ${raw.refusal_reason || 'contaminated comp pool'}`);
+          out.sold_refused = {
+            reason: raw.refusal_reason || 'contaminated comp pool',
+            sold_count: Number(raw.sold_count) || 0,
+          };
           out.available = true;
           return out;
         }
