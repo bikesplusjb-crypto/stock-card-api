@@ -292,6 +292,29 @@ app.post(
           } else {
             console.log("[stripe] checkout.session.completed with NO resolvable email — session " + (obj.id || "?"));
           }
+
+          /* WHICH ROUTE THE PAYMENT ARRIVED BY, IN THE LOG.
+
+             Every checkout link in the codebase already appends
+             client_reference_id -- but only inside `if (currentUser)`,
+             so it is present when somebody was SIGNED IN as they
+             clicked and absent when they were not.
+
+             Both subscriptions on file resolved by "checkout email",
+             which means neither buyer was signed in at the till. That
+             is expected for testing and a problem for a real customer:
+             the email at Stripe is editable, so a typo grants Pro to
+             nobody, and pro_click can never be joined to
+             subscription_paid.
+
+             No behaviour change -- the fallback chain is already right
+             and already ordered correctly. This is one line so the next
+             payment answers the question instead of prompting another
+             archaeology session. */
+          console.log("[stripe] PAID via " + via +
+            (via === "client_reference_id"
+              ? " (signed in at checkout — click and payment can be joined)"
+              : " (NOT signed in at checkout — no user id, funnel cannot be joined)"));
         }
       }
 
