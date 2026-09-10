@@ -5595,7 +5595,51 @@ function priceHealth(card) {
   };
 }
 
-/* GET /api/shop-health?shopId=...&key=...
+/* WHOEVER IS ASKING HAS TO OWN THE SHOP.
+
+   This route's own docstring documented a `key` parameter for years.
+   The handler never read it. Anyone holding a shopId got the whole
+   commercial picture of that business -- every card, what it cost, what
+   it is listed at, cash tied up, capital trapped in aging stock, and
+   what the lot would clear today.
+
+   Worse than an ordinary missing check, because it queries through
+   supabaseAdmin. That is the service-role client, which bypasses row
+   level security entirely -- and RLS on `shops` and `shop_inventory` is
+   correctly configured with four policies each. The database was doing
+   its job; this endpoint went around it.
+
+   A shopId is a UUID, so it is not guessable. But it appears in URLs,
+   in localStorage, in screenshots and in network logs, and "you cannot
+   guess it" is not access control. A shop deciding whether to put its
+   inventory in here is entitled to better than that.
+
+   THE FIX IS THE ONE THE SCHEMA ALREADY IMPLIES. shops.owner_user_id
+   exists. Verify the caller's Supabase token, resolve it to a user, and
+   confirm that user owns the shop being asked about. Two lookups, both
+   indexed.
+
+   Read from the Authorization header rather than a query parameter, so
+   the credential does not end up in Render's request logs the way
+   REFRESH_SECRET does. */
+async function userFromAuthHeader(req) {
+  if (!supabaseAdmin) return null;
+  const h = String(req.headers.authorization || "");
+  const token = h.startsWith("Bearer ") ? h.slice(7).trim() : "";
+  if (!token) return null;
+  try {
+    const { data, error } = await supabaseAdmin.auth.getUser(token);
+    if (error || !data || !data.user) return null;
+    return data.user;
+  } catch (e) {
+    console.log("[auth] token check failed:", e.message);
+    return null;
+  }
+}
+
+/* GET /api/shop-health?shopId=...
+   Authorization: Bearer <supabase access token>
+
    One pass over a shop's inventory returning both readings per card
    plus the totals a shop actually asks about: cash tied up, how much
    is aging, and what the whole lot would clear if it sold today. */
@@ -5604,14 +5648,31 @@ app.get("/api/shop-health", async (req, res) => {
   const shopId = String(req.query.shopId || "").trim();
   if (!shopId) return res.status(400).json({ success: false, error: "shopId required" });
 
+  const user = await userFromAuthHeader(req);
+  if (!user) {
+    return res.status(401).json({ success: false, error: "Sign in to view shop health" });
+  }
+
   try {
     const { data: shop, error: shopErr } = await supabaseAdmin
       .from("shops")
-      .select("id,name,default_target_margin,default_fee_percent,default_shipping_cost")
+      .select("id,name,owner_user_id,default_target_margin,default_fee_percent,default_shipping_cost")
       .eq("id", shopId)
       .maybeSingle();
     if (shopErr) throw new Error(shopErr.message);
     if (!shop) return res.json({ success: false, error: "Shop not found" });
+
+    /* SAME ANSWER FOR "does not exist" AND "not yours" WOULD BE BETTER
+       STILL, but `shop` is needed above for the not-found case and
+       changing that shape would break the caller. What matters is that
+       neither path returns any inventory.
+
+       Compared as strings because one side is a uuid column and the
+       other comes off a JWT. */
+    if (String(shop.owner_user_id || "") !== String(user.id)) {
+      console.log("[shop-health] user " + user.id + " asked for shop " + shopId + " and does not own it");
+      return res.status(403).json({ success: false, error: "That is not your shop" });
+    }
 
     const { data: rows, error: invErr } = await supabaseAdmin
       .from("shop_inventory")
