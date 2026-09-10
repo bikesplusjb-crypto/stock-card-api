@@ -189,6 +189,30 @@ __def('config', function (module, exports, require) {
       identityLowPenalty: num(process.env.BUYMAX_CONF_IDENTITY_LOW_PENALTY, 25),
       // Hard ceiling on analysis confidence while identity is unknown.
       maxWithoutIdentity: num(process.env.BUYMAX_CONF_MAX_WITHOUT_IDENTITY, 70),
+      /* NOTHING HERE EVER EARNS 100.
+
+         The arithmetic saturates without meaning to. Base 20, plus the
+         25 sold-data bonus, plus 36 for comp depth, plus 10 for active
+         listings is 91 BEFORE identity is considered at all -- and the
+         identity bonus then pushes any well-described card straight into
+         the clamp at 100.
+
+         That was invisible while identity_confidence was always null,
+         because maxWithoutIdentity capped everything at 70. The moment
+         the host supplied a real identity hook, the strongest cards
+         jumped from 70 to 100 -- and both numbers were wrong in opposite
+         directions.
+
+         100 out of 100 is a claim, not a measurement. This engine works
+         from a thirty-day window, a median of other people's sales, and
+         an identity read off a photograph; certainty is not available to
+         it at any depth of evidence. The ceiling makes the top of the
+         scale mean "as good as this gets", which is true, rather than
+         "no doubt remains", which is not.
+
+         Applied last, after every bonus and penalty, so it caps the
+         answer rather than distorting the reasoning that produced it. */
+      maxOverall: num(process.env.BUYMAX_CONF_MAX, 95),
     },
 
     // ---------------------------------------------------------------------
@@ -670,6 +694,12 @@ __def('core/confidence', function (module, exports, require) {
     // A cap, not another penalty: no amount of market evidence lifts the
     // analysis past this while the subject of it is unidentified.
     if (identityUnknown) score = Math.min(score, c.maxWithoutIdentity);
+
+    /* And a second ceiling that applies however well the card is known.
+       See config.confidence.maxOverall -- the scale reaches 91 on comp
+       depth alone, so without this the identity bonus lands every strong
+       card on 100. */
+    score = Math.min(score, c.maxOverall);
 
     return clamp(Math.round(score), 0, 100);
   }
