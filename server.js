@@ -3508,6 +3508,56 @@ async function fetchSoldComps(query, limit) {
 /* Cache-first sold lookup. askMedian is passed in only so the history
    row can store the ask and the sold side from the same moment.
    compact=true halves the record spend — used for refinement chips. */
+/* A SEALED MEDIAN THAT IS NOWHERE NEAR THE ASKING PRICE IS NOT A PRICE.
+
+   The sealed filter works. What it cannot fix is that thecardapi's pool
+   for a sealed product is mostly GROUP BREAK TEAM SLOTS -- a breaker
+   sells thirty spots for every box that changes hands as a box.
+
+   Measured on the first live run, 10 Sept:
+
+     2026 Topps Series 1 hobby box
+     62 records, 31 rejected as break slots (correctly, by name),
+     31 survived -> median $13, range $6-$32
+     ask side, same card: $135 low / $220 typical / $370 high
+
+   Thirty-one clean records is not a thin pool, so nothing flagged. The
+   number was simply seventeen times too small, and a shop reading $13
+   for a $220 box is the exact failure this whole file exists to
+   prevent.
+
+   No filter can catch it, because the surviving records are not
+   contaminated -- they are real sales of a real thing that is not the
+   thing being priced. What catches it is the comparison askVsSold has
+   always made for singles: a gap this wide means the two sides describe
+   different objects. IMPLAUSIBLE_GAP_PCT is 65% there; a factor of four
+   here, which is deliberately looser, because sealed asks genuinely do
+   sit above sold and the point is to catch $13-against-$220 rather than
+   to police ordinary spread.
+
+   Refuses the median rather than adjusting it. The ask side still shows
+   with its own caveat, which is the honest answer: we know what people
+   are asking for this box and we do not know what it sold for. */
+const SEALED_ASK_SANITY_X = Number(process.env.SEALED_ASK_SANITY_X || 4);
+
+function sealedSanityCheck(sold, askMedian) {
+  if (!sold || sold.soldIsSealed !== true) return sold;
+  const med = Number(sold.soldMedian);
+  const ask = Number(askMedian);
+  if (!(med > 0) || !(ask > 0)) return sold;
+  if (med * SEALED_ASK_SANITY_X > ask) return sold;   // within range, leave alone
+
+  sold.soldLimited     = true;
+  sold.soldBasis       = "limited";
+  sold.soldSealedNoise = true;
+  sold.soldWarning =
+    "These sales average $" + Math.round(med) + " while this product is listed around $" +
+    Math.round(ask) + ". Completed-sale data for sealed product is mostly group-break " +
+    "team slots, not boxes — so there is no trustworthy sold price here. The asking " +
+    "prices above are the better guide.";
+  return sold;
+}
+
 async function getSoldComps(query, askMedian, compact) {
   if (!CARDAPI_KEY) return null;
   const limit = compact ? CARDAPI_LIMIT_COMPACT : CARDAPI_LIMIT;
@@ -3515,7 +3565,11 @@ async function getSoldComps(query, askMedian, compact) {
   if (!key) return null;
 
   const hit = await readSoldCache(key);
-  if (hit) { hit.cached = true; return hit; }
+  /* Applied on the cached path too. The check depends on the ASK, which
+     is not part of what gets cached and can differ between two callers
+     looking at the same card -- so it has to run on the way out, not on
+     the way in. */
+  if (hit) { hit.cached = true; return sealedSanityCheck(hit, askMedian); }
 
   const fresh = await fetchSoldComps(query, limit);
   if (!fresh || fresh.rateLimited) return fresh;
@@ -3526,7 +3580,12 @@ async function getSoldComps(query, askMedian, compact) {
      different slice of the market (one grade, or raw only) and would
      corrupt the daily series for the card as a whole. */
   if (!compact) await recordPriceHistory(key, fresh.query, fresh, askMedian);
-  return fresh;
+  /* After the cache write and after the history write, both of which
+     should record what the API actually returned. The refusal is a
+     presentation decision about THIS lookup, not a claim that the
+     records were wrong -- and soldLimited already keeps them out of the
+     permanent series on its own. */
+  return sealedSanityCheck(fresh, askMedian);
 }
 
 /* Ask vs sold — the spread nobody else shows.
