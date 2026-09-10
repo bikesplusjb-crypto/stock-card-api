@@ -1262,6 +1262,22 @@ const NOT_THE_PRODUCT = [
   "box only", "no cards", "card removed", "cards removed", "opened",
   "resealed", "damaged box", "crushed",
   "1 pack from", "one pack from", "single pack from", "pack from a",
+  /* BARE "break" AND "breaks", NOT JUST THE COMPOUNDS.
+
+     The compound forms caught 30 of 62 records on the first live test
+     and let 31 through, which then produced a $13 median for a $220
+     box. A title reading "Hobby 3-Box Break 1" matched "box break"; the
+     survivors said it some other way and nothing stopped them.
+
+     For a sealed query the word is decisive on its own. A group breaker
+     sells thirty team slots for every box that changes hands as a box,
+     so "break" in a sealed title is almost always a slot rather than a
+     product -- and a slot is not a physical object at all.
+
+     Safe here in a way it would not be for singles: hasWord() matches on
+     boundaries, so "breakers" and "breaking" do not trigger it, and this
+     list is only ever consulted when looksSealed(query) is true. */
+  "break", "breaks",
   "break slot", "personal break", "random team", "random player",
   "case break", "box break", "spot", "slot",
   "display only", "empty display", "promo only", "sell sheet", "dummy"
@@ -2702,7 +2718,11 @@ const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
    Twice in one afternoon. The rule this keeps failing to encode: adding
    a FIELD to the payload is a logic change, not an additive one, because
    readers gate on its presence. */
-const SOLD_LOGIC_VERSION = 7;
+/* v7 -> v8 (2026-09-10). NOT_THE_PRODUCT gained bare "break"/"breaks".
+   Every v7 sealed row was filtered by a list that let group-break team
+   slots through -- 31 of 62 on the measured case, producing a $13
+   median for a $220 box. */
+const SOLD_LOGIC_VERSION = 8;
 
 /* The cache key must carry the limit. Without it a 50-record compact pull
    gets stored under the same key as a full lookup and is then served back
@@ -3544,7 +3564,36 @@ function sealedSanityCheck(sold, askMedian) {
   if (!sold || sold.soldIsSealed !== true) return sold;
   const med = Number(sold.soldMedian);
   const ask = Number(askMedian);
-  if (!(med > 0) || !(ask > 0)) return sold;
+  if (!(med > 0)) return sold;
+
+  /* NO ASK MEANS NO CROSS-CHECK, WHICH IS NOT THE SAME AS PASSING.
+
+     The first version returned early when the ask was missing, and that
+     is exactly the case that reached a screen: a photographed box with
+     no usable active listings, so askMedian was 0, so the guard skipped
+     and $13 printed under "WHAT IT ACTUALLY SOLD FOR".
+
+     A guard whose reference is absent should say it cannot tell, not
+     wave the number through. With no ask to compare against, the pool's
+     own coherence is the only evidence left -- and a sealed product's
+     real sales cluster tightly, because there is one version of it.
+     Anything spanning more than 3x without a second opinion is not a
+     price. */
+  if (!(ask > 0)) {
+    const lo = Number(sold.soldLow), hi = Number(sold.soldHigh);
+    if (lo > 0 && hi > 0 && hi / lo > 3) {
+      sold.soldLimited     = true;
+      sold.soldBasis       = "limited";
+      sold.soldSealedNoise = true;
+      sold.soldWarning =
+        "These sales run from $" + Math.round(lo) + " to $" + Math.round(hi) +
+        ", and there are no active listings to check them against. Completed-sale " +
+        "data for sealed product is mostly group-break team slots rather than boxes, " +
+        "so this is not a price worth trusting.";
+    }
+    return sold;
+  }
+
   if (med * SEALED_ASK_SANITY_X > ask) return sold;   // within range, leave alone
 
   sold.soldLimited     = true;
@@ -3558,13 +3607,34 @@ function sealedSanityCheck(sold, askMedian) {
   return sold;
 }
 
-async function getSoldComps(query, askMedian, compact) {
+/* THE OWNER FLAG NEVER REACHED THE BACKEND.
+
+   ?owner=1 has excluded Sebastian from analytics since it was added --
+   scan_events, saves, the funnel. It does nothing to the comp cache,
+   because every p_is_owner in this file is hardcoded false and the
+   lookup endpoints never read it.
+
+   That gap cost four SOLD_LOGIC_VERSION bumps on 10 Sept, all of them
+   made purely so a filter change could be SEEN. Bumping the version
+   discards every user's cache to let one person test, which is an
+   expensive way to reload a page.
+
+   `fresh` skips the READ and keeps the WRITE, so an owner lookup still
+   fills the cache for everyone behind them. Costs 100 records per
+   bypassed lookup against a 50,000/day allowance.
+
+   Deliberately not authenticated. The flag is a localStorage value the
+   browser sends, so anyone can set it -- and the worst they can do is
+   spend records that are already sitting unused at 2% of the daily
+   budget. An auth check here would cost more than the thing it
+   protects. */
+async function getSoldComps(query, askMedian, compact, fresh) {
   if (!CARDAPI_KEY) return null;
   const limit = compact ? CARDAPI_LIMIT_COMPACT : CARDAPI_LIMIT;
   const key = cacheKeyFor(query, limit);
   if (!key) return null;
 
-  const hit = await readSoldCache(key);
+  const hit = fresh ? null : await readSoldCache(key);
   /* Applied on the cached path too. The check depends on the ASK, which
      is not part of what gets cached and can differ between two callers
      looking at the same card -- so it has to run on the way out, not on
@@ -4048,7 +4118,8 @@ app.get("/api/card-market", async (req, res) => {
 
     const market = await getEbayCardMarket(query);
     const clean  = normalizeCardQuery(query);
-    const sold   = await getSoldComps(clean, market.avgPrice, compact);
+    const sold   = await getSoldComps(clean, market.avgPrice, compact,
+                                      req.query.fresh === "1");
 
     res.json({
       success:           true,
@@ -4477,7 +4548,12 @@ app.post(
       const market        = await getCardMarketForCard(ai);
       const searchQuery   = market.searchQuery || buildCardQuery(ai) || cleanCardName;
 
-      let sold      = await getSoldComps(searchQuery, market.avgPrice);
+      /* Owner mode bypasses the comp cache -- see getSoldComps. Read
+         from the multipart body because /api/scan-card is a POST with
+         no query string of its own. */
+      const wantFresh = String((req.body && req.body.fresh) || "") === "1";
+
+      let sold      = await getSoldComps(searchQuery, market.avgPrice, false, wantFresh);
       let soldQuery = searchQuery;
 
       /* See detectListingYear() above. Only fires when the sold lookup
