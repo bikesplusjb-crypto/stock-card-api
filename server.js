@@ -628,6 +628,27 @@ function stripQueryJunk(q) {
      zeros from BOTH sides of any digit/digit fraction found anywhere
      in the text; a genuine "0" (from "000/999") survives since \d+
      still needs at least one digit left after the zeros are consumed. */
+  /* "SERIES ONE" FINDS NOTHING. "SERIES 1" FINDS A HUNDRED.
+
+     Measured on the first live sealed test, 10 Sept:
+
+       2026 Topps hobby box              100 records
+       2026 Topps series one hobby box     0 records
+
+     Adding a correct, more specific term took the result to zero,
+     because thecardapi indexes the product as "Series 1" and a query
+     saying "Series One" matches nothing at all. Same shape as the
+     leading-zero fraction and the letters-only card number: a query
+     that is right about the card and wrong about the index.
+
+     parseCardQuery() already normalises this for the typed path
+     (KNOWN_SETS carries "Update Series"), and printCodeKey() does the
+     same for its own lookup -- but neither runs on the string that
+     actually reaches the API. This does, for every path. */
+  out = out.replace(/\bseries\s+one\b/gi, "Series 1")
+           .replace(/\bseries\s+two\b/gi, "Series 2")
+           .replace(/\bseries\s+three\b/gi, "Series 3");
+
   /* NOTE the missing \s* before the slash, and why it matters.
 
      This used to allow whitespace on BOTH sides, which meant it also
@@ -2649,6 +2670,23 @@ const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
    nothing depends on this bump -- but a v4 row served for twelve hours
    is still an answer from a function that no longer exists, which is
    the whole reason this constant is here. */
+/* v6 -> v7 (2026-09-10). Two shape changes in one deploy, and the rule
+   from the v6 note applies to both: adding a FIELD is a logic change,
+   because readers gate on its presence.
+
+     - summarizeSold's EARLY RETURN now carries soldIsSealed/soldConfig,
+       which the main return already had. A sealed query that found
+       nothing came back without the field and was indistinguishable
+       from a query that was never sealed.
+     - normalizeCardQuery now rewrites "Series One" to "Series 1", which
+       changes the query string itself and therefore the answer. Measured
+       the same morning: "2026 Topps series one hobby box" returned 0
+       records where "2026 Topps hobby box" returned 100.
+
+   The second one alone would justify the bump -- every v6 row for a
+   Series One product was an answer to a query that no longer gets
+   sent. */
+
 /* v5 -> v6 (2026-09-09, an hour after v5). summarizeSold now also
    returns soldWideBase -- whether the base sales span more than one
    card. Added it to the payload and left this constant at 5, which is
@@ -2664,7 +2702,7 @@ const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
    Twice in one afternoon. The rule this keeps failing to encode: adding
    a FIELD to the payload is a logic change, not an additive one, because
    readers gate on its presence. */
-const SOLD_LOGIC_VERSION = 6;
+const SOLD_LOGIC_VERSION = 7;
 
 /* The cache key must carry the limit. Without it a 50-record compact pull
    gets stored under the same key as a full lookup and is then served back
@@ -2756,7 +2794,22 @@ function summarizeSold(records, query, limitUsed) {
       soldGradeBreakdown: [], bestOfferCount: 0, lastSaleDate: null,
       sales: [], query: query, lookbackDays: CARDAPI_LOOKBACK,
       limitUsed: limitUsed || CARDAPI_LIMIT,
-      soldBasis: "none", soldWarning: "", soldContaminated: false
+      soldBasis: "none", soldWarning: "", soldContaminated: false,
+      /* THE EARLY RETURN IS STILL AN ANSWER, AND IT HAS TO HAVE THE SAME
+         SHAPE AS THE OTHER ONE.
+
+         soldIsSealed was added to the main return only, so a sealed
+         query that found nothing came back without the field at all --
+         and a caller checking for it could not tell "not sealed" from
+         "sealed, no data". Which is exactly what happened on the first
+         live test: 2026 Topps series one hobby box returned 0 records,
+         took this branch, and looked like the sealed code had not run.
+
+         Same failure as the soldWideBase cache-shape miss: a field added
+         to one code path and not the other. */
+      soldIsSealed: looksSealed(query),
+      soldConfig: looksSealed(query) ? sealedConfigOf(query) : null,
+      soldLotsFound: 0
     };
   }
 
