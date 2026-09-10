@@ -949,7 +949,18 @@ function resolvePokemonSet(ai) {
   return named;
 }
 
-function isLikelyCardListing(title) {
+/* THE NEGATIVE LIST RUNS BACKWARDS FOR A SEALED PRODUCT.
+
+   Every sealed term below sits in `negative` for a good reason, recorded
+   there: a $1 hobby-box listing once became the entire ask pool for a
+   green /99 autograph, and the app built a full recommendation on it.
+   Those stay exactly where they are.
+
+   But when the thing being PRICED is a box, that same list rejects every
+   correct listing and keeps every wrong one. So the second argument
+   flips which list is which. Default false, so every existing caller
+   behaves identically -- the singles path cannot change. */
+function isLikelyCardListing(title, sealedMode) {
   const t = String(title || "").toLowerCase();
   /* A SEALED BOX IS NOT A CARD, AND IT USED TO PASS AS ONE.
 
@@ -986,6 +997,21 @@ function isLikelyCardListing(title) {
     "break slot","random team","case break","box break",
     "lot of","card lot","bulk lot","repack","mystery box","mystery pack"
   ];
+  if (sealedMode) {
+    /* A sealed listing must NAME a configuration -- that is what makes
+       it sealed rather than a single. And the things that are not the
+       product (an empty box, a wrapper, one pack pulled from a box, a
+       break slot) are rejected here as well as on the sold side, so a
+       $9 empty box never reaches the ask median either. */
+    if (!sealedConfigOf(t)) return false;
+    if (notTheProductWord(t)) return false;
+    /* Still not a poster, a plush or a digital code. */
+    const junk = ["poster","plush","figure","toy","shirt","t-shirt","costume",
+                  "keychain","funko","blanket","pillow","wallet","phone case",
+                  "digital","code card only","sticker only"];
+    return !junk.some(w => t.includes(w));
+  }
+
   return positive.some(w => t.includes(w)) && !negative.some(w => t.includes(w));
 }
 
@@ -1114,6 +1140,180 @@ const NOT_THE_CARD = [
 ];
 
 const PARALLEL_WORDS = COLOR_WORDS.concat(TEXTURE_WORDS).concat(POKEMON_WORDS);
+
+/* ══════════════════════════════════════════════════════════════
+   SEALED PRODUCT
+
+   A shop's money is mostly in sealed, not singles, and none of the hard
+   parts of this file apply to it. A card has forty versions -- parallels,
+   serials, grades, autos, inserts -- and every word list above exists to
+   tell them apart. A hobby box is one thing with the year printed on it
+   in enormous letters.
+
+   Measured before any of this was written, by typing two queries into
+   the live scanner on 9 Sept:
+
+     2018 Topps Chrome hobby box    2 sales    $460, $209
+     2026 Topps hobby box         100+ sales    $300 median
+
+   So thecardapi carries sealed, and a current product has FAR more depth
+   than most singles -- a hundred sales in thirty days where a parallel
+   returns three.
+
+   CONFIGURATION IS THE PARALLEL PROBLEM IN A SMALLER VOCABULARY. That
+   $300 median came back with an $1,800 sale in the same pool, which is a
+   CASE -- six boxes in one lot. Hobby, blaster, mega and case are
+   different products at very different prices, exactly as a base card
+   and a Superfractor are. The difference is that this list is twelve
+   terms rather than the hundreds above.
+
+   ORDER MATTERS. "hobby case" contains "hobby", so the case terms are
+   tested first -- the same trap printCodeKey() hits with "topps chrome
+   update" against "topps chrome". sealedConfigOf() walks this array in
+   order and returns the first hit, so do not sort it alphabetically. */
+const SEALED_CONFIGS = [
+  "hobby case", "blaster case", "mega case", "retail case", "sealed case",
+  "case",
+  "hobby box", "hobby",
+  "blaster box", "blaster",
+  "mega box", "mega",
+  "jumbo box", "jumbo",
+  "hanger box", "hanger",
+  "value box", "value pack",
+  "fat pack", "cello",
+  "booster box", "booster bundle", "booster pack",
+  "retail box", "retail",
+  "tin",
+  "box", "pack"
+];
+
+/* Which configuration a piece of text describes, normalised so the
+   variants collapse: "hobby box" and "hobby" are the same shelf, and a
+   seller writes both. Returns null when the text names none, which is
+   the signal that this is not a sealed query at all. */
+function sealedConfigOf(text) {
+  const t = " " + String(text || "").toLowerCase()
+                    .replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ") + " ";
+  for (let i = 0; i < SEALED_CONFIGS.length; i++) {
+    const w = SEALED_CONFIGS[i];
+    if (t.indexOf(" " + w + " ") > -1) {
+      /* Collapse to the family. A "hobby box" and a "hobby" are one
+         product; a "hobby case" is not either of them. */
+      if (/case/.test(w))     return "case";
+      if (/hobby/.test(w))    return "hobby";
+      if (/blaster/.test(w))  return "blaster";
+      if (/mega/.test(w))     return "mega";
+      if (/jumbo/.test(w))    return "jumbo";
+      if (/hanger/.test(w))   return "hanger";
+      if (/value|fat pack|cello/.test(w)) return "value";
+      if (/booster bundle/.test(w))       return "bundle";
+      if (/booster pack|^pack$/.test(w))  return "pack";
+      if (/booster box|retail box|^box$/.test(w)) return "box";
+      if (/retail/.test(w))   return "retail";
+      if (/tin/.test(w))      return "tin";
+      return w;
+    }
+  }
+  return null;
+}
+
+/* Is the thing being PRICED a sealed product? Read off the query, the
+   same way targetIsParallel and targetIsSpecial are, so it only fires
+   when the words genuinely made it into the search rather than on
+   anything the model guessed. */
+function looksSealed(query) {
+  const t = String(query || "").toLowerCase();
+  if (!/\b(box|case|pack|tin|bundle|cello|hanger|jumbo|blaster|booster)\b/.test(t)) return false;
+  return sealedConfigOf(t) !== null;
+}
+
+/* NOT THE PRODUCT -- the sealed equivalent of NOT_THE_CARD.
+
+   Sealed has its own ways of being something else entirely, and they
+   are worse than a wrong card because they are so much cheaper. An
+   empty box sells for $8 against a $300 box. One pack pulled from a box
+   sells for $25. A break slot is not a physical object at all.
+
+   "break slot", "random team" and "personal break" already appear in
+   the singles negative list for the same reason. */
+const NOT_THE_PRODUCT = [
+  "empty box", "empty", "wrapper only", "wrapper", "wrappers",
+  "box only", "no cards", "card removed", "cards removed", "opened",
+  "resealed", "damaged box", "crushed",
+  "1 pack from", "one pack from", "single pack from", "pack from a",
+  "break slot", "personal break", "random team", "random player",
+  "case break", "box break", "spot", "slot",
+  "display only", "empty display", "promo only", "sell sheet", "dummy"
+];
+
+function notTheProductWord(title) {
+  const t = " " + String(title || "").toLowerCase()
+                    .replace(/[^a-z0-9 -]/g, " ").replace(/\s+/g, " ") + " ";
+  return NOT_THE_PRODUCT.find(w => hasWord(t, w)) || null;
+}
+
+/* HOW MANY UNITS IS THIS LISTING?
+
+   A lot price is not a unit price, and on sealed it is the single
+   biggest source of the wide spreads seen in testing -- "3x hobby box"
+   at $900 sits in the same pool as one box at $300 and drags the median
+   up by a multiple.
+
+   Returns the count so the caller can divide. 1 when the listing is a
+   single unit, which is the common case. Deliberately conservative: a
+   number it cannot read confidently returns 1 and the listing prices as
+   one unit, which is the existing behaviour rather than a new error. */
+function sealedUnitCount(title) {
+  const t = " " + String(title || "").toLowerCase()
+                    .replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ") + " ";
+  let m;
+  /* "3x hobby box" -- but a real title is "3x 2026 Topps Series One
+     Hobby Box", with the year and the product name in between. An
+     earlier version required the configuration word immediately after
+     the count and therefore never fired on anything real: a $900
+     three-box lot priced as one $900 box.
+
+     So the count and the configuration are checked separately. The
+     multiplier only counts when the title ALSO names a sealed
+     configuration, which the caller has already established, so "20x30
+     inch" on a poster cannot reach this. */
+  m = t.match(/\b(\d{1,2})\s*x\b/);
+  if (m && sealedConfigOf(t)) {
+    const n1 = parseInt(m[1], 10);
+    if (n1 > 1 && n1 <= 24) return n1;
+  }
+  /* "lot of 4 boxes", "lot of 2 hobby" */
+  m = t.match(/\blot of (\d{1,2})\b/);
+  if (m) return Math.max(1, Math.min(24, parseInt(m[1], 10)));
+  /* "4 box lot", "2 blaster lot" */
+  m = t.match(/\b(\d{1,2})\s+(?:hobby |blaster |mega |jumbo |retail |booster )?(?:box|boxes|case|cases|pack|packs|tin|tins)\s+lot\b/);
+  if (m) return Math.max(1, Math.min(24, parseInt(m[1], 10)));
+  return 1;
+}
+
+/* Is a SOLD record the sealed product being priced?
+
+   Mirrors saleRejectReason() and returns the same { rule, reason } shape
+   so CompGuard's receipt renders it without changes. */
+function sealedRejectReason(r, wantConfig) {
+  const w = notTheProductWord(r.title);
+  if (w) return { rule: "not_the_product:" + w, reason: "Not the sealed product \u2014 " + w };
+
+  /* A different configuration is a different product. Only checked when
+     the query itself named one -- a bare "2026 Topps box" has nothing to
+     compare against and everything passes, which is honest. */
+  if (wantConfig) {
+    const got = sealedConfigOf(r.title);
+    if (got && got !== wantConfig) {
+      return { rule: "wrong_config:" + got, reason: "Different configuration \u2014 " + got };
+    }
+  }
+
+  const lr = listingReject(r.title);
+  if (lr) return lr;
+  return null;
+}
+
 
 /* ── WORD-BOUNDARY MATCHING ─────────────────────────────────────
 
@@ -2127,6 +2327,11 @@ async function fetchEbayListings(query, limit) {
     const cleanQuery = normalizeCardQuery(query);
     if (!token || !cleanQuery) return [];
 
+    /* Decided from the query rather than passed in, so every caller --
+       the scan path, the typed path, the watchlist refresh -- gets the
+       right filter without any of them having to know sealed exists. */
+    const sealedMode = looksSealed(cleanQuery);
+
     const url =
       "https://api.ebay.com/buy/browse/v1/item_summary/search?q=" +
       encodeURIComponent(cleanQuery) + "&limit=" + (limit || EBAY_FETCH_LIMIT);
@@ -2143,9 +2348,13 @@ async function fetchEbayListings(query, limit) {
     const rawItems = Array.isArray(data.itemSummaries) ? data.itemSummaries : [];
 
     return rawItems
-      .filter(item => isLikelyCardListing(item.title))
+      .filter(item => isLikelyCardListing(item.title, sealedMode))
       .map(item => {
-        const g = detectGrade(item.title);
+        /* A box is not graded. Reading a grade off a sealed title finds
+           the seller advertising what came out of it -- "Hobby Box PSA
+           10 hits" -- and files the box as a slab. */
+        const g = sealedMode ? { graded: false, company: null, grade: null }
+                             : detectGrade(item.title);
         return {
           title:        item.title || "",
           price:        safeNumber(item.price && item.price.value, 0),
@@ -2551,6 +2760,46 @@ function summarizeSold(records, query, limitUsed) {
     };
   }
 
+  /* ── SEALED PRODUCT ─────────────────────────────────────────────
+
+     Read off the query, exactly as targetIsParallel is below. Every
+     sealed behaviour in this function is gated on this flag, so a
+     singles lookup runs the identical code it ran before -- which is
+     the whole safety property of this change.
+
+     wantConfig is the configuration the query asked for: hobby, blaster,
+     case. Null when the query did not name one, in which case nothing is
+     filtered on it and the wide-spread guard is left to say so. */
+  const targetIsSealed = looksSealed(query);
+  const wantConfig     = targetIsSealed ? sealedConfigOf(query) : null;
+
+  /* A LOT PRICE IS NOT A UNIT PRICE, AND ON SEALED IT IS THE BIGGEST
+     SINGLE DISTORTION.
+
+     Measured on 2026 Topps hobby box: a $300 median with an $1,800 sale
+     in the same pool. That $1,800 is a case -- six boxes, one price --
+     and left undivided it drags every statistic up.
+
+     Normalised BEFORE the median rather than filtered out, because a
+     three-box lot at $900 is real evidence that a box is worth $300.
+     Throwing it away loses information; dividing it keeps it. The
+     original is preserved so the sale row still shows what actually
+     changed hands.
+
+     Only runs for sealed. A "lot of 3" singles listing is still
+     rejected outright by NOT_THE_CARD, unchanged. */
+  if (targetIsSealed) {
+    clean.forEach(function (r) {
+      const units = sealedUnitCount(r.title);
+      if (units > 1) {
+        r.lotUnits    = units;
+        r.lotPrice    = r.price;
+        r.price       = Math.round((r.price / units) * 100) / 100;
+        r.perUnit     = true;
+      }
+    });
+  }
+
   const prices = clean.map(r => r.price).sort((a, b) => a - b);
 
   /* If the card being priced IS a parallel, stripping parallels would
@@ -2599,7 +2848,14 @@ function summarizeSold(records, query, limitUsed) {
     if (targetIsParallel || targetIsSpecial || targetIsVariation) return group;
     const base = [];
     group.forEach(function (r) {
-      const why = saleRejectReason(r);
+      /* Sealed asks a different question of a listing. saleRejectReason
+         checks print runs, parallels and autographs -- none of which a
+         box has -- and would pass an empty wrapper straight through
+         while rejecting nothing that matters. sealedRejectReason checks
+         what actually goes wrong here: the wrong configuration, an empty
+         box, a single pack pulled from one, a break slot. */
+      const why = targetIsSealed ? sealedRejectReason(r, wantConfig)
+                                 : saleRejectReason(r);
       if (!why) { base.push(r); return; }
       if (tag === "raw") {
         rejected.push({ price: r.price, title: r.title,
@@ -2646,7 +2902,11 @@ function summarizeSold(records, query, limitUsed) {
   };
 
   clean.forEach(r => {
-    const g = gradeOf(r);
+    /* A sealed box is not graded, and the title routinely contains a
+       grade word anyway -- "2026 Topps Hobby Box PSA 10 hits!" is a
+       seller advertising what came out of it. Running gradeOf() on that
+       would file the box in the graded pool and empty the raw one. */
+    const g = targetIsSealed ? null : gradeOf(r);
     r.isGraded = !!g;
     if (g) {
       if (!r.grader) r.grader = g.company;   // fill from the title
@@ -2711,7 +2971,10 @@ function summarizeSold(records, query, limitUsed) {
   const auctionMed   = median(auctionP);
   const dates = clean.map(r => r.saleDate).filter(Boolean).sort();
 
-  const ladder = soldGradeBreakdown(ladderSrc);
+  /* No grade ladder for a box. There is no PSA 10 version of a sealed
+     product, and a ladder built from grade words in seller titles would
+     be describing the cards inside. */
+  const ladder = targetIsSealed ? [] : soldGradeBreakdown(ladderSrc);
   const rawMed = median(rawP);
 
   /* The headline number must describe ONE thing. A raw card is not worth
@@ -2770,9 +3033,13 @@ function summarizeSold(records, query, limitUsed) {
        contaminated median; this one exists because there no longer is
        one. The pool is thin or empty and nothing was substituted. */
     limited = true;
-    warning = "Only " + filt.rawBase + " clean base-card sale" +
-              (filt.rawBase === 1 ? "" : "s") + " out of " + filt.rawAll +
-              " ungraded. Too few to price from — review before pricing.";
+    warning = targetIsSealed
+      ? ("Only " + filt.rawBase + " clean sale" + (filt.rawBase === 1 ? "" : "s") +
+         " of this exact product out of " + filt.rawAll +
+         ". Too few to price from — review before pricing.")
+      : ("Only " + filt.rawBase + " clean base-card sale" +
+         (filt.rawBase === 1 ? "" : "s") + " out of " + filt.rawAll +
+         " ungraded. Too few to price from — review before pricing.");
   } else if (!useFixed && useRaw && fixedP.length > 0 && fixedMed >= rawMed * 3) {
     /* The penny-auction split. Fixed-price copies are selling for
        several times what auctions close at, but there are too few
@@ -2935,6 +3202,12 @@ function summarizeSold(records, query, limitUsed) {
        tell "too little evidence" from "too much of the wrong kind" --
        they need different answers from the person. */
     soldWideBase: wideBase,
+    /* So the scanner can say "product" rather than "card", and so a
+       caller can tell a box result from a single without re-parsing the
+       query. */
+    soldIsSealed:  targetIsSealed,
+    soldConfig:    wantConfig,
+    soldLotsFound: clean.filter(function (r) { return r.perUnit; }).length,
     soldGraded: { count: graded.length, median: median(grP) },
     soldRawBasis:      filt.rawFellBack ? "ungraded" : "base",
     soldBaseCount:     filt.rawBase,
