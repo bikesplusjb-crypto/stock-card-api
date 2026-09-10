@@ -9180,8 +9180,89 @@ app.post("/api/sendgrid-webhook", async (req, res) => {
    resolved, and every BuyMax route returned this file's own "Endpoint
    not found". A working mount and an unreachable one look identical
    from the logs. */
+/* BUYMAX WAS BEING TOLD NOTHING ABOUT THE CARD, SO IT ASSUMED THE WORST.
+
+   The mount supplied getSoldComps and nothing else. providers/local.js
+   only runs its identity block when a getIdentity hook exists, so
+   intel.identity_confidence was ALWAYS null -- and null is not neutral
+   in that engine:
+
+     risk        +15  noIdentityConfidence
+     confidence  -20  identityUnknownPenalty
+     confidence  capped at 70  (maxWithoutIdentity)
+
+   Every real BuyMax result carried it. Read straight off the event log
+   on 10 Sept -- eighteen checks across twelve sessions, and the
+   confidence values are 70, 70, 70, 70, 70, 67, 15. Seventy is not a
+   measurement, it is the ceiling.
+
+   And it was wrong about the card. By the time somebody types an asking
+   price, the scanner has read both sides, identified the player, the
+   year, the set and the card number, checked the number against the
+   catalog, and found completed sales for it. The panel sends all of
+   that. BuyMax simply never asked.
+
+   WHAT THIS IS, AND WHAT IT IS NOT. It scores how completely the card
+   is described, not whether the description is correct -- those are
+   different questions and only the catalog can answer the second. So it
+   is capped well below certainty, and a card carrying nothing but a
+   name still returns null, which is the honest answer and the existing
+   behaviour.
+
+   Deliberately no network call. verifyAgainstCatalog() would be the
+   real check and it costs catalog records, which are the tightest
+   budget in this file -- and the scan has already run it. Spending them
+   again to re-answer a question BuyMax could infer from the fields in
+   front of it would be paying twice for one answer. */
+function identityConfidenceFromItem(item) {
+  const it = item || {};
+  const has = (v) => {
+    const t = String(v == null ? "" : v).trim();
+    return t && !/^(unknown|n\/a|none|-)$/i.test(t);
+  };
+
+  /* A name on its own is what an unidentified card looks like: the
+     query string and nothing behind it. */
+  const supporting = [
+    has(it.player),
+    has(it.year) && /^(18|19|20)\d{2}$/.test(String(it.year).trim()),
+    has(it.set) || has(it.brand),
+    has(it.card_number) && /[0-9]/.test(String(it.card_number))
+  ].filter(Boolean).length;
+
+  if (supporting === 0) return null;
+
+  /* 55 for one supporting field, rising to 85 for all four. The floor
+     sits just under BUYMAX_IDENTITY_FLOOR (60) on purpose, so a card
+     described by one field alone still reads as weakly identified
+     rather than adequately identified. The ceiling stays under 90
+     because completeness is not verification. */
+  const score = 55 + supporting * 7.5;
+
+  /* A stated condition and a resolved parallel are the two fields that
+     most often separate a $3 card from a $300 one, so they are worth a
+     little on top -- but only once the card is otherwise well
+     described. */
+  let bonus = 0;
+  if (supporting >= 3 && has(it.condition)) bonus += 3;
+  if (supporting >= 3 && (has(it.parallel) || has(it.serial_number))) bonus += 2;
+
+  return Math.min(90, Math.round(score + bonus));
+}
+
 mountBuyMax(app, {
-  local: { getSoldComps: makeCardGaugeHook(getSoldComps) }
+  local: {
+    getSoldComps: makeCardGaugeHook(getSoldComps),
+    /* Synchronous work in an async hook. providers/local.js awaits it
+       and reads identity_confidence off the result, so the shape has to
+       match what it expects from an HTTP identify call. */
+    getIdentity: async function (item) {
+      return {
+        identity: item || null,
+        identity_confidence: identityConfidenceFromItem(item)
+      };
+    }
+  }
 });
 
 app.use((req, res) => {
