@@ -3628,13 +3628,15 @@ function sealedSanityCheck(sold, askMedian) {
    spend records that are already sitting unused at 2% of the daily
    budget. An auth check here would cost more than the thing it
    protects. */
-async function getSoldComps(query, askMedian, compact, fresh) {
+async function getSoldComps(query, askMedian, compact, skipCache) {
   if (!CARDAPI_KEY) return null;
   const limit = compact ? CARDAPI_LIMIT_COMPACT : CARDAPI_LIMIT;
   const key = cacheKeyFor(query, limit);
   if (!key) return null;
 
-  const hit = fresh ? null : await readSoldCache(key);
+  /* Named skipCache, not fresh: `fresh` is already the local holding
+     the freshly-fetched payload a few lines down. */
+  const hit = skipCache ? null : await readSoldCache(key);
   /* Applied on the cached path too. The check depends on the ASK, which
      is not part of what gets cached and can differ between two callers
      looking at the same card -- so it has to run on the way out, not on
