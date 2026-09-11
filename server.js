@@ -1873,9 +1873,34 @@ function buildQueryTiers(ai) {
 
   let tight, core, loose;
   if (poke) {
-    // "pokemon" is forced in so eBay lands in the right category, and the
-    // variant is deliberately left out of the keywords.
-    tight = joinParts(["pokemon", lang, player, set, num, serial, auto, patch, grade]);
+    /* THE VARIANT WAS LEFT OUT, AND THAT PRICED AN ILLUSTRATION RARE AS
+       A COMMON.
+
+       "pokemon" is forced in so eBay lands in the right category. The
+       variant used to be deliberately omitted -- and the consequence is
+       the same bug the auto comment above describes, in a different
+       vocabulary.
+
+       targetIsParallel is computed from the QUERY. With the variant
+       missing it always read false for Pokemon, so narrow() stripped
+       the parallel sales and kept the base ones, and the card was
+       priced off exactly the sales that are not it.
+
+       Seen on a real scan, 11 Sept:
+
+         2023 Pokemon Obsidian Flames Beedrill ex Illustration Rare
+         q = "pokemon Beedrill ex Obsidian Flames 98/86"
+         BROADENED loose -> "pokemon Beedrill ex" (44 sales) -> $5
+
+       An Illustration Rare priced off every Beedrill ex ever printed.
+
+       par is already gated by parallelIsTrustworthy(), so it is only
+       non-empty when the model says it read the words off the card or a
+       serial backs them up. And tight only: if the term finds nothing
+       the chain drops to core without it, so a misread variant costs
+       one empty query rather than a wrong price -- the same trade this
+       file already makes for serials, variations and autographs. */
+    tight = joinParts(["pokemon", lang, player, set, num, par, serial, auto, patch, grade]);
     core  = joinParts(["pokemon", lang, player, num, auto, patch, grade]);
     loose = joinParts(["pokemon", lang, player, auto]);
   } else {
@@ -2734,6 +2759,12 @@ const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
    nothing depends on this bump -- but a v4 row served for twelve hours
    is still an answer from a function that no longer exists, which is
    the whole reason this constant is here. */
+/* v7 -> v9 (2026-09-11). The Pokemon tight query now carries the
+   variant. Every v8 row for a Pokemon parallel was priced by a query
+   that could not see its own rarity -- an Illustration Rare read as a
+   common -- so those answers are wrong rather than merely stale.
+   Jumped past v8 because v8 rows are already in the cache. */
+
 /* v6 -> v7 (2026-09-10). Two shape changes in one deploy, and the rule
    from the v6 note applies to both: adding a FIELD is a logic change,
    because readers gate on its presence.
@@ -2770,7 +2801,7 @@ const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
    Every v7 sealed row was filtered by a list that let group-break team
    slots through -- 31 of 62 on the measured case, producing a $13
    median for a $220 box. */
-const SOLD_LOGIC_VERSION = 8;
+const SOLD_LOGIC_VERSION = 9;
 
 /* The cache key must carry the limit. Without it a 50-record compact pull
    gets stored under the same key as a full lookup and is then served back
