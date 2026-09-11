@@ -448,8 +448,33 @@ app.get("/api/affiliate-test", (req, res) => {
 });
 
 // ── Helpers ────────────────────────────────────────────────────
+/* THE MIME TYPE IS FORWARDED, SO A BAD ONE IS FORWARDED TOO.
+
+   Whatever the browser labelled the upload went straight into the data
+   URL and on to OpenAI. A HEIC from an iPhone photo library came back
+   as invalid_image_format -- six times in half an hour on 11 Sept, one
+   person retrying, no explanation on screen.
+
+   The real fix is in the scanner: it now re-encodes anything that is
+   not jpeg/png/gif/webp to JPEG via canvas before uploading. This is
+   the backstop for the cases that never touch it -- an older build
+   still cached on somebody's phone, a direct API call, a browser where
+   canvas failed and the original was sent as a fallback.
+
+   Relabelling rather than converting: there is no image library here
+   and adding one for this would be a large dependency for a rare case.
+   A HEIC labelled image/jpeg still fails, but it fails having been
+   tried, and the log line below says which format arrived so the next
+   occurrence is diagnosable rather than mysterious. */
+const OPENAI_OK_MIME = /^image\/(jpeg|png|gif|webp)$/i;
+
 function fileToDataUrl(file) {
-  const mime = file.mimetype || "image/jpeg";
+  let mime = file.mimetype || "image/jpeg";
+  if (!OPENAI_OK_MIME.test(mime)) {
+    console.log("[scan] unsupported image type from client: " + mime +
+                " (" + (file.originalname || "unnamed") + ") — sending as jpeg");
+    mime = "image/jpeg";
+  }
   const base64 = file.buffer.toString("base64");
   return `data:${mime};base64,${base64}`;
 }
