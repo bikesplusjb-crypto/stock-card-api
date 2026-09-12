@@ -1018,12 +1018,30 @@ __def('core/decision', function (module, exports, require) {
     const d = cfg.decision;
 
     if (blockers && blockers.length) {
-      return { result: 'REVIEW', reason: blockers[0], factors: blockers };
+      return { result: 'REVIEW', no_call: true, reason: blockers[0], factors: blockers };
     }
 
+    /* NO DATA IS NOT A CLOSE CALL, AND THE CLIENT COULD NOT TELL THEM APART.
+
+       Every REVIEW rendered as "Your call — not enough to call it either
+       way", which is the right sentence when an ask sits a few percent
+       above a ceiling built on twenty completed sales. It is the wrong
+       sentence when the engine produced no resale estimate at all.
+
+       Observed 12 Sept on a 1999 Base Set Charizard: 50 of 50 listings
+       rejected, nothing left to price against, and a $2 ask on a card
+       whose own page showed sales from $300 to $819 came back as
+       "your call". A person reads that as the engine weighing it up and
+       shrugging. It never weighed anything.
+
+       no_call marks the REVIEWs where there was nothing to decide on, so
+       the client can say "cannot price this" instead of "too close to
+       call". result stays REVIEW — anything switching on BUY/PASS/REVIEW,
+       including the outcome endpoint and the CSS class, is untouched. */
     if (calc.maximum_buy_price === null) {
       return {
         result: 'REVIEW',
+        no_call: true,
         reason: 'Active marketplace data is insufficient to produce a reliable resale estimate.',
         factors: market.quality_gate.reasons,
       };
@@ -1036,6 +1054,7 @@ __def('core/decision', function (module, exports, require) {
     if (soldRefusal) {
       return {
         result: 'REVIEW',
+        no_call: true,
         reason: `Completed-sale data was withheld: ${soldRefusal.reason}. BuyMax will not call this off asking prices alone.`,
         factors: ['sold_comps_refused'],
       };
