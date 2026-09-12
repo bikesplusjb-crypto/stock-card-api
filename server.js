@@ -4189,6 +4189,78 @@ app.get("/api/dollar-bin", async (req, res) => {
 });
 
 // ── /api/card-market ───────────────────────────────────────────
+/* ── PRICE HISTORY FROM EVERY PRICED LOOKUP ──────────────────
+
+   record_daily_price had exactly ONE caller: refreshWatchlistPrices().
+   So a permanent price point was only ever written for a card somebody
+   had already saved -- about 25 a day against roughly 50 lookups a day.
+   Every other priced lookup wrote a sold_comps_cache row with a twelve
+   hour TTL and then threw the sold data away.
+
+   Measured 12 Sept: 1,225 cards written on 9 Sept by the one-off
+   backfill migration, then 24, 29 and 20 on the days after. That is
+   the watchlist, not the traffic.
+
+   The series is the asset. It is the one thing here that compounds
+   without anyone visiting, and it was compounding at half rate for no
+   reason other than where the call happened to live.
+
+   SAFE TO CALL ON EVERY LOOKUP. record_daily_price upserts on
+   (cache_key, day), so twenty people pricing the same Ohtani today
+   produce one row, last write winning, not twenty.
+
+   REFUSALS ARE HONOURED, exactly as the nightly refresh honours them.
+   soldContaminated means the wrong records got in; soldLimited means
+   filtering worked and what survived is too thin to call a market
+   price. Both are refused rather than written, because a series with
+   an asking price in it is worse than a series with a gap.
+
+   COMPACT REQUESTS ARE SKIPPED. compact=1 comes from the scanner's
+   refinement chips and pulls half the records, so its median rests on
+   a different population -- and cacheKeyFor() without a limit argument
+   would file it under the full-pool key anyway. Two populations under
+   one key is the bug the range fix above already had to undo once.
+
+   Fire-and-forget at the call site: the response is already sent, and
+   a failed history write must never cost somebody their price. */
+async function recordDailyPriceFromLookup(query, sold) {
+  try {
+    if (!supabaseAdmin) return;
+    const s = sold || {};
+    if (s.soldContaminated || s.soldLimited) return;
+
+    /* Same median the nightly refresh picks: soldRaw when the base pool
+       is deep enough to stand behind, headline otherwise. */
+    const usedRaw = !!(s.soldRaw && s.soldRaw.count >= 3 && s.soldRaw.median);
+    const median  = safeNumber((usedRaw ? s.soldRaw.median : 0) || s.soldMedian, 0);
+    if (!(median > 0)) return;
+
+    const num = function (v) {
+      const x = Number(v);
+      return Number.isFinite(x) && x > 0 ? x : null;
+    };
+    const lo = usedRaw ? (num(s.soldRaw.low)  || num(s.soldLow))  : num(s.soldLow);
+    const hi = usedRaw ? (num(s.soldRaw.high) || num(s.soldHigh)) : num(s.soldHigh);
+    const n  = usedRaw ? s.soldRaw.count : s.soldCountUsed;
+
+    /* No range means no row — same guard as the nightly write. A median
+       with an invented low and high is worse than a gap. */
+    if (!(Number(lo) > 0 && Number(hi) > 0 && Number(n) > 0)) return;
+
+    await supabaseAdmin.rpc("record_daily_price", {
+      p_cache_key: cacheKeyFor(query),
+      p_median:    median,
+      p_low:       lo,
+      p_high:      hi,
+      p_count:     n,
+      p_basis:     s.soldBasis || null,
+      p_card_name: query
+    });
+  } catch (e) {
+    console.log("[daily-price] lookup write skipped: " + (e && e.message));
+  }
+}
+
 app.get("/api/card-market", async (req, res) => {
   try {
     const query = req.query.query || req.query.cardName;
@@ -4240,6 +4312,9 @@ app.get("/api/card-market", async (req, res) => {
          than no player name, because it gets sorted as if it were true. */
       ...parseCardQuery(clean)
     });
+
+    /* After the response, never before it. */
+    if (!compact) recordDailyPriceFromLookup(clean, sold);
   } catch (error) {
     res.status(500).json({ success: false, error: "Card market lookup failed", details: error.message });
   }
