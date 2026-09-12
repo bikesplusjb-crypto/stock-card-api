@@ -1375,6 +1375,12 @@ __def('core/engine', function (module, exports, require) {
         target_offer: calc.target_offer,
         walk_away_above: calc.walk_away_above,
         result: decision.result,
+        /* The payload rebuilds decision field by field, so anything the
+           engine sets and this object does not list is silently dropped.
+           no_call was added to decide() and lost exactly here -- the
+           client kept rendering "Your call" because the flag never left
+           the server. */
+        no_call: !!decision.no_call,
         reason: decision.reason,
         factors: decision.factors,
       },
