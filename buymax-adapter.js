@@ -122,10 +122,42 @@ function makeCardGaugeHook(soldCompsFn) {
       };
     }
 
-    const median = Number(raw.soldMedian);
+    /* THE CEILING MUST REST ON THE SAME SALES THE SCANNER SHOWS.
+
+       This read raw.soldMedian -- the headline number, computed before
+       CompGuard's base filter. Everywhere else in the app the median is
+       soldRaw.median whenever the base pool has three or more sales,
+       falling back to soldMedian only when it does not:
+       refreshWatchlistPrices picks that way, and so does the daily
+       price-history write.
+
+       Measured 12 Sept on "2024 Topps Shohei Ohtani": soldMedian 13,
+       soldRaw.median 15. A shop would have read $15 on the scanner and
+       been handed a buy ceiling built off $13, with nothing on either
+       screen accounting for the gap. Two numbers for one card is the
+       failure this whole codebase spends its refusals avoiding.
+
+       soldRaw is the pool the refusals are computed against too, so
+       taking the median from anywhere else means the guard and the
+       number it guards describe different sets of sales. */
+    const usedRaw = !!(raw.soldRaw && raw.soldRaw.count >= 3 && raw.soldRaw.median);
+    const median  = Number(usedRaw ? raw.soldRaw.median : raw.soldMedian);
     if (!isFinite(median) || median <= 0) {
       return { refused: true, refusal_reason: 'no usable sold median' };
     }
+
+    /* DEPTH HAS TO MATCH THE MEDIAN, NOT THE SEARCH.
+
+       soldCount is everything the search returned -- on that same
+       Ohtani, 100, including the graded copies and other parallels
+       CompGuard threw out. Reporting it beside a median built from 33
+       base sales overstates the evidence by a factor of three, in the
+       one field BuyMax uses to judge how much to trust the number.
+
+       The full search count rides along as sold_count_all so nothing
+       is hidden; it is just no longer the figure that reads as depth. */
+    const baseCount = Number(
+      (usedRaw ? raw.soldRaw.count : 0) || raw.soldCountUsed || raw.soldCount || 0);
 
     /* Field names the provider already recognises -- it maps
        soldMedian, sold_median, median and medianPrice, so soldMedian
@@ -135,7 +167,8 @@ function makeCardGaugeHook(soldCompsFn) {
        one the ceiling rests on. */
     return {
       soldMedian: median,
-      soldCount: Number(raw.soldCount) || 0,
+      soldCount: baseCount,
+      sold_count_all: Number(raw.soldCount) || 0,
       basis: raw.soldBasis || 'raw',
       /* Passed through untouched so the ladder BuyMax builds can show
          graded rungs where they exist, without re-querying. */
