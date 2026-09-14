@@ -2253,6 +2253,24 @@ __def('index', function (module, exports, require) {
     const express = require('express'); // required lazily so the engine can run without it
     const cfg = opts.config || config;
     const pool = opts.pool || null;
+
+    /* STORE HOOKS, RATHER THAN A SECOND DATABASE CLIENT.
+
+       logAnalysis and logOutcome were written against node-postgres and
+       need an opts.pool. No pool has ever been passed, and pg is not a
+       dependency of this service -- so every decision BuyMax has made
+       since it shipped went unrecorded, and /buymax/outcome has had
+       nothing to update.
+
+       Rather than add pg, the host supplies two functions. server.js
+       already holds a service-role Supabase client that writes every
+       other table here; it passes that capability in the same way it
+       passes getSoldComps. buymax.js keeps knowing nothing about how
+       storage works, and still detaches cleanly.
+
+       opts.pool still works if it is ever wanted. Hooks win when both
+       are present because the hook is the deliberate choice. */
+    const store = opts.store || null;
     const providers = opts.providers || buildProviders(cfg, opts.deps || {}, opts);
     const r = express.Router();
 
@@ -2272,10 +2290,21 @@ __def('index', function (module, exports, require) {
       }
 
       const payload = result.payload;
-      if (result.status === 200 && pool) {
-        const { request } = { request: { asking_price: payload.costs.purchase_price } };
-        const logged = await logAnalysis(pool, cfg, payload, request);
-        payload.meta.analysis_id = logged.id || null;
+      if (result.status === 200 && (store || pool)) {
+        const request = { asking_price: payload.costs.purchase_price };
+        /* Logging must never cost somebody their answer. If the write
+           fails the analysis still returns, just without an id -- and
+           the receipt hides its buttons when there is no id, because
+           there is nothing for them to report against. */
+        let logged = { id: null };
+        try {
+          logged = store
+            ? await store.logAnalysis(payload, request)
+            : await logAnalysis(pool, cfg, payload, request);
+        } catch (e) {
+          console.log('[buymax] analysis not logged: ' + (e && e.message));
+        }
+        payload.meta.analysis_id = logged && logged.id ? logged.id : null;
       }
       if (payload._screen) delete payload._screen;
 
@@ -2286,7 +2315,10 @@ __def('index', function (module, exports, require) {
     r.post('/buymax/outcome', express.json(), async (req, res) => {
       const { analysis_id, action, paid_price, sold_price } = req.body || {};
       if (!analysis_id) return res.status(400).json({ success: false, error: 'analysis_id required' });
-      const out = await logOutcome(pool, cfg, analysis_id, { action, paid_price, sold_price });
+      const body = { action, paid_price, sold_price };
+      const out = store
+        ? await store.logOutcome(analysis_id, body)
+        : await logOutcome(pool, cfg, analysis_id, body);
       res.status(out.ok ? 200 : 400).json({ success: out.ok, error: out.reason || null });
     });
 
