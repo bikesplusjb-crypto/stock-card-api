@@ -2301,8 +2301,26 @@ __def('index', function (module, exports, require) {
         providers: providersStatus,
         database: Boolean(pool),
         categories: { implemented: ['card'], planned: ['watch', 'coin', 'comic', 'toy', 'hotwheels'] },
-        uses_sold_comps: false,
-        note: 'v0.1 uses eBay ACTIVE listings only. Sold values appear only if the CardGauge provider supplies them.',
+        /* THE HEALTH ENDPOINT CONTRADICTED THE ENGINE.
+
+           uses_sold_comps: false was true of v0.1 before the CardGauge
+           adapter existed. It has not been true for a while: the
+           adapter supplies completed sales, decide() REFUSES outright
+           when they are withheld, and since 12 Sept it reads the median
+           from soldRaw -- the CompGuard-filtered base pool.
+
+           A health check that reports the opposite of what the engine
+           does is worse than no health check. Anyone debugging from it
+           would look in the wrong place first.
+
+           Reported rather than hard-coded, so it cannot drift again:
+           if the provider stops supplying sold data, this goes false on
+           its own. */
+        uses_sold_comps: providersStatus.cardgauge,
+        sold_comps_mode: providersStatus.cardgauge ? 'provider_supplied' : 'unavailable',
+        note: providersStatus.cardgauge
+          ? 'Completed sales come from the CardGauge provider. Active eBay listings are used for the resale estimate only, and a decision is refused when sold comps are withheld.'
+          : 'CardGauge provider not configured \u2014 no completed-sale data available, so decisions will refuse rather than price from asking prices alone.',
       });
     });
 
