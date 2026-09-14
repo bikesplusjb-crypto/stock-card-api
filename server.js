@@ -5394,6 +5394,24 @@ app.post(
         custom:    { content_name: searchQuery, content_type: "card_scan" }
       });
 
+      /* THE PRICE HISTORY WAS ONLY EVER RECORDING TYPED SEARCHES.
+
+         recordDailyPriceFromLookup was added to /api/card-market on
+         12 Sept and nowhere else -- the route I happened to be reading,
+         not the route people use. Scans outnumber typed searches by
+         roughly four to one, so most of the comps this service fetched
+         were thrown away, and the ask-side columns added this morning
+         were still empty hours later with zero rows.
+
+         soldQuery, not searchQuery: when the year-correction retry or
+         the tier ladder changed the query, soldQuery is the one that
+         produced these comps. Filing them under the query that failed
+         would put two different cards under one key.
+
+         Fire and forget, after the response is built. A history write
+         must never cost somebody their scan. */
+      recordDailyPriceFromLookup(soldQuery, sold, market);
+
       return res.json({
         success:           true,
         cardName:          cleanCardName || "Unknown Trading Card",
