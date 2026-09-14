@@ -4800,7 +4800,22 @@ app.post(
 
       if (!front) return res.status(400).json({ success: false, error: "Front image required" });
 
+      /* WHERE THE THIRTEEN SECONDS GO.
+
+         Measured 14 Sept: /api/scan-card returned in 12.6s and 13.0s.
+         The route is three sequential awaits -- vision, then active
+         listings, then sold comps -- and each needs the one before it,
+         so none of them can overlap. Which of the three dominates was
+         a guess, and guessing about latency is how you optimise the
+         wrong one.
+
+         Logged per stage, and per scan, so the next conversation about
+         speed starts from a measurement. Cheap: three Date.now() calls
+         and one line of output. */
+      const t0 = Date.now();
       const ai = await scanWithOpenAI(front, back);
+      const tVision = Date.now() - t0;
+      const tMarketStart = Date.now();
 
       /* BEFORE ANYTHING READS IT. The display name, the query builder
          and the response all consume ai.serialNumber independently, so
@@ -4846,6 +4861,8 @@ app.post(
       const verifyPromise = verifyAgainstCatalog(ai);
 
       const market        = await getCardMarketForCard(ai);
+      const tMarket = Date.now() - tMarketStart;
+      const tSoldStart = Date.now();
       const searchQuery   = market.searchQuery || buildCardQuery(ai) || cleanCardName;
 
       /* Owner mode bypasses the comp cache -- see getSoldComps. Read
@@ -4854,6 +4871,10 @@ app.post(
       const wantFresh = String((req.body && req.body.fresh) || "") === "1";
 
       let sold      = await getSoldComps(searchQuery, market.avgPrice, false, wantFresh);
+      console.log("[timing] vision=" + tVision + "ms market=" + tMarket
+        + "ms sold=" + (Date.now() - tSoldStart) + "ms"
+        + " frontKB=" + Math.round((front && front.size ? front.size : 0) / 1024)
+        + " backKB=" + Math.round((back && back.size ? back.size : 0) / 1024));
       let soldQuery = searchQuery;
 
       /* See detectListingYear() above. Only fires when the sold lookup
