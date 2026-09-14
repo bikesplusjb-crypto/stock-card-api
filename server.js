@@ -3707,6 +3707,76 @@ function sealedSanityCheck(sold, askMedian) {
    spend records that are already sitting unused at 2% of the daily
    budget. An auth check here would cost more than the thing it
    protects. */
+/* Walks buildQueryTiers() for a query that arrived as text rather than
+   as a scan. parseCardQuery() already pulls year, brand, set, player and
+   parallel out of the string; that is enough to build the tier ladder.
+
+   A tier only counts as an answer if something survived the base filter.
+   soldCount is the raw record count -- fourteen sales of six different
+   products still reads as fourteen -- so judging on it would stop at the
+   first tier with ANY records and adopt a pool that prices nothing.
+
+   Returns null when the original result was already usable, so the
+   caller keeps exactly what it had. */
+async function broadenTypedLookup(clean, market, sold, compact) {
+  try {
+    if (compact) return null;
+    const baseN = sold && sold.soldRaw ? Number(sold.soldRaw.count) : 0;
+    if (baseN >= 3) return null;
+
+    const p = parseCardQuery(clean);
+    const ai = {
+      year:     p.year || "",
+      brand:    p.brand || "",
+      set:      p.set || "",
+      player:   p.player || "",
+      parallel: p.parallel || "",
+      sport:    p.sport || "",
+      cardNumber: (clean.match(/#\s*([A-Za-z0-9-]+)/) || [])[1] || ""
+    };
+    if (!ai.player && !ai.set) return null;
+
+    const tiers = buildQueryTiers(ai) || [];
+    const seen  = new Set([clean]);
+    let tried   = 0;
+
+    for (const t of tiers) {
+      if (tried >= 3) break;
+      const q = t && t.query;
+      if (!q || seen.has(q)) continue;
+      seen.add(q);
+      tried++;
+
+      const alt = await getSoldComps(q, market.avgPrice, false);
+      const usable = alt && Number(alt.soldCount) > 0 && !alt.soldLimited
+                     && alt.soldRaw && Number(alt.soldRaw.count) >= 3
+                     && Number(alt.soldMedian) > 0;
+      if (!usable) continue;
+
+      /* SAY WHICH CARD THE NUMBER IS FOR.
+
+         A broadened tier answers a different question from the one
+         asked -- the base card instead of the Green Parallel. That is
+         useful, and it is only useful if it says so. Silently swapping
+         in a wider pool is the exact move every other pricing tool
+         makes and the reason this one exists. */
+      alt.broadenedFrom = clean;
+      alt.broadenedTo   = q;
+      alt.broadenedTier = t.tier;
+      alt.broadenedNote =
+        "No completed sales matched the full description. This is priced from " +
+        "a broader search (" + q + ") \u2014 check it describes your card.";
+      console.log("[broaden] " + clean + " -> " + q + " (" + t.tier + ", " +
+                  alt.soldRaw.count + " base sales)");
+      return { sold: alt };
+    }
+    return null;
+  } catch (e) {
+    console.log("[broaden] skipped: " + (e && e.message));
+    return null;
+  }
+}
+
 async function getSoldComps(query, askMedian, compact, skipCache) {
   if (!CARDAPI_KEY) return null;
   const limit = compact ? CARDAPI_LIMIT_COMPACT : CARDAPI_LIMIT;
@@ -4223,7 +4293,7 @@ app.get("/api/dollar-bin", async (req, res) => {
 
    Fire-and-forget at the call site: the response is already sent, and
    a failed history write must never cost somebody their price. */
-async function recordDailyPriceFromLookup(query, sold) {
+async function recordDailyPriceFromLookup(query, sold, market) {
   try {
     if (!supabaseAdmin) return;
     const s = sold || {};
@@ -4247,6 +4317,37 @@ async function recordDailyPriceFromLookup(query, sold) {
        with an invented low and high is worse than a gap. */
     if (!(Number(lo) > 0 && Number(hi) > 0 && Number(n) > 0)) return;
 
+    /* THE ASK SIDE WAS COMPUTED EVERY TIME AND THROWN AWAY.
+
+       BuyMax works its ceiling back from an assumption that active asks
+       run at 0.80 of sale price. That number is a guess -- the code says
+       so -- and it drives every ceiling the engine produces.
+
+       The measurement that would replace it has passed through here
+       3,022 times and been dropped on each one: sold_comps_cache keeps
+       only the sold payload, and market.raw is built for the response
+       and discarded when it is sent.
+
+       Recording both on one row, same day, same cache_key, turns that
+       into an answer over a few weeks -- and one that can be cut by
+       price band, by sport, by raw versus graded. No published figure
+       will ever do that for this hobby; it needs somebody's own traffic.
+
+       market.raw is the UNGRADED active group, which is the right
+       comparison: the sold median above is soldRaw, also ungraded base.
+       Pairing ungraded asks with graded sales would measure the slab
+       premium and call it a discount rate.
+
+       Nulls are fine. A card with sold comps and no clean asks still
+       records its sold side -- the 11-argument RPC coalesces, so the
+       nightly refresh (which has no asks at all) can never blank a
+       value a lookup wrote earlier the same day. */
+    const ask    = (market && market.raw) || null;
+    const askNum = function (v) {
+      const x = Number(v);
+      return Number.isFinite(x) && x > 0 ? x : null;
+    };
+
     await supabaseAdmin.rpc("record_daily_price", {
       p_cache_key: cacheKeyFor(query),
       p_median:    median,
@@ -4254,7 +4355,11 @@ async function recordDailyPriceFromLookup(query, sold) {
       p_high:      hi,
       p_count:     n,
       p_basis:     s.soldBasis || null,
-      p_card_name: query
+      p_card_name: query,
+      p_ask_median: ask ? askNum(ask.median) : null,
+      p_ask_low:    ask ? askNum(ask.low)    : null,
+      p_ask_high:   ask ? askNum(ask.high)   : null,
+      p_ask_count:  ask && Number(ask.count) > 0 ? Number(ask.count) : null
     });
   } catch (e) {
     console.log("[daily-price] lookup write skipped: " + (e && e.message));
@@ -4271,8 +4376,47 @@ app.get("/api/card-market", async (req, res) => {
 
     const market = await getEbayCardMarket(query);
     const clean  = normalizeCardQuery(query);
-    const sold   = await getSoldComps(clean, market.avgPrice, compact,
+    let   sold   = await getSoldComps(clean, market.avgPrice, compact,
                                       req.query.fresh === "1");
+
+    /* THE LONGER THE QUERY, THE LESS LIKELY IT FINDS ANYTHING.
+
+       Measured 13 Sept across 3,022 cached lookups. The relationship is
+       monotonic and steep:
+
+         3 words   75% usable     15% returned nothing
+         5 words   33% usable     45% returned nothing
+         7 words   21% usable     60% returned nothing
+        10 words    4% usable     92% returned nothing
+
+       1,499 lookups -- half of everything ever run -- came back with
+       zero records from eBay. Only 293 were cases where eBay found
+       sales and the filter rejected them all. Contamination, which I
+       had assumed was the problem, is 3-4%.
+
+       eBay's keyword search is an AND across title words, so a nine-term
+       string needs all nine in a seller's title. Sellers do not write
+       titles that way. The better the scanner reads a card, the longer
+       the query it builds, and the less likely it matches anything --
+       precision working against itself.
+
+       The scan route already solved this with buildQueryTiers(): drop
+       the parallel, then the card number, then the set, stopping at the
+       first tier that returns a pool worth standing behind. The typed
+       and searched path never got it, which is why it is the path with
+       the empty results.
+
+       Reusing that function rather than writing a second ladder. It
+       carries protections earned the hard way -- a serial-numbered card
+       never falls back to a tier that has dropped its denominator,
+       because the base card's sales are clean, plentiful, and for a
+       different object.
+
+       Only runs when the first attempt found no usable pool, so an
+       ordinary lookup costs exactly what it did before. Capped at three
+       extra calls. */
+    const laddered = await broadenTypedLookup(clean, market, sold, compact);
+    if (laddered) { sold = laddered.sold; }
 
     res.json({
       success:           true,
@@ -4314,7 +4458,7 @@ app.get("/api/card-market", async (req, res) => {
     });
 
     /* After the response, never before it. */
-    if (!compact) recordDailyPriceFromLookup(clean, sold);
+    if (!compact) recordDailyPriceFromLookup(clean, sold, market);
   } catch (error) {
     res.status(500).json({ success: false, error: "Card market lookup failed", details: error.message });
   }
