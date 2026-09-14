@@ -4015,6 +4015,75 @@ const AI_FALLBACK = (summary) => ({
   signal: "VERIFY", confidence: "Low", summary
 });
 
+/* SECOND LOOK, AT ONE LINE, ON ITS OWN.
+
+   The copyright year decides which card gets priced, and the model
+   would not read it reliably off a full card back. Measured 14 Sept:
+   the same two photos submitted a minute apart, no code change in
+   between, returned 2024 with card number #177 and then 2023 with
+   none. detail:'high' improved the odds and did not settle it, and
+   copyrightLine came back EMPTY on every one of those scans -- right
+   answers included -- so the transcription check had nothing to check.
+
+   In a full-card image that line is roughly 3% of the pixels, sitting
+   under a photograph and a statistics table full of large, high-
+   contrast years. The model reads the card and reports a conclusion.
+   Given a crop of the bottom strip, there is nothing else in the frame
+   to read.
+
+   ONE JOB, AND PERMISSION TO FAIL. It is asked for a transcription and
+   nothing else, and told explicitly that an empty answer is correct
+   when the line is not legible. A model asked to produce a year will
+   produce one; a model asked to copy a line it cannot see should say
+   so.
+
+   gpt-4o-mini here, not 4o. The full model is used for the card
+   because a misread brand or parallel is expensive; this call reads
+   one line of print in an image that contains almost nothing else,
+   which is the task the small model is good at. It also keeps the
+   second call cheap and fast enough to be worth making.
+
+   Everything is wrapped: a failure returns null and the scan proceeds
+   on what the first pass found. This can only add information. */
+async function readCopyrightStrip(stripFile) {
+  if (!stripFile || !process.env.OPENAI_API_KEY) return null;
+  try {
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer ' + process.env.OPENAI_API_KEY
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        max_tokens: 120,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text:
+              'This is a crop of the bottom edge of the back of a trading card. ' +
+              'Find the copyright line -- it looks like "\u00a9 2024 THE TOPPS COMPANY, INC." ' +
+              'or "\u00ae, TM & \u00a9 2026 PANINI AMERICA, INC." ' +
+              'Reply with ONLY that line, copied exactly as printed. ' +
+              'Do not explain, do not add anything, do not correct it. ' +
+              'If there is no copyright line visible, or you cannot read the year in it, ' +
+              'reply with exactly: NONE. ' +
+              'Copying a line you cannot actually read is worse than replying NONE.' },
+            { type: 'image_url', image_url: { url: fileToDataUrl(stripFile), detail: 'high' } }
+          ]
+        }]
+      })
+    });
+    const j = await r.json();
+    const txt = ((j.choices && j.choices[0] && j.choices[0].message.content) || '').trim();
+    if (!txt || /^none$/i.test(txt)) return null;
+    return txt.slice(0, 200);
+  } catch (e) {
+    console.log('[strip] read failed: ' + (e && e.message));
+    return null;
+  }
+}
+
 async function scanWithOpenAI(frontFile, backFile) {
   if (!process.env.OPENAI_API_KEY) return AI_FALLBACK("OpenAI API key missing.");
 
@@ -4813,11 +4882,12 @@ app.post("/api/correction", async (req, res) => {
 // ── /api/scan-card ─────────────────────────────────────────────
 app.post(
   "/api/scan-card",
-  upload.fields([{ name: "front", maxCount: 1 }, { name: "back", maxCount: 1 }]),
+  upload.fields([{ name: "front", maxCount: 1 }, { name: "back", maxCount: 1 }, { name: "backStrip", maxCount: 1 }]),
   async (req, res) => {
     try {
       const front = req.files?.front?.[0] || null;
       const back  = req.files?.back?.[0]  || null;
+      const backStrip = req.files?.backStrip?.[0] || null;
 
       if (!front) return res.status(400).json({ success: false, error: "Front image required" });
 
@@ -4858,8 +4928,21 @@ app.post(
          card year AND disagrees. If copyrightLine is empty -- which is a
          legitimate answer on a glared or cropped back -- nothing changes
          and ai.year stands. */
+      /* Only when the first pass did not produce one. A scan that read
+         the line already costs nothing extra; one that did not gets a
+         second call worth a few seconds against a wrong card. */
       try {
-        const cl = String(ai.copyrightLine || '');
+        let cl = String(ai.copyrightLine || '');
+        if (!/(19[5-9]\d|20[0-4]\d)/.test(cl) && backStrip) {
+          const fromStrip = await readCopyrightStrip(backStrip);
+          if (fromStrip) {
+            cl = fromStrip;
+            ai.copyrightLine = fromStrip;
+            console.log('[strip] read: "' + fromStrip.slice(0, 90) + '"');
+          } else {
+            console.log('[strip] nothing readable in the crop');
+          }
+        }
         const m  = cl.match(/(19[5-9]\d|20[0-4]\d)/);
         if (m) {
           const fromLine = m[1];
