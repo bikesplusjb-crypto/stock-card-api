@@ -9724,7 +9724,17 @@ const buymaxStore = {
       sold_market_value: m.sold_market_value ?? null,
       risk_score:        (payload.risk && payload.risk.score) ?? null,
       risk_reasons:      (payload.risk && payload.risk.reasons) || null,
-      confidence:        payload.confidence ?? null,
+      /* confidence is an OBJECT, not a number: three scores for the
+         decision, the market and the identity. Declared integer first
+         time and the first real decision failed to log because of it.
+         Stored whole, with the three extracted beside it -- the gap
+         between them is the useful part. A 95 on the decision next to a
+         40 on the market is high confidence in a calculation built on
+         thin evidence, which is the case worth finding later. */
+      confidence:          payload.confidence ?? null,
+      confidence_buymax:   (payload.confidence && payload.confidence.buymax_confidence) ?? null,
+      confidence_market:   (payload.confidence && payload.confidence.market_confidence) ?? null,
+      confidence_identity: (payload.confidence && payload.confidence.identity_confidence) ?? null,
       estimated_resale:  d.estimated_resale ?? null,
       maximum_buy_price: d.maximum_buy_price ?? null,
       decision:          d.result || null,
