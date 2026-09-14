@@ -9688,7 +9688,81 @@ function identityConfidenceFromItem(item) {
   return Math.min(90, Math.round(score + bonus));
 }
 
+/* BUYMAX WAS NEVER WRITING ANYTHING DOWN.
+
+   The engine logs through opts.pool, a node-postgres handle. None was
+   ever passed and pg is not a dependency here, so every decision it has
+   made went unrecorded and /api/buymax/outcome had no row to update.
+
+   These two functions give it the Supabase client this service already
+   uses. Nothing else changes: buymax.js still knows nothing about where
+   its records go.
+
+   WHY IT IS WORTH THE TROUBLE: none of this can be backfilled. Whether
+   a BUY was profitable, how often REVIEW was the right call, whether
+   confidence tracks reality -- all of it needs the decision stored at
+   the time it was made, next to what actually happened. A month of
+   unlogged decisions is a month that can never be analysed. */
+const buymaxStore = {
+  async logAnalysis(payload, request) {
+    if (!supabaseAdmin) return { id: null };
+    const m = payload.market || {};
+    const d = payload.decision || {};
+    const row = {
+      engine_version:    payload.engine && payload.engine.version,
+      category:          payload.category || null,
+      item_identity:     payload.item || null,
+      query_used:        payload.query_used || null,
+      asking_price:      request.asking_price ?? null,
+      providers_used:    (payload.providers && payload.providers.used) || null,
+      provider_errors:   (payload.providers && payload.providers.errors) || null,
+      listings_found:    m.listings_found ?? null,
+      listings_accepted: m.listings_accepted ?? null,
+      listings_rejected: m.listings_rejected ?? null,
+      rejection_reasons: m.rejection_reasons || null,
+      active_market:     m.active_market || null,
+      sold_market_value: m.sold_market_value ?? null,
+      risk_score:        (payload.risk && payload.risk.score) ?? null,
+      risk_reasons:      (payload.risk && payload.risk.reasons) || null,
+      confidence:        payload.confidence ?? null,
+      estimated_resale:  d.estimated_resale ?? null,
+      maximum_buy_price: d.maximum_buy_price ?? null,
+      decision:          d.result || null,
+      decision_reason:   d.reason || null,
+      /* The distinction the whole no_call change exists for: a REVIEW
+         that weighed the ask, versus one that never looked at it. */
+      no_call:           !!d.no_call
+    };
+    const { data, error } = await supabaseAdmin
+      .from("buymax_analyses").insert(row).select("id").single();
+    if (error) { console.log("[buymax] log failed: " + error.message); return { id: null }; }
+    return { id: data.id };
+  },
+
+  async logOutcome(id, outcome) {
+    if (!supabaseAdmin) return { ok: false, reason: "no_database" };
+    /* Only the five the table allows. An unknown action is rejected
+       rather than stored, because a column that can hold anything
+       cannot be counted later. */
+    const ok = ["bought","passed","sold","ignored","corrected"];
+    const action = ok.includes(String(outcome.action)) ? outcome.action : null;
+    if (!action) return { ok: false, reason: "bad_action" };
+    const { data, error } = await supabaseAdmin
+      .from("buymax_analyses")
+      .update({
+        outcome_action:      action,
+        outcome_paid_price:  outcome.paid_price ?? null,
+        outcome_sold_price:  outcome.sold_price ?? null,
+        outcome_reported_at: new Date().toISOString()
+      })
+      .eq("id", id).select("id");
+    if (error) return { ok: false, reason: error.message };
+    return { ok: Array.isArray(data) && data.length > 0 };
+  }
+};
+
 mountBuyMax(app, {
+  store: buymaxStore,
   local: {
     getSoldComps: makeCardGaugeHook(getSoldComps),
     /* Synchronous work in an async hook. providers/local.js awaits it
