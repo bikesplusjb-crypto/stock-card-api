@@ -8834,7 +8834,14 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
    couple of nights instead of the first N being covered every night.
    Raise it if the allowance grows; lower it if daytime scans start
    competing for budget. */
-const REFRESH_MAX_PER_RUN = Number(process.env.REFRESH_MAX_PER_RUN || 80);
+/* 80 -> 200, 15 Sept. The scanner, binder and sign-up box all promise
+   that kept cards are "re-priced every night". With 156 watched cards and
+   a cap of 80, each card was actually re-priced about every other night.
+   200 covers the whole watchlist in one run: roughly 15,600 records of a
+   50,000/day allowance, and about ten minutes, still finishing before the
+   4:30 price alerts. When the watchlist passes 200, either raise this or
+   change the wording -- the promise and the cap have to agree. */
+const REFRESH_MAX_PER_RUN = Number(process.env.REFRESH_MAX_PER_RUN || 200);
 
 /* ET calendar day of the last refresh that got past its fetch and
    finished. Read by the 6:00 catch-up cron. */
