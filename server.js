@@ -4124,7 +4124,34 @@ async function scanWithOpenAI(frontFile, backFile) {
        one thing that cannot be allowed to fail. At current volume the
        difference is a few dollars a month; if scanning grows past a few
        hundred a day it is worth re-measuring, but not before. */
-    model: "gpt-4o",
+    /* THE MODEL NAME LIVES IN AN ENV VAR NOW.
+
+       It was hard-coded here and in the grader. Two reasons to change
+       that, neither urgent:
+
+       gpt-4o is legacy -- OpenAI defines that as "no longer receives
+       updates" and "will be deprecated at some point". The bare alias is
+       NOT on the shutdown list today; only the 2024-05-13 snapshot is,
+       on 23 Oct 2026, and GA models get six months notice. So there is
+       no deadline. But when it comes, a config change beats a deploy.
+
+       And trying a replacement should not require editing code. Set the
+       variable, scan a card, read the [timing] line, set it back.
+
+       Default stays gpt-4o, so deploying this changes nothing.
+
+         CARDGAUGE_VISION_MODEL=gpt-5.6-luna   cheap/fast tier
+         CARDGAUGE_VISION_MODEL=gpt-5.6-terra  mid
+         CARDGAUGE_VISION_MODEL=gpt-5.6-sol    flagship; OpenAI names this
+                                               as the gpt-4o replacement
+
+       NOT NECESSARILY A DROP-IN. Newer families sometimes want
+       max_completion_tokens instead of max_tokens, and some ignore
+       temperature. Hence the fallback below: if the configured model
+       errors, the call retries once on gpt-4o rather than failing in
+       front of somebody. A failed experiment should cost a log line,
+       not a lookup. */
+    model: VISION_MODEL,
     messages: [
       { role: "system", content: "You are an expert trading card identifier. You examine photos of sports cards, Pokemon cards, TCG cards, graded slabs, and sealed product. You return ONLY valid JSON with no markdown, no code fences, and no commentary. You never estimate dollar values." },
       { role: "user", content: [
@@ -4139,17 +4166,39 @@ async function scanWithOpenAI(frontFile, backFile) {
     max_tokens: 900
   };
 
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(payload)
-  });
+  /* ONE RETRY ON THE KNOWN-GOOD MODEL.
 
-  const rawText = await response.text();
-  if (!response.ok) {
+     Trying a new vision model should not be able to break scanning for
+     whoever happens to be using the site at the time. A wrong model id,
+     a family that rejects max_tokens, a tier the account cannot reach --
+     all of them surface as a non-200 here, and all of them are fixed by
+     falling back to the model that was working this morning.
+
+     Fires only when the configured model is not already the fallback, so
+     an ordinary outage is not retried twice for no reason. The log line
+     names the model and the error, which is the whole record of the
+     experiment. */
+  async function callOpenAI(body) {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+    return { ok: r.ok, text: await r.text() };
+  }
+
+  let res1 = await callOpenAI(payload);
+  if (!res1.ok && payload.model !== VISION_FALLBACK) {
+    console.error("[vision] " + payload.model + " failed, retrying on "
+      + VISION_FALLBACK + ": " + res1.text.slice(0, 300));
+    res1 = await callOpenAI(Object.assign({}, payload, { model: VISION_FALLBACK }));
+  }
+
+  const rawText = res1.text;
+  if (!res1.ok) {
     console.error("OpenAI error:", rawText);
     return AI_FALLBACK("AI could not identify this card.");
   }
@@ -5012,7 +5061,7 @@ app.post(
       const wantFresh = String((req.body && req.body.fresh) || "") === "1";
 
       let sold      = await getSoldComps(searchQuery, market.avgPrice, false, wantFresh);
-      console.log("[timing] vision=" + tVision + "ms market=" + tMarket
+      console.log("[timing] model=" + VISION_MODEL + " vision=" + tVision + "ms market=" + tMarket
         + "ms sold=" + (Date.now() - tSoldStart) + "ms"
         + " frontKB=" + Math.round((front && front.size ? front.size : 0) / 1024)
         + " backKB=" + Math.round((back && back.size ? back.size : 0) / 1024));
@@ -6314,7 +6363,7 @@ async function gradeWithOpenAI(frontFile, backFile, condition, notes) {
        centering and corner wear off a photo is harder vision than
        reading a logo, and being wrong here costs somebody a $25
        grading fee on a card that was never going to make the grade. */
-    model: "gpt-4o",
+    model: VISION_MODEL,
     messages: [
       { role: "system", content: "You are a conservative trading card grading pre-screener. You examine photos and estimate a likely grade RANGE, never a single definitive grade. You know a camera cannot resolve fine surface scratches or print lines, and you say so. You return ONLY valid JSON with no markdown, no code fences, and no commentary. You never estimate dollar values. You would rather under-promise a grade than have someone waste money on a submission." },
       { role: "user", content: [{ type: "text", text: userText }, ...images] }
@@ -6966,6 +7015,11 @@ app.get("/api/vs-market", async (req, res) => {
    answers "how many", which costs almost nothing and is most of what
    people want.
    ─────────────────────────────────────────────────────────────── */
+/* Vision model for the scanner and the grader. Default is the current
+   production model, so an unset variable behaves exactly as today. */
+const VISION_MODEL    = process.env.CARDGAUGE_VISION_MODEL || "gpt-4o";
+const VISION_FALLBACK = "gpt-4o";
+
 const CATALOG_BASE      = "https://www.thecardapi.com/api/v1/catalog";
 const CATALOG_PAGE_SIZE = 5;      // records per lookup — see note 1 above
 /* 9s was too tight. Real lookups against thecardapi were aborting
