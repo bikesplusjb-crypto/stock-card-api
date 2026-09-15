@@ -4159,7 +4159,7 @@ async function scanWithOpenAI(frontFile, backFile) {
         ...images
       ]}
     ],
-    temperature: 0.1,
+    ...samplingFor(VISION_MODEL),
     /* 700 was tight for 25 keys plus a summary, and parallelOptions is an
        array that only appears when the model has something to say. Room to
        list three or four candidates costs a fraction of a cent.
@@ -6370,7 +6370,8 @@ async function gradeWithOpenAI(frontFile, backFile, condition, notes) {
       { role: "system", content: "You are a conservative trading card grading pre-screener. You examine photos and estimate a likely grade RANGE, never a single definitive grade. You know a camera cannot resolve fine surface scratches or print lines, and you say so. You return ONLY valid JSON with no markdown, no code fences, and no commentary. You never estimate dollar values. You would rather under-promise a grade than have someone waste money on a submission." },
       { role: "user", content: [{ type: "text", text: userText }, ...images] }
     ],
-    temperature: 0.2,
+    /* Grader ran at 0.2 for the same reason; same family rule. */
+    ...samplingFor(VISION_MODEL),
     ...tokenCapFor(VISION_MODEL, 800)
   };
 
@@ -7038,6 +7039,34 @@ const VISION_FALLBACK = "gpt-4o";
    has not been invented yet gets the modern spelling by default and an
    old one keeps the old. If a future family rejects temperature too,
    the fallback will surface that the same way this surfaced. */
+/* AND THE SAME FOR TEMPERATURE.
+
+   Second wall, 15 Sept, after the token cap was fixed:
+
+     "Unsupported value: 'temperature' does not support 0.1 with this
+      model. Only the default (1) value is supported."
+
+   Worth pausing on rather than deleting the parameter and moving on.
+   temperature 0.1 is not decoration here: this prompt spends two
+   thousand words telling the model to READ what is printed and not to
+   infer, and a low temperature is what stops it reaching for the
+   plausible answer over the legible one. Every failure this scanner has
+   had -- the 2023/2024 year, parallels guessed off a sheen -- is the
+   model being creative where it should be literal.
+
+   So a model that only runs at 1 is NOT a like-for-like swap, and any
+   accuracy test against it has to be read with that in mind. Newer
+   families are trained to be deterministic without the dial, and the
+   prompt does most of the constraining anyway. It may be fine. It is
+   not automatically fine.
+
+   Omitted rather than forced to 1, so the model uses its own default. */
+function samplingFor(model) {
+  return /^(gpt-4|gpt-3)/.test(String(model || ""))
+    ? { temperature: 0.1 }
+    : {};
+}
+
 function tokenCapFor(model, n) {
   return /^(gpt-4|gpt-3)/.test(String(model || ""))
     ? { max_tokens: n }
