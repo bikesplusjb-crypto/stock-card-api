@@ -4165,7 +4165,8 @@ async function scanWithOpenAI(frontFile, backFile) {
        list three or four candidates costs a fraction of a cent.
 
        Spelled per model family -- see tokenCapFor. */
-    ...tokenCapFor(VISION_MODEL, 900)
+    ...tokenCapFor(VISION_MODEL, 900),
+    ...effortFor(VISION_MODEL)
   };
 
   /* ONE RETRY ON THE KNOWN-GOOD MODEL.
@@ -4180,7 +4181,23 @@ async function scanWithOpenAI(frontFile, backFile) {
      an ordinary outage is not retried twice for no reason. The log line
      names the model and the error, which is the whole record of the
      experiment. */
+  /* THE COST OF A SCAN WAS NEVER RECORDED.
+
+     Every model comparison needs tokens per scan, and nothing here read
+     the usage block OpenAI returns. [vision-usage] is now the record of
+     each call: the model that ACTUALLY answered (the [timing] line prints
+     the configured model even after a fallback), input and output
+     tokens, reasoning tokens, finish reason and wall time.
+
+     A 200 IS NOT A SUCCESS FOR A REASONING MODEL. The GPT-5.6 family
+     reasons before it answers, and those reasoning tokens count against
+     max_completion_tokens. Run out mid-thought and the response is a 200
+     with finish_reason "length" and an empty answer -- which the old
+     check waved through and the parser then turned into "AI result
+     could not be parsed", with no fallback. Empty content now counts as
+     a failure, so it falls back like any other. */
   async function callOpenAI(body) {
+    const t0 = Date.now();
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -4189,14 +4206,42 @@ async function scanWithOpenAI(frontFile, backFile) {
       },
       body: JSON.stringify(body)
     });
-    return { ok: r.ok, text: await r.text() };
+    const text = await r.text();
+    let ok = r.ok;
+    if (ok) {
+      try {
+        const d = JSON.parse(text);
+        const u = d.usage || {};
+        const choice = (d.choices && d.choices[0]) || {};
+        const content = (choice.message && choice.message.content) || "";
+        const reasoning = (u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens) || 0;
+        console.log("[vision-usage] model=" + (d.model || body.model)
+          + " in=" + (u.prompt_tokens || 0)
+          + " out=" + (u.completion_tokens || 0)
+          + " reasoning=" + reasoning
+          + " finish=" + (choice.finish_reason || "?")
+          + " ms=" + (Date.now() - t0));
+        if (!String(content).trim()) ok = false;
+      } catch (e) {
+        ok = false;
+      }
+    }
+    return { ok, text };
   }
 
   let res1 = await callOpenAI(payload);
   if (!res1.ok && payload.model !== VISION_FALLBACK) {
     console.error("[vision] " + payload.model + " failed, retrying on "
       + VISION_FALLBACK + ": " + res1.text.slice(0, 300));
-    res1 = await callOpenAI(Object.assign({}, payload, { model: VISION_FALLBACK }));
+    /* Rebuild the parameters for gpt-4o rather than inheriting the
+       newer family's: reasoning_effort is rejected by non-reasoning
+       models, and the fallback should run with the same temperature and
+       token cap production always had. */
+    const fb = Object.assign({}, payload, { model: VISION_FALLBACK });
+    delete fb.max_completion_tokens;
+    delete fb.reasoning_effort;
+    Object.assign(fb, samplingFor(VISION_FALLBACK), tokenCapFor(VISION_FALLBACK, 900));
+    res1 = await callOpenAI(fb);
   }
 
   const rawText = res1.text;
@@ -7069,6 +7114,19 @@ function samplingFor(model) {
   return /^(gpt-4|gpt-3)/.test(String(model || ""))
     ? { temperature: 0.1 }
     : {};
+}
+
+/* REASONING EFFORT, FOR TESTING ONLY.
+
+   GPT-5.6 models default to medium reasoning, which adds latency and
+   billed output tokens to a task that is mostly reading print. Set
+   CARDGAUGE_VISION_EFFORT to none, low or medium to compare. Unset
+   sends nothing, so the model uses its own default. Never sent to
+   gpt-4/gpt-3 models, which reject it. */
+function effortFor(model) {
+  const e = process.env.CARDGAUGE_VISION_EFFORT;
+  if (!e || /^(gpt-4|gpt-3)/.test(String(model || ""))) return {};
+  return { reasoning_effort: e };
 }
 
 function tokenCapFor(model, n) {
