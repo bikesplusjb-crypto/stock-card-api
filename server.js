@@ -5514,7 +5514,11 @@ app.post(
             }).join(" ")
           : " | learned=none") +
         " | verified=" + (verification.checked
-            ? (verification.exists === true ? "yes" : verification.exists === false ? "NO" : "?")
+            ? (verification.exists === true
+                ? (verification.confidence === "low"
+                    ? "MISMATCH" + (verification.suggested ? " (catalog says " + verification.suggested.set_name + ")" : "")
+                    : "yes")
+                : verification.exists === false ? "NO" : "?")
             : "skipped")
       );
 
@@ -8296,15 +8300,67 @@ async function verifyAgainstCatalog(ai) {
       /* The card exists. Does the person on it match what the model
          said? A number that lands on a different player means the scan
          read one of the two fields wrong, and that is worth saying. */
-      const said = String(ai.player || "").toLowerCase().replace(/[^a-z ]/g, "").trim();
-      const real = String(hit.subject || "").toLowerCase().replace(/[^a-z ]/g, "").trim();
+      /* Accents stripped rather than deleted: "Velázquez" used to become
+         "velzquez", which could never match a model that wrote
+         "Velazquez". */
+      const plain = v => String(v || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+                                        .toLowerCase().replace(/[^a-z ]/g, "").trim();
+      const said = plain(ai.player);
+      const real = plain(hit.subject);
       if (said && real) {
-        const overlap = said.split(" ").filter(w => w.length > 2 && real.indexOf(w) > -1);
+        const saidWords = said.split(" ").filter(w => w.length > 2);
+        const overlap = saidWords.filter(w => real.indexOf(w) > -1);
         if (!overlap.length) {
           out.confidence = "low";
           out.note = "The catalog lists #" + number + " in this set as " + hit.subject +
                      ", not " + ai.player + ". One of those is wrong \u2014 worth checking " +
                      "the card number on the back.";
+
+          /* THE CATALOG USUALLY ALREADY KNOWS WHICH CARD IT IS.
+
+             15 Sept: a 2024 Topps Heritage Ohtani #371 scanned as 2023,
+             three times. The warning fired correctly -- 2023 Heritage #371
+             is Nelson Velazquez -- and then told the person to check the
+             card NUMBER, which was the one field read right. The year was
+             wrong, and 2024 Topps Heritage #371 Shohei Ohtani was sitting
+             in catalog_cards the whole time.
+
+             So: same product, same number, same player, a nearby year.
+             Local rows only -- no catalog records spent. And it is a
+             SUGGESTION in the note, never a swap, which keeps the rule
+             this function was built on: it annotates, it does not change
+             the answer. */
+          try {
+            const family = String(set.set_name || setNm || "").replace(/^\s*\d{4}\s+/, "").trim();
+            if (supabaseAdmin && family.length >= 4 && saidWords.length) {
+              const sib = await supabaseAdmin
+                .from("catalog_sets")
+                .select("ucid,set_name,year")
+                .ilike("set_name", "%" + family)
+                .limit(40);
+              const sibSets = (sib.data || []).filter(r =>
+                r.ucid !== setUcid && Number(r.year) && (!year || Math.abs(Number(r.year) - year) <= 3) &&
+                plain(String(r.set_name).replace(/^\s*\d{4}\s+/, "")) === plain(family));
+              if (sibSets.length) {
+                const sc = await supabaseAdmin
+                  .from("catalog_cards")
+                  .select("set_ucid,card_number,subject")
+                  .in("set_ucid", sibSets.map(r => r.ucid))
+                  .limit(2000);
+                const match = (sc.data || []).find(c =>
+                  sameCardNumber(c.card_number, number) &&
+                  saidWords.some(w => plain(c.subject).indexOf(w) > -1));
+                if (match) {
+                  const ms = sibSets.find(r => r.ucid === match.set_ucid);
+                  out.suggested = { year: Number(ms.year), set_name: ms.set_name, subject: match.subject };
+                  out.note = "The catalog lists #" + number + " in " + (set.set_name || setNm) +
+                             " as " + hit.subject + ", not " + ai.player + ". But #" + number +
+                             " in " + ms.set_name + " IS " + match.subject +
+                             " \u2014 check the year in the fine print on the back.";
+                }
+              }
+            }
+          } catch (e) { /* the plain warning stands */ }
         }
       }
       return out;
