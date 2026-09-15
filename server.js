@@ -5096,6 +5096,16 @@ app.post(
         }
       }
 
+      /* See catalogYearCheck. Before the display name and every query, so
+         the name, the search, the sold comps and the history row all use
+         the corrected year. */
+      const catalogYearFix = await catalogYearCheck(ai);
+      if (catalogYearFix) {
+        console.log("[catalog-year] " + catalogYearFix.from + " -> " + catalogYearFix.to +
+                    " | " + catalogYearFix.note);
+        ai.year = String(catalogYearFix.to);
+      }
+
       const cleanCardName = buildDisplayName(ai);
 
       /* NO NAME, NO BRAND, NO SET: THERE IS NO CARD TO PRICE.
@@ -5464,6 +5474,14 @@ app.post(
       }
 
       const verification  = await verifyPromise;
+      /* The scanner already renders verified.yearCorrected as "Confirmed in
+         the card catalog - year corrected to X". Reuse it rather than add a
+         second UI for the same fact. */
+      if (catalogYearFix && verification) {
+        verification.yearCorrected = verification.yearCorrected ||
+          { from: catalogYearFix.from, to: catalogYearFix.to, sets: 1 };
+        verification.catalogYearFix = catalogYearFix;
+      }
 
       /* What other people corrected on this same misread. Looked up
          AFTER pricing rather than before, deliberately: this is a
@@ -5513,6 +5531,7 @@ app.post(
               return c.field + "->" + c.suggested + "(" + c.agreement + "," + c.matchKind + ")";
             }).join(" ")
           : " | learned=none") +
+        (catalogYearFix ? " | CATALOG-YEAR " + catalogYearFix.from + "->" + catalogYearFix.to : "") +
         " | verified=" + (verification.checked
             ? (verification.exists === true
                 ? (verification.confidence === "low"
@@ -5704,6 +5723,7 @@ app.post(
            is real and the card number is not in it, which is what a
            misread looks like from the outside. */
         verified:          verification,
+        catalogYearFix:    catalogYearFix,
         summary:           ai.summary    || "AI scan complete. Verify exact version, condition, and comps.",
         avgSoldPrice:      market.avgPrice,
         avgPrice:          market.avgPrice,
@@ -7914,6 +7934,109 @@ function sameCardNumber(a, b) {
   return !!x && x === y;
 }
 
+/* ── THE CATALOG KNOWS WHICH YEAR THIS CARD IS ────────────────
+
+   15 Sept: a 2024 Topps Heritage Shohei Ohtani #371 scanned as 2023,
+   four times on gpt-4o, and was priced every time from 2023 sales. The
+   prompt carries a worked example of exactly this mistake. The copyright
+   strip reader exists for exactly this mistake. Neither stopped it.
+
+   The catalog could have. Both rows were already in catalog_cards:
+
+     2023 Topps Heritage #371  Nelson Velazquez
+     2024 Topps Heritage #371  Shohei Ohtani
+
+   That is not a hint, it is proof. The number read correctly, the
+   player read correctly, and in the year that was read that number
+   belongs to somebody else -- while the same number in the same product
+   one year over IS this player. Only the year can be wrong.
+
+   verifyAgainstCatalog() deliberately never changes the answer, and it
+   runs alongside pricing, so even when it noticed, the price had already
+   been built on the wrong year. This runs BEFORE pricing, against local
+   rows only (no catalog records spent), and changes the year only on
+   that proof:
+
+     - a row for the read year, same product, same number, exists
+     - that row is a DIFFERENT player
+     - exactly one other year within three, same product and number,
+       IS this player
+
+   Anything short of that returns null and the scan stands as read. A
+   missing row proves nothing -- checklists are incomplete -- so an
+   absent card never triggers a change. */
+async function catalogYearCheck(ai) {
+  try {
+    if (!supabaseAdmin) return null;
+    const year   = parseInt(ai.year, 10);
+    const number = String(ai.cardNumber || "").trim();
+    const plain  = v => String(v || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+                                     .toLowerCase().replace(/[^a-z0-9 ]/g, " ")
+                                     .replace(/\s+/g, " ").trim();
+    const words  = plain(ai.player).split(" ").filter(w => w.length > 2 && !/^\d+$/.test(w));
+    const brand  = cleanVal(ai.brand), setNm = cleanVal(ai.set);
+    if (!year || !number || JUNK_VALUE.test(number) || !words.length || (!brand && !setNm)) return null;
+
+    /* The product name as the catalog writes it, minus the year: the set
+       alone ("Topps Heritage") or brand + set ("Topps" + "Heritage"). */
+    const families = [plain(setNm), plain([brand, setNm].filter(Boolean).join(" "))]
+      .filter(f => f.length >= 4);
+    if (!families.length) return null;
+    const likeWords = plain(setNm || brand).split(" ").filter(Boolean);
+    if (!likeWords.length) return null;
+
+    const setsRes = await supabaseAdmin
+      .from("catalog_sets")
+      .select("ucid,set_name,year")
+      .gte("year", year - 3).lte("year", year + 3)
+      .ilike("set_name", "%" + likeWords.join("%") + "%")
+      .limit(200);
+    const sets = (setsRes.data || []).filter(r => {
+      const stripped = plain(String(r.set_name || "").replace(/^\s*\d{4}(-\d{2})?\s+/, ""));
+      return Number(r.year) && families.indexOf(stripped) > -1;
+    });
+    if (!sets.some(r => Number(r.year) === year)) return null;
+    if (!sets.some(r => Number(r.year) !== year)) return null;
+
+    const bare = number.replace(/^#+/, "");
+    const cardsRes = await supabaseAdmin
+      .from("catalog_cards")
+      .select("set_ucid,card_number,subject")
+      .in("set_ucid", sets.map(r => r.ucid))
+      .in("card_number", Array.from(new Set([bare, bare.replace(/^0+(?=\d)/, ""), "#" + bare])))
+      .limit(50);
+    const yearOf  = {}; sets.forEach(r => { yearOf[r.ucid] = Number(r.year); });
+    const nameOf  = {}; sets.forEach(r => { nameOf[r.ucid] = r.set_name; });
+    const isThis  = c => words.some(w => plain(c.subject).split(" ").indexOf(w) > -1);
+    const rows    = (cardsRes.data || []).filter(c => sameCardNumber(c.card_number, number) && c.subject);
+
+    const readRows = rows.filter(c => yearOf[c.set_ucid] === year);
+    if (!readRows.length) return null;          // absence proves nothing
+    if (readRows.some(isThis)) return null;     // read year confirmed
+
+    const elsewhere = rows.filter(c => yearOf[c.set_ucid] !== year && isThis(c));
+    const years = Array.from(new Set(elsewhere.map(c => yearOf[c.set_ucid])));
+    if (years.length !== 1) return null;        // none, or ambiguous
+
+    const right = elsewhere[0];
+    return {
+      from:        year,
+      to:          years[0],
+      cardNumber:  bare,
+      readSet:     nameOf[readRows[0].set_ucid],
+      readSubject: readRows[0].subject,
+      rightSet:    nameOf[right.set_ucid],
+      rightSubject: right.subject,
+      note: "#" + bare + " in " + nameOf[readRows[0].set_ucid] + " is " + readRows[0].subject +
+            ", so this can't be " + year + ". #" + bare + " in " + nameOf[right.set_ucid] +
+            " is " + right.subject + " \u2014 priced as " + years[0] + "."
+    };
+  } catch (e) {
+    console.warn("[catalog-year] check failed:", e.message);
+    return null;
+  }
+}
+
 async function verifyAgainstCatalog(ai) {
   const out = {
     checked:   false,      // did we get to ask?
@@ -8363,6 +8486,15 @@ async function verifyAgainstCatalog(ai) {
           } catch (e) { /* the plain warning stands */ }
         }
       }
+      /* TRACE. On 15 Sept this printed verified=yes for a 2023 Heritage
+         #371 read as Ohtani, while catalog_cards says that card is Nelson
+         Velazquez -- and nothing in the code or the data explained it.
+         One line naming the set, the catalog's player and the scan's
+         player settles it the next time instead of guessing again. */
+      console.log("[verify] " + (set.set_name || setNm) + " #" + number +
+                  " catalog=" + (hit.subject || "?") + " scan=" + (ai.player || "?") +
+                  " -> " + (out.confidence === "low" ? "MISMATCH" : "match") +
+                  (fromCache ? " (set from cache)" : ""));
       return out;
     }
 
