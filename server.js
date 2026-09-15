@@ -4485,6 +4485,20 @@ async function recordDailyPriceFromLookup(query, sold, market) {
     const s = sold || {};
     if (s.soldContaminated || s.soldLimited) return;
 
+    /* A QUERY WITH NO NAME IN IT IS NOT A CARD.
+
+       "2018", "2021" and "#243" all reached this table as if they were
+       cards -- each one a median across whatever the marketplace
+       returned for a bare year or number. Somebody may still see a
+       result for a search like that; it must not become a permanent
+       series under a key that looks like an identity. Three letters in
+       a row is the bar: every player, creature, brand and set name
+       clears it, and a bare year or card number does not. */
+    if (!/[a-z]{3,}/i.test(String(query || ""))) {
+      console.log("[daily-price] skipped nameless query: " + query);
+      return;
+    }
+
     /* Same median the nightly refresh picks: soldRaw when the base pool
        is deep enough to stand behind, headline otherwise. */
     const usedRaw = !!(s.soldRaw && s.soldRaw.count >= 3 && s.soldRaw.median);
@@ -5083,6 +5097,28 @@ app.post(
       }
 
       const cleanCardName = buildDisplayName(ai);
+
+      /* NO NAME, NO BRAND, NO SET: THERE IS NO CARD TO PRICE.
+
+         15 Sept, 9:43 AM: the vision call came back empty, the strip
+         reader found "(c) 2018 THE TOPPS COMPANY" on the back, and the
+         scan went ahead with a query of just "2018". It returned 100
+         sales of unrelated 2018 cards, showed the person a $5 price, and
+         wrote that into permanent price history.
+
+         A year on its own identifies nothing. Stopping here returns the
+         same error path the scanner already handles -- the message shows,
+         and the free scan is NOT used up, because noteFreeScan() only
+         runs on success. Sealed product and slabs still pass: they carry
+         a brand or a set even when there is no player. */
+      if (!cleanVal(ai.player) && !cleanVal(ai.brand) && !cleanVal(ai.set)) {
+        console.log("[scan] UNIDENTIFIED — no player, brand or set (read: \"" +
+                    cleanCardName + "\") — not priced");
+        return res.json({
+          success: false,
+          error: "Couldn't read this card. Try again with the whole card in frame and less glare, or type the card name instead."
+        });
+      }
 
       /* RESOLVED BEFORE THE MARKET LOOKUP, NOT AFTER.
 
