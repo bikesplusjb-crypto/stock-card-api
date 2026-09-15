@@ -4162,8 +4162,10 @@ async function scanWithOpenAI(frontFile, backFile) {
     temperature: 0.1,
     /* 700 was tight for 25 keys plus a summary, and parallelOptions is an
        array that only appears when the model has something to say. Room to
-       list three or four candidates costs a fraction of a cent. */
-    max_tokens: 900
+       list three or four candidates costs a fraction of a cent.
+
+       Spelled per model family -- see tokenCapFor. */
+    ...tokenCapFor(VISION_MODEL, 900)
   };
 
   /* ONE RETRY ON THE KNOWN-GOOD MODEL.
@@ -6369,7 +6371,7 @@ async function gradeWithOpenAI(frontFile, backFile, condition, notes) {
       { role: "user", content: [{ type: "text", text: userText }, ...images] }
     ],
     temperature: 0.2,
-    max_tokens: 800
+    ...tokenCapFor(VISION_MODEL, 800)
   };
 
   try {
@@ -7019,6 +7021,28 @@ app.get("/api/vs-market", async (req, res) => {
    production model, so an unset variable behaves exactly as today. */
 const VISION_MODEL    = process.env.CARDGAUGE_VISION_MODEL || "gpt-4o";
 const VISION_FALLBACK = "gpt-4o";
+
+/* NEWER FAMILIES RENAMED THE TOKEN CAP.
+
+   Tested 15 Sept: gpt-5.6-luna is reachable on this account and
+   rejected the request outright --
+
+     "Unsupported parameter: 'max_tokens' is not supported with this
+      model. Use 'max_completion_tokens' instead."
+
+   The one-shot fallback caught it and the scan still returned on
+   gpt-4o, which is exactly what it was for. But the model works; only
+   the parameter name was wrong.
+
+   Keyed off the model name rather than a version list, so a model that
+   has not been invented yet gets the modern spelling by default and an
+   old one keeps the old. If a future family rejects temperature too,
+   the fallback will surface that the same way this surfaced. */
+function tokenCapFor(model, n) {
+  return /^(gpt-4|gpt-3)/.test(String(model || ""))
+    ? { max_tokens: n }
+    : { max_completion_tokens: n };
+}
 
 const CATALOG_BASE      = "https://www.thecardapi.com/api/v1/catalog";
 const CATALOG_PAGE_SIZE = 5;      // records per lookup — see note 1 above
