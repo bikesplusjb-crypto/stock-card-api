@@ -4489,7 +4489,7 @@ async function recordDailyPriceFromLookup(query, sold, market) {
       return Number.isFinite(x) && x > 0 ? x : null;
     };
 
-    await supabaseAdmin.rpc("record_daily_price", {
+    const { error: rpcError } = await supabaseAdmin.rpc("record_daily_price", {
       p_cache_key: cacheKeyFor(query),
       p_median:    median,
       p_low:       lo,
@@ -4502,6 +4502,10 @@ async function recordDailyPriceFromLookup(query, sold, market) {
       p_ask_high:   ask ? askNum(ask.high)   : null,
       p_ask_count:  ask && Number(ask.count) > 0 ? Number(ask.count) : null
     });
+    /* Returned, not thrown -- the catch below would never see it. */
+    if (rpcError) {
+      console.log("[daily-price] lookup write failed for " + query + ": " + rpcError.message);
+    }
   } catch (e) {
     console.log("[daily-price] lookup write skipped: " + (e && e.message));
   }
@@ -8503,6 +8507,13 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
    competing for budget. */
 const REFRESH_MAX_PER_RUN = Number(process.env.REFRESH_MAX_PER_RUN || 80);
 
+/* ET calendar day of the last refresh that got past its fetch and
+   finished. Read by the 6:00 catch-up cron. */
+let lastRefreshCompletedDay = null;
+function etDayString() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+
 async function refreshWatchlistPrices() {
   if (!supabaseAdmin) {
     console.log("[watchlist-refresh] skipped — no Supabase client");
@@ -8517,19 +8528,45 @@ async function refreshWatchlistPrices() {
        the whole watchlist rather than repeatedly refreshing whichever
        rows the database happened to return first. nullsFirst so a card
        that has never been checked jumps the queue. */
-    const { data: items, error } = await supabaseAdmin
-      .from("watchlist_items")
-      .select("id, card_name, last_checked_at")
-      .order("last_checked_at", { ascending: true, nullsFirst: true })
-      .limit(REFRESH_MAX_PER_RUN);
+    /* RETRY THE FETCH BEFORE GIVING UP THE NIGHT.
+
+       14 Sept 2026: this select got a Gateway Timeout from Supabase at
+       04:00:05 ET and the function returned. One failed read cost the
+       whole night -- zero cards stamped, zero daily-price rows -- while
+       the 4:30 price-alerts run on the same database worked fine. The
+       same timeout had hit the welcome-email job at 2:50, 3:10 and 3:50,
+       so it was an intermittent upstream blip, not a code change.
+
+       Three attempts spaced 2 and 5 minutes apart. Still finishes before
+       the 4:30 alerts run on a normal night, and the 6:00 catch-up below
+       covers an outage longer than that. */
+    let items = null;
+    let error = null;
+    const FETCH_WAITS_MS = [120000, 300000];
+    for (let attempt = 1; attempt <= FETCH_WAITS_MS.length + 1; attempt++) {
+      const r = await supabaseAdmin
+        .from("watchlist_items")
+        .select("id, card_name, last_checked_at")
+        .order("last_checked_at", { ascending: true, nullsFirst: true })
+        .limit(REFRESH_MAX_PER_RUN);
+      items = r.data;
+      error = r.error;
+      if (!error) break;
+      console.error("[watchlist-refresh] fetch error (attempt " + attempt + "/" +
+                    (FETCH_WAITS_MS.length + 1) + "):", error.message);
+      if (attempt <= FETCH_WAITS_MS.length) {
+        await new Promise(resolve => setTimeout(resolve, FETCH_WAITS_MS[attempt - 1]));
+      }
+    }
 
     if (error) {
-      console.error("[watchlist-refresh] fetch error:", error.message);
+      console.error("[watchlist-refresh] giving up after retries — catch-up run will try again");
       return;
     }
 
     if (!items || !items.length) {
       console.log("[watchlist-refresh] no cards to refresh");
+      lastRefreshCompletedDay = etDayString();
       return;
     }
 
@@ -8540,6 +8577,10 @@ async function refreshWatchlistPrices() {
     /* Counted separately so the log distinguishes "no sold data" from
        "the write failed" -- they need different responses. */
     let skipped = 0;
+    /* Daily-price rows actually written. updated counts current_price
+       changes, which is not the same thing -- a card can reprice with
+       no usable range and write no history row. */
+    let written = 0;
     let budgetStopped = false;
 
     for (const item of items) {
@@ -8723,7 +8764,7 @@ async function refreshWatchlistPrices() {
                high is worse than a gap -- the gap is honest and the
                refusals above already produce them. */
             if (Number(lo) > 0 && Number(hi) > 0 && Number(n) > 0) {
-              await supabaseAdmin.rpc("record_daily_price", {
+              const { error: rpcError } = await supabaseAdmin.rpc("record_daily_price", {
                 /* No limit argument, matching the getSoldComps call above --
                    cacheKeyFor defaults to CARDAPI_LIMIT, so this lands on the
                    same key the comps were cached under. Passing a different
@@ -8740,6 +8781,14 @@ async function refreshWatchlistPrices() {
                 p_basis:     s.soldBasis || null,
                 p_card_name: item.card_name
               });
+              /* supabase-js RETURNS errors, it does not throw them. The
+                 catch below never saw a failed write, so a broken RPC
+                 would have looked exactly like a quiet night. */
+              if (rpcError) {
+                console.log("[daily-price] write failed for " + item.card_name + ": " + rpcError.message);
+              } else {
+                written++;
+              }
             } else {
               console.log("[daily-price] no usable base range for " +
                           item.card_name + " — day left as a gap");
@@ -8815,9 +8864,11 @@ async function refreshWatchlistPrices() {
       "[watchlist-refresh] done. updated=" + updated +
       " skipped=" + skipped + " (kept previous price)" +
       " failed=" + failed +
+      " history_rows=" + written +
       (budgetStopped ? " STOPPED-ON-BUDGET" : "") +
       " elapsed=" + elapsed + "s"
     );
+    lastRefreshCompletedDay = etDayString();
   } catch (e) {
     console.error("[watchlist-refresh] fatal error:", e.message);
   }
@@ -8827,6 +8878,27 @@ cron.schedule("0 4 * * *", function () { refreshWatchlistPricesGuarded("nightly 
   timezone: "America/New_York"
 });
 console.log("Watchlist daily refresh scheduled for 4:00 AM ET");
+
+/* CATCH-UP RUN.
+
+   node-cron does not replay a missed tick, and the 4:00 run gives up
+   after its retries. So a second chance at 6:00 ET, which only runs if
+   no refresh has completed today.
+
+   The marker lives in memory, so a service restart between 4:00 and
+   6:00 makes the catch-up run again even if 4:00 succeeded. That costs
+   one extra batch of comp pulls and nothing else -- record_daily_price
+   upserts on (cache_key, day), so no duplicate rows. */
+cron.schedule("0 6 * * *", function () {
+  if (lastRefreshCompletedDay === etDayString()) {
+    console.log("[watchlist-refresh] catch-up not needed — today's run completed");
+    return;
+  }
+  refreshWatchlistPricesGuarded("catch-up cron");
+}, {
+  timezone: "America/New_York"
+});
+console.log("Watchlist catch-up refresh scheduled for 6:00 AM ET");
 
 /* ONE RUN AT A TIME.
 
