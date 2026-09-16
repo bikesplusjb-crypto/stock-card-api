@@ -2522,6 +2522,45 @@ async function fetchEbayListings(query, limit) {
   }
 }
 
+/* THE PICTURE WAS WHICHEVER LISTING CAME BACK FIRST.
+
+   16 Sept, "2018 Topps Shohei Ohtani us285": the thumbnail was a Rookie
+   Debut card -- a different 2018 Update Ohtani -- and an earlier search
+   showed a PSA 6 slab above a price labelled RAW. Only the photo was
+   wrong, but the photo is what somebody checks first to see whether we
+   found their card.
+
+   Scored instead of first-found: a listing whose title carries the card
+   number that was searched wins outright; raw beats graded (the headline
+   is a raw price); and a title naming a different version -- Rookie
+   Debut, All-Star, a parallel, an auto, a lot -- loses points unless the
+   search itself asked for that word. Ties keep eBay's order, so a search
+   with nothing to go on behaves exactly as before. */
+function pickListingImage(listings, cleanQuery) {
+  const withImg = (listings || []).filter(x => x && x.image);
+  if (!withImg.length) return "";
+  const q = " " + String(cleanQuery || "").toLowerCase() + " ";
+  const numM = q.match(/#?\s*([a-z]{0,4}-?\d{1,4}[a-z]?)\s/i);
+  const numTok = numM && /\d/.test(numM[1]) && !/^(19|20)\d{2}$/.test(numM[1])
+    ? numM[1].replace(/[#\s-]/g, "").toLowerCase() : "";
+  const VERSION_WORDS = ["rookie debut", "all-star", "all star", "refractor", "parallel", "auto",
+    "autograph", "patch", "relic", "lot", "reprint", "insert", "gold", "rainbow", "foil",
+    "black", "vintage stock", "independence day", "mother's day", "father's day", "memorial day",
+    "short print", " sp ", "ssp", "variation", "chrome", "sepia", "/"];
+  let best = withImg[0], bestScore = -Infinity;
+  withImg.forEach((x, i) => {
+    const t = " " + String(x.title || "").toLowerCase() + " ";
+    const tn = t.replace(/[#\s-]/g, "");
+    let score = 0;
+    if (numTok && tn.indexOf(numTok) > -1) score += 10;
+    if (!x.graded) score += 3;
+    VERSION_WORDS.forEach(w => { if (t.indexOf(w) > -1 && q.indexOf(w) === -1) score -= 4; });
+    score -= i * 0.01;             // tie-break: keep eBay's order
+    if (score > bestScore) { bestScore = score; best = x; }
+  });
+  return best.image || "";
+}
+
 // Turn a listing array into the market summary shape the frontends expect.
 function summarizeListings(listings, cleanQuery, extra) {
   const prices = listings.map(item => item.price).sort((a, b) => a - b);
@@ -2539,7 +2578,7 @@ function summarizeListings(listings, cleanQuery, extra) {
     listingCount:   listings.length,
     spreadRatio:    Number(spread.toFixed(1)),
     wideSpread:     wide,
-    image:          (listings.find(x => x.image) || {}).image || "",
+    image:          pickListingImage(listings, cleanQuery),
     priceSource:    listings.length ? "eBay active card listings (median)" : "No clean card listings found",
     raw:            summarizeGroup(rawGroup),
     graded:         summarizeGroup(gradedGroup),
