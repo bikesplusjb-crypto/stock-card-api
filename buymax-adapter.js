@@ -198,6 +198,11 @@ function makeCardGaugeHook(soldCompsFn) {
     return {
       soldMedian: median,
       soldCount: baseCount,
+      /* The same trimmed low and high the scanner prints as the range.
+         The panel turns them into "if it sells low / typical / high"
+         so the profit at the ask is shown as a spread, not one figure. */
+      soldLow:  Number(raw.soldLow)  || null,
+      soldHigh: Number(raw.soldHigh) || null,
       sold_count_all: Number(raw.soldCount) || 0,
       basis: raw.soldBasis || 'raw',
       /* Passed through untouched so the ladder BuyMax builds can show
