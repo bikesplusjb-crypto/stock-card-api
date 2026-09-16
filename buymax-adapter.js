@@ -140,6 +140,36 @@ function makeCardGaugeHook(soldCompsFn) {
        soldRaw is the pool the refusals are computed against too, so
        taking the median from anywhere else means the guard and the
        number it guards describe different sets of sales. */
+    /* THE PAGE SAID "SEVERAL VERSIONS" AND BUYMAX QUOTED A CEILING ANYWAY.
+
+       16 Sept, "2018 Topps shohei Ohtani": the scanner put up "Sale
+       prices are all over the place -- this search is catching several
+       versions of the card. Pick one below", and directly under it BuyMax
+       answered Walk away / open at $58 / never above $66, at 95
+       confidence. The scanner's warning fires when the high end of the
+       sales is 3x the median or the median is 3x the low end; nothing
+       told BuyMax, because that test only ever ran in the browser.
+
+       Same test, same threshold (WIDE_SPREAD_X = 3 in scanner.html), same
+       fields -- soldMedian, soldLow, soldHigh -- so the two can never
+       disagree about whether this number describes one card. It refuses
+       as a no-call, the "Can't price this one" the page already renders
+       for a contaminated pool, and the refinement chips on the same page
+       are the way back to a price. */
+    {
+      const med = Number(raw.soldMedian) || 0;
+      const lo  = Number(raw.soldLow)    || 0;
+      const hi  = Number(raw.soldHigh)   || 0;
+      const WIDE_SPREAD_X = 3;
+      if (med > 0 && ((hi > 0 && hi / med >= WIDE_SPREAD_X) || (lo > 0 && med / lo >= WIDE_SPREAD_X))) {
+        return {
+          refused: true,
+          refusal_reason: 'sale prices span several versions of this card — narrow the search to price it',
+          sold_count: raw.soldCount || 0
+        };
+      }
+    }
+
     const usedRaw = !!(raw.soldRaw && raw.soldRaw.count >= 3 && raw.soldRaw.median);
     const median  = Number(usedRaw ? raw.soldRaw.median : raw.soldMedian);
     if (!isFinite(median) || median <= 0) {
