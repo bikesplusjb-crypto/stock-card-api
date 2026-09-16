@@ -157,9 +157,14 @@ function makeCardGaugeHook(soldCompsFn) {
        for a contaminated pool, and the refinement chips on the same page
        are the way back to a price. */
     {
-      const med = Number(raw.soldMedian) || 0;
-      const lo  = Number(raw.soldLow)    || 0;
-      const hi  = Number(raw.soldHigh)   || 0;
+      /* Same pool the scanner now headlines (unifySoldHeadline): the
+         full raw pool and its trimmed range when it has 3+ sales, so the
+         page's warning and this refusal test identical numbers. */
+      const rp  = raw.soldRaw || {};
+      const useR = Number(rp.count) >= 3 && Number(rp.median) > 0;
+      const med = Number(useR ? rp.median : raw.soldMedian) || 0;
+      const lo  = Number(useR && rp.low  ? rp.low  : raw.soldLow)  || 0;
+      const hi  = Number(useR && rp.high ? rp.high : raw.soldHigh) || 0;
       const WIDE_SPREAD_X = 3;
       if (med > 0 && ((hi > 0 && hi / med >= WIDE_SPREAD_X) || (lo > 0 && med / lo >= WIDE_SPREAD_X))) {
         return {
@@ -201,8 +206,8 @@ function makeCardGaugeHook(soldCompsFn) {
       /* The same trimmed low and high the scanner prints as the range.
          The panel turns them into "if it sells low / typical / high"
          so the profit at the ask is shown as a spread, not one figure. */
-      soldLow:  Number(raw.soldLow)  || null,
-      soldHigh: Number(raw.soldHigh) || null,
+      soldLow:  Number(usedRaw && raw.soldRaw.low  ? raw.soldRaw.low  : raw.soldLow)  || null,
+      soldHigh: Number(usedRaw && raw.soldRaw.high ? raw.soldRaw.high : raw.soldHigh) || null,
       sold_count_all: Number(raw.soldCount) || 0,
       basis: raw.soldBasis || 'raw',
       /* Passed through untouched so the ladder BuyMax builds can show
