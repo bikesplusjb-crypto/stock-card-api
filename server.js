@@ -3787,6 +3787,169 @@ async function recordPriceHistory(key, query, sold, askMedian) {
   } catch (e) {}
 }
 
+/* ── DATA FOUNDATION ──────────────────────────────────────────────
+
+   Until 16 Sept, nearly everything CardGauge learned was thrown away.
+   Every sold lookup overwrote the previous cached result for its search,
+   and thecardapi only reaches back 30 days -- so a sale seen on 1 August
+   was gone by September. What the scanner read, and what the card turned
+   out to be, was never kept. And a card had no identity beyond whatever
+   words described it that day, so "2018 Topps Update Ohtani #US285" and
+   "ohtani us285" were strangers.
+
+   Three stores, filled as a side effect of work already being done --
+   no extra thecardapi records spent, nothing on the request path waits:
+
+     market_sales / market_sale_queries  LICENSED. Every raw sale a
+       lookup returns, kept once, never overwritten, plus which searches
+       found it. thecardapi ToS s.5: Builder may store 5,000,000 records;
+       all must go within 30 days of cancelling. No image URLs (eBay).
+     cards / card_aliases  OWNED. One permanent card_id per exact card
+       (year, brand, set, player, number, parallel, print run, auto),
+       and every name it has been looked up under.
+     scan_reads  OWNED. What the model read, what the catalog and the
+       guards changed, and the price that came out -- the accuracy record
+       and, later, labelled training data. No photos, no user identity.
+
+   Every write is fire-and-forget and swallows its own errors: the data
+   layer must never be the reason a scan or a price fails. */
+const DATA_LOGIC_VERSION = "2026-09-16";
+
+function archiveSoldRecords(recs, query) {
+  try {
+    if (!supabaseAdmin || !Array.isArray(recs) || !recs.length) return;
+    const num = v => (v === null || v === undefined || v === "" || !isFinite(Number(v))) ? null : Number(v);
+    const str = (v, n) => (v === null || v === undefined || v === "") ? null : String(v).slice(0, n || 200);
+    const rows = recs.map(r => ({
+      sale_id:          str(r.id, 120),
+      platform:         str(r.platform, 40),
+      listing_type:     str(r.listing_type, 20),
+      title:            str(r.title, 300),
+      sale_date:        str(r.sale_date, 10),
+      sold_at:          str(r.sold_at, 40),
+      price:            num(r.price),
+      original_price:   num(r.original_price),
+      currency:         str(r.currency, 3),
+      price_confirmed:  typeof r.price_confirmed === "boolean" ? r.price_confirmed : null,
+      bids:             num(r.bids),
+      shipping_price:   num(r.shipping_price),
+      grader:           str(r.grader, 10),
+      grade:            str(r.grade, 10),
+      grade_qualifier:  str(r.grade_qualifier, 10),
+      grade_label:      str(r.label, 40),
+      autograph_grade:  str(r.autograph_grade, 10),
+      cert:             str(r.cert, 30),
+      print_run:        num(r.print_run),
+      features:         Array.isArray(r.features) ? r.features.slice(0, 12).map(f => String(f).slice(0, 30)) : null,
+      cat_player:       str(r.player, 80),
+      cat_set:          str(r.card_set, 120),
+      cat_card_number:  str(r.card_number, 30),
+      cat_year:         num(r.year),
+      cat_manufacturer: str(r.manufacturer, 40),
+      cat_sport:        str(r.sport, 30),
+      cat_team:         str(r.team, 60),
+      category:         str(r.category, 20),
+      listing_url:      str(r.listing_url, 500)
+    })).filter(r => r.sale_id && r.price !== null);
+    if (!rows.length) return;
+    supabaseAdmin.rpc("cg_archive_sales", { p_query: String(query || ""), p_rows: rows })
+      .then(({ error }) => { if (error) console.log("[data] sales archive failed: " + error.message); })
+      .catch(e => console.log("[data] sales archive error: " + e.message));
+  } catch (e) { /* never let the archive break a lookup */ }
+}
+
+async function recordCard(fields) {
+  try {
+    if (!supabaseAdmin || !fields) return null;
+    const aliases = (fields.aliases || []).filter(Boolean).map(a => String(a).slice(0, 200));
+    const payload = Object.assign({}, fields, { aliases: aliases });
+    const { data, error } = await supabaseAdmin.rpc("cg_card_upsert", { p: payload });
+    if (error) { console.log("[data] card upsert failed: " + error.message); return null; }
+    return data || null;
+  } catch (e) { return null; }
+}
+
+function printRunOf(ai) {
+  const d = serialDenominator(ai);
+  const m = String(d || "").match(/(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
+/* Identity only for a card we can actually name. An untrusted parallel
+   (read from colour alone) gets NO card_id rather than being filed under
+   the base card -- a wrong identity is worse than a missing one. */
+function identityFromAi(ai, source, aliases) {
+  if (!ai || (!cleanVal(ai.player) && !cleanVal(ai.set))) return null;
+  const hasPar = !!cleanVal(ai.parallel) && !GENERIC_SET.test(cleanVal(ai.parallel));
+  if (hasPar && !parallelIsTrustworthy(ai)) return null;
+  const yr = parseInt(ai.year, 10);
+  return {
+    year:         yr > 1850 && yr < 2100 ? String(yr) : "",
+    brand:        cleanVal(ai.brand),
+    set_name:     cleanVal(ai.set),
+    player:       cleanVal(ai.player),
+    card_number:  cleanVal(ai.cardNumber),
+    parallel:     hasPar ? cleanVal(ai.parallel) : "",
+    print_run:    printRunOf(ai),
+    is_rookie:    !!ai.isRookie,
+    is_auto:      !!ai.isAutograph,
+    is_patch:     !!ai.isPatch,
+    sport:        cleanVal(ai.sport),
+    display_name: String(buildDisplayName(ai) || "").slice(0, 200),
+    source:       source,
+    aliases:      aliases || []
+  };
+}
+
+function soldSummaryForLog(sold) {
+  const s = sold || {};
+  const r = s.soldRaw || {};
+  const useR = Number(r.count) >= 3 && Number(r.median) > 0;
+  return {
+    median: useR ? Number(r.median) : (Number(s.soldMedian) || null),
+    count:  useR ? Number(r.count)  : (Number(s.soldCount)  || null),
+    basis:  s.soldBasis || null,
+    flags: {
+      contaminated: !!s.soldContaminated, limited: !!s.soldLimited, wide_base: !!s.soldWideBase,
+      broadened: !!s.broadenedTo, broadened_tier: s.broadenedTier || null,
+      low: Number(r.low || s.soldLow) || null, high: Number(r.high || s.soldHigh) || null,
+      cached: !!s.cached
+    }
+  };
+}
+
+async function logScanRead(x) {
+  try {
+    if (!supabaseAdmin) return;
+    const ai = x.ai || {};
+    const ident = identityFromAi(ai, x.surface, [x.soldQuery, x.searchQuery]);
+    const cardId = ident ? await recordCard(ident) : null;
+    const sum = soldSummaryForLog(x.sold);
+    const final = {};
+    ["year", "brand", "set", "insertName", "player", "cardNumber", "parallel", "parallelEvidence",
+     "parallelCertain", "serialNumber", "isRookie", "isAutograph", "isPatch", "sport", "gradeCompany",
+     "gradeValue", "copyrightLine", "confidence"]
+      .forEach(k => { if (ai[k] !== undefined && ai[k] !== "" && ai[k] !== null) final[k] = ai[k]; });
+    const { error } = await supabaseAdmin.from("scan_reads").insert({
+      surface:       x.surface,
+      model:         x.model || null,
+      used_back:     !!x.usedBack,
+      card_id:       cardId,
+      read:          x.read || null,
+      corrections:   x.corrections || null,
+      final:         final,
+      sold_query:    x.soldQuery ? String(x.soldQuery).slice(0, 300) : null,
+      sold_median:   sum.median,
+      sold_count:    sum.count,
+      sold_basis:    sum.basis,
+      sold_flags:    sum.flags,
+      vision_ms:     x.visionMs || null,
+      logic_version: DATA_LOGIC_VERSION
+    });
+    if (error) console.log("[data] scan_read insert failed: " + error.message);
+  } catch (e) { /* never let logging break a scan */ }
+}
+
 async function fetchSoldComps(query, limit) {
   if (!CARDAPI_KEY) return null;
   const clean = normalizeCardQuery(query);
@@ -3816,6 +3979,7 @@ async function fetchSoldComps(query, limit) {
     const remaining = r.headers.get("x-ratelimit-remaining");
     const body = await r.json();
     const recs = Array.isArray(body.data) ? body.data : [];
+    archiveSoldRecords(recs, clean);   // data foundation: keep every sale seen
     const out  = summarizeSold(recs, clean, useLimit);
     out.recordsUsed = recs.length;
     out.budgetLeft  = remaining != null ? Number(remaining) : null;
@@ -4914,6 +5078,34 @@ app.get("/api/card-market", async (req, res) => {
 
     /* After the response, never before it. */
     if (!compact) recordDailyPriceFromLookup(clean, sold, market);
+
+    /* Data foundation. A typed search is the person telling us the card,
+       so a parallel they typed counts as printed evidence. */
+    setImmediate(() => {
+      try {
+        const pq = parseCardQuery(clean) || {};
+        const sm = /pok[eé]mon/i.test(clean) ? null
+                 : clean.match(/(?:^|[\s(])(?:0*(\d{1,4}))?\s*\/\s*(\d{1,4})(?!\d)/);
+        const typedAi = {
+          year: pq.year, brand: pq.brand, set: pq.set, player: pq.player, parallel: pq.parallel,
+          sport: pq.sport, parallelEvidence: pq.parallel ? "printed" : "", parallelCertain: true,
+          cardNumber: (clean.match(/#\s*([A-Za-z0-9-]+)/) || [])[1] || "",
+          serialNumber: sm && Number(sm[1] || 1) <= Number(sm[2]) ? (sm[1] || "1") + "/" + sm[2] : "",
+          isRookie: /\b(rc|rookie)\b/i.test(clean),
+          isAutograph: /\b(auto|autograph|signed)\b/i.test(clean),
+          isPatch: /\b(patch|relic|jersey)\b/i.test(clean)
+        };
+        logScanRead({
+          surface: compact ? "typed_refine" : "typed_search",
+          ai: typedAi,
+          read: { query: String(query || "").slice(0, 200) },
+          corrections: laddered ? { broadened_to: sold && sold.broadenedTo, tier: sold && sold.broadenedTier } : null,
+          sold: sold,
+          soldQuery: (sold && sold.broadenedTo) || clean,
+          searchQuery: clean
+        });
+      } catch (e) { /* never break a lookup */ }
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: "Card market lookup failed", details: error.message });
   }
@@ -5350,7 +5542,18 @@ app.post(
       /* See catalogYearCheck. Before the display name and every query, so
          the name, the search, the sold comps and the history row all use
          the corrected year. */
+      /* The model's read as it came back (after the copyright-line year
+         check), before the parallel guard and the catalog year check
+         change anything -- kept for scan_reads. */
+      const modelRead = {
+        year: ai.year, brand: ai.brand, set: ai.set, player: ai.player, cardNumber: ai.cardNumber,
+        parallel: ai.parallel, parallelEvidence: ai.parallelEvidence, serialNumber: ai.serialNumber,
+        isRookie: ai.isRookie, isAutograph: ai.isAutograph, gradeCompany: ai.gradeCompany,
+        gradeValue: ai.gradeValue, copyrightLine: ai.copyrightLine, confidence: ai.confidence
+      };
+      let parallelClearedFrom = "";
       if (retroBorderColourGuess(ai)) {
+        parallelClearedFrom = ai.parallel;
         console.log("[parallel] cleared colour-only \"" + ai.parallel +
                     "\" on a retro-design product — the coloured border is the base design");
         ai.parallel        = "";
@@ -5829,6 +6032,28 @@ app.post(
          Fire and forget, after the response is built. A history write
          must never cost somebody their scan. */
       recordDailyPriceFromLookup(soldQuery, sold, market);
+
+      /* Data foundation -- after everything is decided, never awaited. */
+      setImmediate(() => logScanRead({
+        surface:   back ? "scan_both_sides" : "scan_front_only",
+        model:     VISION_MODEL,
+        usedBack:  !!back,
+        ai:        Object.assign({}, ai),
+        read:      modelRead,
+        corrections: {
+          catalog_year:     catalogYearFix ? { from: catalogYearFix.from, to: catalogYearFix.to } : null,
+          parallel_cleared: parallelClearedFrom || null,
+          listing_year:     yearCorrection && yearCorrection.adopted ? yearCorrection : null,
+          year_guess:       yearGuess || null,
+          known_corrections: knownCorrections || null,
+          verified: verification ? { checked: !!verification.checked, exists: verification.exists,
+                                     confidence: verification.confidence || null } : null
+        },
+        sold:        sold,
+        soldQuery:   soldQuery,
+        searchQuery: searchQuery,
+        visionMs:    tVision
+      }));
 
       return res.json({
         success:           true,
@@ -9419,6 +9644,17 @@ async function refreshWatchlistPrices() {
             /* No range means no row. A median with an invented low and
                high is worse than a gap -- the gap is honest and the
                refusals above already produce them. */
+            /* Data foundation: give every binder card a permanent card_id,
+               with its saved name as an alias. Not awaited. */
+            recordCard(identityFromAi({
+              year: item.year, brand: item.brand, set: item.set_name, player: item.player,
+              cardNumber: item.card_number, parallel: item.parallel, sport: item.sport,
+              parallelEvidence: item.parallel ? "printed" : "", parallelCertain: true,
+              serialNumber: (String(item.card_name || "").match(/(\d{1,4}\s*\/\s*\d{1,4})/) || [])[1] || "",
+              isRookie: /\b(rc|rookie)\b/i.test(item.card_name || ""),
+              isAutograph: /\b(auto|autograph|signed)\b/i.test(item.card_name || "")
+            }, "binder", [item.card_name]));
+
             if (Number(lo) > 0 && Number(hi) > 0 && Number(n) > 0) {
               const { error: rpcError } = await supabaseAdmin.rpc("record_daily_price", {
                 /* No limit argument, matching the getSoldComps call above --
