@@ -204,6 +204,29 @@ async function logProEvent(event, detail) {
    oldest entry is the one evicted when the cap is reached. */
 const seenStripeEvents = new Set();
 
+/* "new" | "duplicate" | "unknown". Unknown means the table could not be
+   reached (or does not exist yet) -- treated as not-a-duplicate, so the
+   webhook behaves exactly as it did before the table existed. */
+async function claimStripeEvent(id, type) {
+  try {
+    if (!supabaseAdmin) return "unknown";
+    const { error } = await supabaseAdmin.from("stripe_events")
+      .insert({ event_id: String(id), event_type: String(type || "") });
+    if (!error) return "new";
+    if (error.code === "23505") return "duplicate";
+    console.log("[stripe] event claim unavailable (" + (error.code || "") + "): " + error.message);
+    return "unknown";
+  } catch (e) {
+    console.log("[stripe] event claim error: " + e.message);
+    return "unknown";
+  }
+}
+async function releaseStripeEvent(id) {
+  try {
+    if (supabaseAdmin) await supabaseAdmin.from("stripe_events").delete().eq("event_id", String(id));
+  } catch (e) { /* best effort */ }
+}
+
 app.post(
   "/api/stripe-webhook",
   express.raw({ type: "application/json" }),
@@ -247,11 +270,33 @@ app.post(
        if this ever proves insufficient.
 
        Capped so a long-running process cannot grow the set unbounded. */
+    /* NOW ALSO REMEMBERED ACROSS RESTARTS.
+
+       The note above named the gap: memory forgets on a deploy, and this
+       app deploys many times a day (eight on 15 Sept alone). A redelivery
+       landing just after one could grant Pro twice or count one sale
+       twice. Each event id is now claimed in stripe_events, whose primary
+       key makes a second insert of the same id fail -- that failure IS the
+       duplicate check, and it holds across restarts and across two server
+       instances racing the same delivery.
+
+       The in-memory set stays in front as the fast path, and as the
+       fallback if the table cannot be reached: a database hiccup must not
+       stop a real payment being processed, so an unknown result proceeds
+       exactly as the code did before this existed. */
+    let claimedInDb = false;
     if (event.id) {
       if (seenStripeEvents.has(event.id)) {
         console.log("[stripe] duplicate event " + event.id + " (" + type + ") — already handled");
         return res.json({ received: true, duplicate: true });
       }
+      const claim = await claimStripeEvent(event.id, type);
+      if (claim === "duplicate") {
+        console.log("[stripe] duplicate event " + event.id + " (" + type + ") — already handled (db)");
+        seenStripeEvents.add(event.id);
+        return res.json({ received: true, duplicate: true });
+      }
+      claimedInDb = (claim === "new");
       seenStripeEvents.add(event.id);
       if (seenStripeEvents.size > 500) {
         const oldest = seenStripeEvents.values().next().value;
@@ -357,6 +402,11 @@ app.post(
       }
     } catch (e) {
       console.error("[stripe] handler error on " + type + ":", e.message);
+      /* Release the claim, so resending this event from the Stripe
+         dashboard after the bug is fixed actually processes it instead
+         of being skipped as already handled. */
+      if (claimedInDb) releaseStripeEvent(event.id);
+      seenStripeEvents.delete(event.id);
     }
 
     // Always 200 once the signature checked out, or Stripe retries forever.
@@ -379,6 +429,100 @@ app.get("/api/stripe-status", (req, res) => {
 // ── Body parsers — everything BELOW this line gets parsed JSON ──
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true }));
+
+/* ── A LIMIT ON WHAT COSTS MONEY ────────────────────────────────────
+
+   Every photo scan is a paid OpenAI call (about 2 cents, measured 15
+   Sept) and every price lookup spends thecardapi's daily record
+   allowance. Nothing limited either. One script looping /api/scan-card
+   could run up hundreds of dollars before morning, and a burst of lookups
+   could empty the allowance and leave every real user -- and the 4 AM
+   repricing -- with nothing.
+
+   Two layers, both in memory:
+     per address  -- a short window for bursts and a daily ceiling, set
+                     well above any real use (a shop scanning a table
+                     through the Business tool, a binder CSV import
+                     pricing row by row);
+     whole server -- a daily ceiling on vision calls from everyone at
+                     once, the circuit breaker if the traffic is spread
+                     across many addresses.
+
+   In memory means a restart resets the counts. That is acceptable for
+   what this is for: stopping a runaway, not metering usage. Every number
+   is an environment variable, so a genuine rush can be let through
+   without a deploy. A limited request gets a 429 with success:false and a
+   plain sentence, which every page already shows as an error. */
+function clientAddress(req) {
+  const fwd = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return fwd || req.ip || (req.socket && req.socket.remoteAddress) || "unknown";
+}
+function etDay() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+function makeLimiter(name, opts) {
+  const hits = new Map();          // addr -> { win: [timestamps], day, dayCount }
+  let globalDay = "", globalCount = 0;
+  setInterval(function () {        // sweep idle addresses hourly
+    const cutoff = Date.now() - opts.windowMs;
+    hits.forEach((v, k) => { if (!v.win.length || v.win[v.win.length - 1] < cutoff) hits.delete(k); });
+  }, 60 * 60 * 1000).unref();
+
+  return function (req, res, next) {
+    if (req.method === "OPTIONS") return next();
+    const now = Date.now(), day = etDay(), addr = clientAddress(req);
+
+    if (opts.globalDailyMax) {
+      if (globalDay !== day) { globalDay = day; globalCount = 0; }
+      if (globalCount >= opts.globalDailyMax) {
+        console.log("[rate-limit] " + name + " GLOBAL daily cap " + opts.globalDailyMax + " reached");
+        return res.status(429).json({ success: false, error:
+          "Scanning is paused for the rest of today while we deal with unusual traffic. Typed search still works." });
+      }
+    }
+
+    let v = hits.get(addr);
+    if (!v) { v = { win: [], day: day, dayCount: 0 }; hits.set(addr, v); }
+    if (v.day !== day) { v.day = day; v.dayCount = 0; }
+    while (v.win.length && v.win[0] <= now - opts.windowMs) v.win.shift();
+
+    if (v.win.length >= opts.windowMax) {
+      const waitMin = Math.max(1, Math.ceil((v.win[0] + opts.windowMs - now) / 60000));
+      console.log("[rate-limit] " + name + " burst limit for " + addr);
+      res.set("Retry-After", String(waitMin * 60));
+      return res.status(429).json({ success: false, error:
+        "That's a lot of " + opts.noun + " in a short time. Try again in about " + waitMin +
+        " minute" + (waitMin === 1 ? "" : "s") + "." });
+    }
+    if (v.dayCount >= opts.dailyMax) {
+      console.log("[rate-limit] " + name + " daily limit for " + addr);
+      return res.status(429).json({ success: false, error:
+        "Daily limit reached for " + opts.noun + " from this connection. It resets at midnight Eastern." });
+    }
+
+    v.win.push(now);
+    v.dayCount++;
+    if (opts.globalDailyMax) globalCount++;
+    next();
+  };
+}
+const envNum = (k, d) => { const n = Number(process.env[k]); return Number.isFinite(n) && n > 0 ? n : d; };
+
+const visionLimiter = makeLimiter("vision", {
+  noun: "scans",
+  windowMs: 10 * 60 * 1000,
+  windowMax:      envNum("LIMIT_SCAN_PER_10MIN", 60),
+  dailyMax:       envNum("LIMIT_SCAN_PER_DAY", 400),
+  globalDailyMax: envNum("LIMIT_SCAN_GLOBAL_PER_DAY", 4000)   // ~ $80 of vision
+});
+const lookupLimiter = makeLimiter("lookup", {
+  noun: "price lookups",
+  windowMs: 10 * 60 * 1000,
+  windowMax: envNum("LIMIT_LOOKUP_PER_10MIN", 300),
+  dailyMax:  envNum("LIMIT_LOOKUP_PER_DAY", 3000)
+});
+app.use(["/api/scan-card", "/api/grade-estimate"], visionLimiter);
+app.use(["/api/card-market", "/api/card-price", "/api/sold-comps", "/api/buymax"], lookupLimiter);
 
 const upload = multer({
   storage: multer.memoryStorage(),
