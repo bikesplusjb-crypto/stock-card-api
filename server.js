@@ -508,12 +508,13 @@ function makeLimiter(name, opts) {
 }
 const envNum = (k, d) => { const n = Number(process.env[k]); return Number.isFinite(n) && n > 0 ? n : d; };
 
+/* The site-wide daily vision ceiling now lives in visionGate below, so
+   it covers shop scans and ordinary scans alike. */
 const visionLimiter = makeLimiter("vision", {
   noun: "scans",
   windowMs: 10 * 60 * 1000,
   windowMax:      envNum("LIMIT_SCAN_PER_10MIN", 60),
-  dailyMax:       envNum("LIMIT_SCAN_PER_DAY", 400),
-  globalDailyMax: envNum("LIMIT_SCAN_GLOBAL_PER_DAY", 4000)   // ~ $80 of vision
+  dailyMax:       envNum("LIMIT_SCAN_PER_DAY", 400)
 });
 const lookupLimiter = makeLimiter("lookup", {
   noun: "price lookups",
@@ -521,8 +522,306 @@ const lookupLimiter = makeLimiter("lookup", {
   windowMax: envNum("LIMIT_LOOKUP_PER_10MIN", 300),
   dailyMax:  envNum("LIMIT_LOOKUP_PER_DAY", 3000)
 });
-app.use(["/api/scan-card", "/api/grade-estimate"], visionLimiter);
-app.use(["/api/card-market", "/api/card-price", "/api/sold-comps", "/api/buymax"], lookupLimiter);
+/* ── SHOP LIMITS ─────────────────────────────────────────────────────
+
+   A counter tablet or a Business Multi-Scan session can legitimately
+   send more scans in ten minutes than any one collector ever would, and
+   the per-connection limits above would stop a busy Saturday at the
+   register. So a request that proves it comes from shop staff is metered
+   against the SHOP instead of the connection:
+
+     proof   Authorization: Bearer <the staff member's Supabase session>
+             x-cg-shop: <shop id>
+             The token is verified with Supabase and the user must be on
+             that shop's staff. Both answers are cached ten minutes.
+     burst   per shop, default 200 scans / 10 min
+     month   per shop, default 1,500 photo scans (~$30 of AI at 2c),
+             resetting on the 1st, Eastern time
+
+   Limits live in shop_limits, which the shop cannot edit (RLS on, no
+   policies) -- deliberately not columns on shops, because the owner can
+   update any column of their own shop row. Usage is counted in
+   shop_usage. Anything that fails the proof -- no header, expired token,
+   not staff -- falls back to the ordinary per-connection limits, so a
+   broken token never blocks a scan outright; it just gets collector
+   limits. The site-wide daily ceiling applies to everyone. Typed lookups
+   by shops are counted but never capped monthly: they cost records from
+   the daily allowance, not money. */
+const SHOP_SCAN_MONTHLY_CAP   = envNum("SHOP_SCAN_MONTHLY_CAP", 1500);
+const SHOP_SCAN_PER_10MIN     = envNum("SHOP_SCAN_PER_10MIN", 200);
+const SHOP_LOOKUP_PER_10MIN   = envNum("SHOP_LOOKUP_PER_10MIN", 600);
+const VISION_GLOBAL_PER_DAY   = envNum("LIMIT_SCAN_GLOBAL_PER_DAY", 4000);   // ~ $80 of vision
+
+const shopTokenCache  = new Map();   // token -> { uid, exp }
+const shopStaffCache  = new Map();   // uid|shop -> { ok, exp }
+const shopLimitCache  = new Map();   // shop -> { cap, per10, exp }
+const shopUsageCache  = new Map();   // shop|period|kind -> count
+const shopBurst       = new Map();   // shop|kind -> [timestamps]
+setInterval(function () {
+  const now = Date.now();
+  [shopTokenCache, shopStaffCache, shopLimitCache].forEach(m => m.forEach((v, k) => { if (v.exp < now) m.delete(k); }));
+  shopBurst.forEach((v, k) => { if (!v.length || v[v.length - 1] < now - 600000) shopBurst.delete(k); });
+}, 30 * 60 * 1000).unref();
+
+function etPeriod() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" }).slice(0, 7);
+}
+
+async function shopFromRequest(req) {
+  try {
+    const shopId = String(req.headers["x-cg-shop"] || "").trim();
+    const auth   = String(req.headers.authorization || "");
+    if (!supabaseAdmin || !/^[0-9a-f-]{36}$/i.test(shopId) || !/^Bearer\s+\S+/.test(auth)) return null;
+    const token = auth.replace(/^Bearer\s+/, "").trim();
+    const now = Date.now();
+
+    let t = shopTokenCache.get(token);
+    if (!t || t.exp < now) {
+      const { data, error } = await supabaseAdmin.auth.getUser(token);
+      t = (error || !data || !data.user) ? { uid: null, exp: now + 60000 }
+                                         : { uid: data.user.id, exp: now + 10 * 60000 };
+      shopTokenCache.set(token, t);
+    }
+    if (!t.uid) return null;
+
+    const sk = t.uid + "|" + shopId;
+    let st = shopStaffCache.get(sk);
+    if (!st || st.exp < now) {
+      const { data } = await supabaseAdmin.from("shop_staff").select("shop_id")
+        .eq("user_id", t.uid).eq("shop_id", shopId).maybeSingle();
+      st = { ok: !!data, exp: now + 10 * 60000 };
+      shopStaffCache.set(sk, st);
+    }
+    if (!st.ok) return null;
+
+    let lim = shopLimitCache.get(shopId);
+    if (!lim || lim.exp < now) {
+      const { data } = await supabaseAdmin.from("shop_limits")
+        .select("scan_monthly_cap,scan_per_10min").eq("shop_id", shopId).maybeSingle();
+      lim = { cap:   data ? Number(data.scan_monthly_cap) : SHOP_SCAN_MONTHLY_CAP,
+              per10: data ? Number(data.scan_per_10min)   : SHOP_SCAN_PER_10MIN,
+              exp: now + 10 * 60000 };
+      shopLimitCache.set(shopId, lim);
+    }
+    return { id: shopId, uid: t.uid, cap: lim.cap, per10: lim.per10 };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function shopUsage(shopId, period, kind) {
+  const key = shopId + "|" + period + "|" + kind;
+  if (shopUsageCache.has(key)) return shopUsageCache.get(key);
+  let n = 0;
+  try {
+    const { data } = await supabaseAdmin.from("shop_usage").select("scans,lookups")
+      .eq("shop_id", shopId).eq("period", period).maybeSingle();
+    n = data ? Number(kind === "scan" ? data.scans : data.lookups) || 0 : 0;
+  } catch (e) { /* unknown -> treat as 0, the tick below corrects it */ }
+  shopUsageCache.set(key, n);
+  return n;
+}
+
+function shopTick(shopId, period, kind) {
+  const key = shopId + "|" + period + "|" + kind;
+  shopUsageCache.set(key, (shopUsageCache.get(key) || 0) + 1);
+  supabaseAdmin.rpc("cg_shop_tick", { p_shop: shopId, p_period: period, p_kind: kind })
+    .then(({ data, error }) => {
+      if (error) console.log("[shop-limit] usage tick failed: " + error.message);
+      else if (Number(data) > 0) shopUsageCache.set(key, Number(data));
+    })
+    .catch(() => {});
+}
+
+function shopBurstOk(shopId, kind, max) {
+  const key = shopId + "|" + kind, now = Date.now();
+  let w = shopBurst.get(key);
+  if (!w) { w = []; shopBurst.set(key, w); }
+  while (w.length && w[0] <= now - 10 * 60 * 1000) w.shift();
+  if (w.length >= max) return Math.max(1, Math.ceil((w[0] + 10 * 60 * 1000 - now) / 60000));
+  w.push(now);
+  return 0;
+}
+
+/* ── FREE-ACCOUNT DAILY LIMIT ────────────────────────────────────────
+
+   Scanning stays free with an account, but not unlimited: 25 photo scans
+   and 50 typed searches a day on the scanner. The point is less the AI
+   bill (on 30 days of data only 7 of 403 scanning days reached 25) than
+   the moment itself -- somebody scanning eighty cards in a morning is a
+   shop or a dealer, and the message at the limit tells them Business
+   exists.
+
+   Counted per ACCOUNT, server-side, across devices, from the session the
+   scanner sends. Pro gets a far higher ceiling. Only the scanner page
+   sends the session, so the binder's spreadsheet import, Show Log,
+   Pre-Grade and Profit Tracker are untouched and keep the ordinary
+   per-connection limits.
+
+   Signed-out requests keep the loose per-connection limits: at a card
+   show a whole hall shares one address, and a tight limit there would
+   stop the floor at once. Resets at midnight Eastern. */
+const FREE_SCANS_PER_DAY   = envNum("FREE_SCANS_PER_DAY", 25);
+const FREE_LOOKUPS_PER_DAY = envNum("FREE_LOOKUPS_PER_DAY", 50);
+const PRO_SCANS_PER_DAY    = envNum("PRO_SCANS_PER_DAY", 300);
+const PRO_LOOKUPS_PER_DAY  = envNum("PRO_LOOKUPS_PER_DAY", 1000);
+const userProCache   = new Map();   // uid -> { pro, exp }
+const userUsageCache = new Map();   // uid|day|kind -> count
+setInterval(function () {
+  const now = Date.now(), today = etDay();
+  userProCache.forEach((v, k) => { if (v.exp < now) userProCache.delete(k); });
+  userUsageCache.forEach((v, k) => { if (k.split("|")[1] !== today) userUsageCache.delete(k); });
+}, 30 * 60 * 1000).unref();
+
+/* Any valid session (no shop header). Returns { uid, pro } or null. */
+async function userFromRequest(req) {
+  try {
+    const auth = String(req.headers.authorization || "");
+    if (!supabaseAdmin || !/^Bearer\s+\S+/.test(auth)) return null;
+    const token = auth.replace(/^Bearer\s+/, "").trim();
+    const now = Date.now();
+    let t = shopTokenCache.get(token);
+    if (!t || t.exp < now || t.email === undefined) {
+      const { data, error } = await supabaseAdmin.auth.getUser(token);
+      t = (error || !data || !data.user)
+        ? { uid: null, email: null, exp: now + 60000 }
+        : { uid: data.user.id, email: String(data.user.email || "").toLowerCase(), exp: now + 10 * 60000 };
+      shopTokenCache.set(token, t);
+    }
+    if (!t.uid) return null;
+    let p = userProCache.get(t.uid);
+    if (!p || p.exp < now) {
+      let pro = false;
+      if (t.email) {
+        const { data } = await supabaseAdmin.from("pro_users").select("active,expires_at")
+          .ilike("email", t.email).eq("active", true).limit(1);
+        const row = Array.isArray(data) ? data[0] : null;
+        pro = !!row && (!row.expires_at || new Date(row.expires_at) >= new Date(etDay()));
+      }
+      p = { pro: pro, exp: now + 10 * 60000 };
+      userProCache.set(t.uid, p);
+    }
+    return { uid: t.uid, pro: p.pro };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function userUsage(uid, day, kind) {
+  const key = uid + "|" + day + "|" + kind;
+  if (userUsageCache.has(key)) return userUsageCache.get(key);
+  let n = 0;
+  try {
+    const { data } = await supabaseAdmin.from("user_daily_usage").select("scans,lookups")
+      .eq("user_id", uid).eq("day", day).maybeSingle();
+    n = data ? Number(kind === "scan" ? data.scans : data.lookups) || 0 : 0;
+  } catch (e) {}
+  userUsageCache.set(key, n);
+  return n;
+}
+function userTick(uid, day, kind) {
+  const key = uid + "|" + day + "|" + kind;
+  userUsageCache.set(key, (userUsageCache.get(key) || 0) + 1);
+  supabaseAdmin.rpc("cg_user_tick", { p_user: uid, p_day: day, p_kind: kind })
+    .then(({ data, error }) => {
+      if (error) console.log("[user-limit] usage tick failed: " + error.message);
+      else if (Number(data) > 0) userUsageCache.set(key, Number(data));
+    })
+    .catch(() => {});
+}
+
+/* Returns true if the request was handled (limited or allowed-and-passed).
+   Returns false when there is no signed-in user, so the caller falls
+   back to the per-connection limiter. */
+async function userDailyGate(req, res, next, kind, onPass) {
+  const user = await userFromRequest(req);
+  if (!user) return false;
+  const day = etDay();
+  const cap = kind === "scan"
+    ? (user.pro ? PRO_SCANS_PER_DAY : FREE_SCANS_PER_DAY)
+    : (user.pro ? PRO_LOOKUPS_PER_DAY : FREE_LOOKUPS_PER_DAY);
+  const used = await userUsage(user.uid, day, kind);
+  if (used >= cap) {
+    console.log("[user-limit] " + (user.pro ? "pro" : "free") + " daily " + kind + " cap " + cap + " for " + user.uid);
+    const what = kind === "scan" ? "cards" : "typed searches";
+    const msg = user.pro
+      ? "You've reached today's limit of " + cap + " " + what + ". It resets at midnight Eastern."
+      : (kind === "scan"
+          ? "You've scanned " + cap + " cards today. Free scanning resets at midnight Eastern, and typed search still works. " +
+            "Scanning like a shop? CardGauge Business is free during beta."
+          : "You've done " + cap + " typed searches today. They reset at midnight Eastern.");
+    res.status(429).json({ success: false, error: msg,
+      limitReached: (user.pro ? "pro_daily_" : "free_daily_") + kind, limit: cap,
+      businessUrl: "https://app.cardgauge.com/business.html" });
+    return true;
+  }
+  req.cgUser = user;
+  userTick(user.uid, day, kind);
+  if (onPass) onPass();
+  next();
+  return true;
+}
+
+let visionGlobalDay = "", visionGlobalCount = 0;
+function visionGlobalFull() {
+  const day = etDay();
+  if (visionGlobalDay !== day) { visionGlobalDay = day; visionGlobalCount = 0; }
+  return visionGlobalCount >= VISION_GLOBAL_PER_DAY;
+}
+
+async function visionGate(req, res, next) {
+  if (req.method === "OPTIONS") return next();
+  if (visionGlobalFull()) {
+    console.log("[rate-limit] vision GLOBAL daily cap " + VISION_GLOBAL_PER_DAY + " reached");
+    return res.status(429).json({ success: false, error:
+      "Scanning is paused for the rest of today while we deal with unusual traffic. Typed search still works." });
+  }
+  const shop = await shopFromRequest(req);
+  if (!shop) {
+    if (await userDailyGate(req, res, next, "scan", function () { visionGlobalCount++; })) return;
+    return visionLimiter(req, res, function () { visionGlobalCount++; next(); });
+  }
+  const period = etPeriod();
+  const used = await shopUsage(shop.id, period, "scan");
+  if (used >= shop.cap) {
+    console.log("[shop-limit] monthly cap " + shop.cap + " reached for shop " + shop.id);
+    return res.status(429).json({ success: false, error:
+      "Your shop has used all " + shop.cap.toLocaleString() + " photo scans for this month. " +
+      "Typed search still works, and scans reset on the 1st. Contact CardGauge if you need more." });
+  }
+  const wait = shopBurstOk(shop.id, "scan", shop.per10);
+  if (wait) {
+    console.log("[shop-limit] burst limit for shop " + shop.id);
+    res.set("Retry-After", String(wait * 60));
+    return res.status(429).json({ success: false, error:
+      "Your shop is scanning very fast. Try again in about " + wait + " minute" + (wait === 1 ? "" : "s") + "." });
+  }
+  req.cgShop = shop;
+  shopTick(shop.id, period, "scan");
+  visionGlobalCount++;
+  next();
+}
+
+async function lookupGate(req, res, next) {
+  if (req.method === "OPTIONS") return next();
+  const shop = await shopFromRequest(req);
+  if (!shop) {
+    if (await userDailyGate(req, res, next, "lookup")) return;
+    return lookupLimiter(req, res, next);
+  }
+  const wait = shopBurstOk(shop.id, "lookup", SHOP_LOOKUP_PER_10MIN);
+  if (wait) {
+    res.set("Retry-After", String(wait * 60));
+    return res.status(429).json({ success: false, error:
+      "Your shop is looking up prices very fast. Try again in about " + wait + " minute" + (wait === 1 ? "" : "s") + "." });
+  }
+  req.cgShop = shop;
+  shopTick(shop.id, etPeriod(), "lookup");
+  next();
+}
+
+app.use(["/api/scan-card", "/api/grade-estimate"], visionGate);
+app.use(["/api/card-market", "/api/card-price", "/api/sold-comps", "/api/buymax"], lookupGate);
 
 const upload = multer({
   storage: multer.memoryStorage(),
