@@ -1320,6 +1320,8 @@ __def('core/engine', function (module, exports, require) {
         // Explicitly separate. V0.1 has no sold data unless CardGauge supplies it.
         sold_market_value: soldAvailable ? round2(intel.sold.median) : null,
         sold_comp_count: soldAvailable ? intel.sold.count : null,
+        sold_low: soldAvailable && intel.sold.low != null ? round2(intel.sold.low) : null,
+        sold_high: soldAvailable && intel.sold.high != null ? round2(intel.sold.high) : null,
         sold_source: soldAvailable ? intel.sold.source : null,
       },
 
