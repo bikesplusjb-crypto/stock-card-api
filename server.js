@@ -3775,7 +3775,36 @@ async function broadenTypedLookup(clean, market, sold, compact) {
     };
     if (!ai.player && !ai.set) return null;
 
-    const tiers = buildQueryTiers(ai) || [];
+    /* A PARALLEL SOMEBODY TYPED IS NOT A COLOUR GUESS.
+
+       16 Sept: "2018 Topps Chrome sepia shohei Ohtani" found nothing
+       usable, so this ladder broadened -- and its first tier was already
+       "2018 Topps Chrome shohei Ohtani". buildQueryTiers only keeps a
+       parallel it can trust, and trust means printed evidence, which a
+       typed query never carried. So the word the person typed was the
+       first thing dropped, and the base Chrome rookie's $320 went up as
+       the headline for a Sepia -- while the What-should-I-pay panel on
+       the same result, reading the same pool, said it could not price
+       the card. Two answers to one question.
+
+       Typed is as good as printed: the person is telling us which card.
+       And the same rule the nightly refresh now follows: a parallel never
+       broadens to a tier without it, a numbered card never to one
+       without its print run. Base cards broaden as before. If nothing
+       matches, the answer is no price -- not a different card's price. */
+    if (ai.parallel) { ai.parallelEvidence = "printed"; ai.parallelCertain = true; }
+    /* Same for an auto or patch someone typed: without the word, an auto
+       /25 broadens to every /25 of that player, signed or not. */
+    if (/\b(auto|autograph|signed)\b/i.test(clean)) ai.isAutograph = true;
+    if (/\b(patch|relic|jersey)\b/i.test(clean))     ai.isPatch = true;
+    const sm = /pok[eé]mon/i.test(clean) ? null
+             : clean.match(/(?:^|[\s(])(?:0*(\d{1,4}))?\s*\/\s*(\d{1,4})(?!\d)/);
+    if (sm && Number(sm[1] || 1) <= Number(sm[2])) ai.serialNumber = (sm[1] || "1") + "/" + sm[2];
+    const keepsIdentity = !!(cleanVal(ai.parallel) && !GENERIC_SET.test(cleanVal(ai.parallel))) ||
+                          !!serialDenominator(ai);
+
+    const tiers = (buildQueryTiers(ai) || []).filter(t =>
+      t && (!keepsIdentity || t.tier === "tight" || t.tier === "serial"));
     const seen  = new Set([clean]);
     let tried   = 0;
 
@@ -8843,6 +8872,97 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
    change the wording -- the promise and the cap have to agree. */
 const REFRESH_MAX_PER_RUN = Number(process.env.REFRESH_MAX_PER_RUN || 200);
 
+/* ── A SAVED NAME IS NOT A SEARCH ────────────────────────────────
+
+   16 Sept, first full run: 156 cards, 56 re-priced, 100 kept yesterday's
+   number. 57 of those 100 came back with ZERO records from eBay. They
+   were searched by their saved names, and saved names are long:
+
+     2025 Panini Revolution Football Travis Hunter Revolution Parallel 214/299 RC
+
+   eBay ANDs every word. Measured 13 Sept: 3-word queries 75% usable,
+   10-word queries 4%. The scan and typed paths already climb a query
+   ladder for exactly this reason; the nightly refresh never did, so the
+   binder promised "re-priced every night" and delivered it to a third
+   of the cards.
+
+   The card's structured fields -- year, brand, set, player, number,
+   parallel, saved alongside the name -- rebuild the query the way the
+   scanner builds it: copy number gone, "/299" kept, junk words dropped.
+
+   ONLY TIERS THAT ARE STILL THIS CARD. A binder price is not a search
+   result the person can eyeball; it is a number they trust silently.
+   So a parallel never falls back to a tier that drops the parallel, and
+   a numbered card never to one that drops its print run (buildQueryTiers
+   already guarantees the second). "tight" and "serial" always qualify;
+   "set-noNum" only for a card with no parallel and no serial, where the
+   card number is the only thing it drops. Nothing broader. A card that
+   still finds nothing keeps its previous price, as before.
+
+   Only runs when the saved name found no usable pool and was not
+   contaminated (contaminated means wrong cards were found, which a
+   narrower query will not fix). At most two extra calls per card and
+   REFRESH_FALLBACK_MAX cards per run, which keeps the whole night well
+   inside the 50,000/day record allowance. */
+const REFRESH_FALLBACK_MAX = Number(process.env.REFRESH_FALLBACK_MAX || 80);
+
+function soldPoolUsable(sold) {
+  return !!(sold && !sold.rateLimited && !sold.soldContaminated && !sold.soldLimited &&
+            Number(sold.soldCount) > 0 && Number(sold.soldMedian) > 0);
+}
+
+async function refreshFallbackSold(item, market) {
+  if (!cleanVal(item.player)) return null;
+  const name   = String(item.card_name || "");
+  /* Print run from the saved name: "214/299" and a bare "/25" both count
+     ("auto /25" has no copy number but is still a /25 card, and dropping
+     it would price every Roman Anthony auto as if it were this one).
+     Not for Pokemon, where "4/102" is a card number, not a print run. */
+  const isPoke = /pok[eé]mon/i.test([item.brand, item.sport, name].join(" "));
+  const sm     = isPoke ? null : name.match(/(?:^|[\s(])(?:0*(\d{1,4}))?\s*\/\s*(\d{1,4})(?!\d)/);
+  const serial = sm ? [sm[0], sm[1] || "1", sm[2]] : [];
+  const ai = {
+    year:       item.year ? String(item.year) : "",
+    brand:      item.brand || "",
+    set:        item.set_name || "",
+    player:     item.player || "",
+    cardNumber: item.card_number || "",
+    parallel:   item.parallel || "",
+    sport:      item.sport || "",
+    /* The person saved this card with this parallel. That is the
+       printed-evidence case, not a colour guess. */
+    parallelEvidence: "printed",
+    parallelCertain:  true,
+    serialNumber: serial[2] && Number(serial[1]) <= Number(serial[2]) ? serial[1] + "/" + serial[2] : "",
+    isAutograph:  /\b(auto|autograph|signed)\b/i.test(name),
+    isPatch:      /\b(patch|relic|jersey)\b/i.test(name)
+  };
+  const hasPar    = !!cleanVal(ai.parallel) && !GENERIC_SET.test(cleanVal(ai.parallel));
+  const hasSerial = !!serialDenominator(ai);
+  const allowed   = { tight: true, serial: true, "set-noNum": !hasPar && !hasSerial };
+
+  const tiers = (buildQueryTiers(ai) || []).filter(t => t && t.query && allowed[t.tier]);
+  const seen  = new Set([normalizeCardQuery(name).toLowerCase()]);
+  let tried = 0;
+  for (const t of tiers) {
+    if (tried >= 2) break;
+    const q = normalizeCardQuery(t.query);
+    if (!q || seen.has(q.toLowerCase())) continue;
+    seen.add(q.toLowerCase());
+    tried++;
+    const alt = await getSoldComps(q, market.avgPrice);
+    if (alt && alt.rateLimited) return alt;
+    if (soldPoolUsable(alt)) {
+      console.log("[refresh-fallback] " + name + " -> " + q + " (" + t.tier + ", " +
+                  alt.soldCount + " sales)");
+      alt.refreshQuery = q;
+      alt.refreshTier  = t.tier;
+      return alt;
+    }
+  }
+  return null;
+}
+
 /* ET calendar day of the last refresh that got past its fetch and
    finished. Read by the 6:00 catch-up cron. */
 let lastRefreshCompletedDay = null;
@@ -8882,7 +9002,7 @@ async function refreshWatchlistPrices() {
     for (let attempt = 1; attempt <= FETCH_WAITS_MS.length + 1; attempt++) {
       const r = await supabaseAdmin
         .from("watchlist_items")
-        .select("id, card_name, last_checked_at")
+        .select("id, card_name, last_checked_at, year, brand, set_name, player, card_number, parallel, sport")
         .order("last_checked_at", { ascending: true, nullsFirst: true })
         .limit(REFRESH_MAX_PER_RUN);
       items = r.data;
@@ -8913,6 +9033,7 @@ async function refreshWatchlistPrices() {
     /* Counted separately so the log distinguishes "no sold data" from
        "the write failed" -- they need different responses. */
     let skipped = 0;
+    let fallbackTried = 0, fallbackPriced = 0;
     /* Daily-price rows actually written. updated counts current_price
        changes, which is not the same thing -- a card can reprice with
        no usable range and write no history row. */
@@ -8950,7 +9071,23 @@ async function refreshWatchlistPrices() {
            A stale number is honest about being old; an asking price
            wearing a sold label is not. */
         const market = await getEbayCardMarket(item.card_name);
-        const sold   = await getSoldComps(item.card_name, market.avgPrice);
+        let sold     = await getSoldComps(item.card_name, market.avgPrice);
+
+        /* See refreshFallbackSold: rebuild the search from the saved
+           fields when the saved name found nothing usable. */
+        if (sold && !sold.rateLimited && !sold.soldContaminated && !soldPoolUsable(sold) ||
+            !sold) {
+          if (fallbackTried < REFRESH_FALLBACK_MAX) {
+            fallbackTried++;
+            const fb = await refreshFallbackSold(item, market);
+            if (fb && fb.rateLimited) {
+              sold = fb;
+            } else if (fb) {
+              sold = fb;
+              fallbackPriced++;
+            }
+          }
+        }
 
         /* Allowance exhausted. Stop the run rather than grinding
            through the remaining cards collecting 429s -- they will be
@@ -9201,6 +9338,7 @@ async function refreshWatchlistPrices() {
       " skipped=" + skipped + " (kept previous price)" +
       " failed=" + failed +
       " history_rows=" + written +
+      " fallback=" + fallbackPriced + "/" + fallbackTried +
       (budgetStopped ? " STOPPED-ON-BUDGET" : "") +
       " elapsed=" + elapsed + "s"
     );
