@@ -5116,14 +5116,23 @@ async function fetchDollarBinCategory(category) {
       .filter(item => isLikelyCardListing(item.title))
       .filter(item => !dbIsGraded(item.title))
       .filter(item => item.image && item.image.imageUrl)
-      .map(item => ({
-        title:    item.title || "",
-        price:    safeNumber(item.price && item.price.value, 0),
-        image:    item.image.imageUrl,
-        url:      addAffiliateToUrl(item.itemWebUrl || ""),
-        category: category.tag,
-        emoji:    category.emoji
-      }))
+      .map(item => {
+        /* Shipping, when eBay gives it. A "$0.99" card with $4.50 postage
+           is a $5.49 card; the Dollar Bin page shows the two together
+           instead of letting the sticker do the talking. null = eBay did
+           not say (calculated shipping), and the page says so. */
+        const so = Array.isArray(item.shippingOptions) ? item.shippingOptions[0] : null;
+        const shipRaw = so && so.shippingCost ? Number(so.shippingCost.value) : null;
+        return {
+          title:    item.title || "",
+          price:    safeNumber(item.price && item.price.value, 0),
+          shipping: Number.isFinite(shipRaw) ? shipRaw : null,
+          image:    item.image.imageUrl,
+          url:      addAffiliateToUrl(item.itemWebUrl || ""),
+          category: category.tag,
+          emoji:    category.emoji
+        };
+      })
       .filter(item => item.price > 0 && item.price <= 5);
   } catch (error) {
     console.log(`Dollar bin fetch error for ${category.tag}:`, error.message);
