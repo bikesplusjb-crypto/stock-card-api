@@ -830,13 +830,19 @@ const upload = multer({
 
 // ── eBay Partner Network (EPN) Affiliate Config ────────────────
 const EPN_CAMPAIGN_ID = "5339149252";
+/* EPN Custom ID on every link the API builds. The scanner and binder pages
+   replace it at the moment of the tap with page.link.where (see the tagger
+   at the bottom of scanner.html); any page without that tagger -- Show Log,
+   Portfolio, Profit Tracker, a link copied out of a result -- reports as
+   "api" in EPN instead of blank, so no earning is unattributed. */
+const EPN_DEFAULT_CUSTOMID = "api";
 const EBAY_FETCH_LIMIT = 100;   // was 25 — too small to filter parallels out of
 
 function ebayUrl(query, sold) {
   const base = "https://www.ebay.com/sch/i.html";
   const q = encodeURIComponent(normalizeCardQuery(query));
   const soldParams = sold ? "&LH_Sold=1&LH_Complete=1" : "";
-  return `${base}?_nkw=${q}${soldParams}&mkcid=1&mkrid=711-53200-19255-0&siteid=0&campid=${EPN_CAMPAIGN_ID}&toolid=10001&mkevt=1`;
+  return `${base}?_nkw=${q}${soldParams}&mkcid=1&mkrid=711-53200-19255-0&siteid=0&campid=${EPN_CAMPAIGN_ID}&toolid=10001&mkevt=1&customid=${EPN_DEFAULT_CUSTOMID}`;
 }
 
 function addAffiliateToUrl(url) {
@@ -849,10 +855,11 @@ function addAffiliateToUrl(url) {
     u.searchParams.set("campid", EPN_CAMPAIGN_ID);
     u.searchParams.set("toolid", "10001");
     u.searchParams.set("mkevt",  "1");
+    if (!u.searchParams.get("customid")) u.searchParams.set("customid", EPN_DEFAULT_CUSTOMID);
     return u.toString();
   } catch (e) {
     const sep = url.includes("?") ? "&" : "?";
-    return `${url}${sep}mkcid=1&mkrid=711-53200-19255-0&siteid=0&campid=${EPN_CAMPAIGN_ID}&toolid=10001&mkevt=1`;
+    return `${url}${sep}mkcid=1&mkrid=711-53200-19255-0&siteid=0&campid=${EPN_CAMPAIGN_ID}&toolid=10001&mkevt=1&customid=${EPN_DEFAULT_CUSTOMID}`;
   }
 }
 
