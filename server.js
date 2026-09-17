@@ -5867,6 +5867,11 @@ app.post(
         ai.year = String(catalogYearFix.to);
       }
 
+      /* After the year is settled, so the set is looked up for the right
+         year. Only when the model returned no set at all. */
+      const catalogSetFix = await catalogSetFill(ai);
+      if (catalogSetFix) ai.set = catalogSetFix.set;
+
       const cleanCardName = buildDisplayName(ai);
 
       /* NO NAME, NO BRAND, NO SET: THERE IS NO CARD TO PRICE.
@@ -6341,6 +6346,7 @@ app.post(
         read:      modelRead,
         corrections: {
           catalog_year:     catalogYearFix ? { from: catalogYearFix.from, to: catalogYearFix.to } : null,
+          catalog_set:      catalogSetFix ? catalogSetFix.product : null,
           parallel_cleared: parallelClearedFrom || null,
           listing_year:     yearCorrection && yearCorrection.adopted ? yearCorrection : null,
           year_guess:       yearGuess || null,
@@ -6507,6 +6513,7 @@ app.post(
            misread looks like from the outside. */
         verified:          verification,
         catalogYearFix:    catalogYearFix,
+        catalogSetFix:     catalogSetFix ? { set: catalogSetFix.set, product: catalogSetFix.product } : null,
         summary:           ai.summary    || "AI scan complete. Verify exact version, condition, and comps.",
         avgSoldPrice:      market.avgPrice,
         avgPrice:          market.avgPrice,
@@ -8748,6 +8755,82 @@ function sameCardNumber(a, b) {
    Anything short of that returns null and the scan stands as read. A
    missing row proves nothing -- checklists are incomplete -- so an
    absent card never triggers a change. */
+/* ── A CARD NUMBER BUT NO SET: ASK THE CATALOG WHICH SET IT IS ─────────
+
+   17 Sept: the same 2024 Bowman Pete Crow-Armstrong #85, scanned twice a
+   minute apart. The first read set "Bowman". The second read "Topps" from
+   the copyright line on the back, no set, and priced "2024 Topps Pete
+   Crow-Armstrong #85" -- a different card's sales (19 of them, against
+   65 for the right one). Both happened to sell for $2. On a rookie where
+   the flagship and the Bowman card sell for different money, that is a
+   wrong price with a confident face.
+
+   When the model returns a year, a player and a card number but no set,
+   the catalog is asked for that player's cards with that number in that
+   year. Exactly one product -> that is the set, filled in before pricing.
+   More than one (a player can be #85 in two products the same year) or
+   none -> nothing is guessed; the scan prices as it would have.
+
+   Parallels and inserts are counted by their PARENT product, so a gold
+   parallel of the same card doesn't make the answer look ambiguous.
+
+   Costs catalog records only on scans that are missing a set (the catalog
+   pool is separate from sales: 500 records a day on Builder), capped at
+   20 records a lookup, cached for a week, and given 4 seconds -- past
+   that the scan simply goes ahead without it. */
+const setFillCache = new Map();   // key -> { set, product, options, until }
+function setFillKey(ai) {
+  return [cleanVal(ai.year), cleanVal(ai.player).toLowerCase(), String(cleanVal(ai.cardNumber)).replace(/^[#\s]*0*/, "").toLowerCase()].join("|");
+}
+async function catalogSetFill(ai) {
+  try {
+    if (!ai || cleanVal(ai.set)) return null;
+    const year = parseInt(ai.year, 10);
+    const player = cleanVal(ai.player);
+    const number = String(cleanVal(ai.cardNumber)).replace(/^[#\s]*0*/, "");
+    if (!(year > 1900 && year < 2100) || !player || player.length < 4 || !number) return null;
+
+    const key = setFillKey(ai);
+    const hit = setFillCache.get(key);
+    if (hit && hit.until > Date.now()) return hit.set ? hit : null;
+
+    const lookup = catalogFetch("/?" + new URLSearchParams({
+      q: player, year: String(year), card_number: number, limit: "20"
+    }).toString());
+    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("set-fill timeout")), 4000));
+    const res = await Promise.race([lookup, timeout]);
+    const cards = Array.isArray(res && res.body && res.body.data) ? res.body.data : [];
+
+    const lastName = player.toLowerCase().split(/\s+/).filter(Boolean).pop().replace(/[^a-z]/g, "");
+    const products = new Map();
+    cards.forEach(c => {
+      const subject = String(c.subject || "").toLowerCase();
+      const num = String(c.card_number || "").replace(/^[#\s]*0*/, "").toLowerCase();
+      if (!lastName || subject.replace(/[^a-z ]/g, "").indexOf(lastName) === -1) return;
+      if (num !== number.toLowerCase()) return;
+      const product = String(c.parent_set_name || c.set_name || "").trim();
+      if (!product || product.indexOf(String(year)) !== 0) return;
+      products.set(product.toLowerCase(), product);
+    });
+
+    const list = Array.from(products.values());
+    let out = { set: null, product: null, options: list, until: Date.now() + 7 * 24 * 3600 * 1000 };
+    if (list.length === 1) {
+      const product = list[0];
+      const setName = product.replace(new RegExp("^" + year + "\\s+"), "").trim();
+      if (setName) out = Object.assign(out, { set: setName, product: product });
+    }
+    setFillCache.set(key, out);
+    if (setFillCache.size > 2000) setFillCache.delete(setFillCache.keys().next().value);
+    console.log("[set-fill] " + key + " -> " + (out.set ? "\"" + out.product + "\"" :
+                (list.length ? "ambiguous: " + list.join(" | ") : "no catalog match")));
+    return out.set ? out : null;
+  } catch (e) {
+    console.log("[set-fill] skipped: " + e.message);
+    return null;
+  }
+}
+
 async function catalogYearCheck(ai) {
   try {
     if (!supabaseAdmin) return null;
