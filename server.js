@@ -6491,6 +6491,60 @@ app.post(
             break;
           }
         }
+
+        /* ── THE SAME LAST RESORT THE TYPED PATH GOT (19 Sept) ────────
+
+           Every query above that dropped the print run was skipped, for
+           the right reason: a /75 priced off base comps is the $2 bug.
+           But the result for a numbered card is then no price at all,
+           and that is its own wrong answer -- confirmed on a real scan
+           minutes ago, a Nico Hoerner Blue /50 that came back with
+           nothing.
+
+           So the numbered-family query runs here too: same card, same
+           parallel, print run dropped. What comes back is deliberately
+           NOT adopted as a price. It is a range across every numbered
+           version, labelled as such, because those sales genuinely
+           describe several different cards and their median describes
+           none of them.
+
+           The $2 bug was adopting a base median as the answer. This
+           adopts nothing -- it reports a span and says what it spans. */
+        if (!sold || !Number(sold.soldCount)) {
+          const denomWanted = serialDenominator(ai);
+          if (denomWanted) {
+            const famQ = (buildQueryTiers(ai) || [])
+              .filter(t => t && t.mixedSerials)
+              .map(t => t.query)[0];
+            if (famQ && !already.has(famQ)) {
+              already.add(famQ);
+              const fam = await getSoldComps(famQ, market.avgPrice);
+              const lo = fam && fam.soldRaw ? Number(fam.soldRaw.low)  : 0;
+              const hi = fam && fam.soldRaw ? Number(fam.soldRaw.high) : 0;
+              if (fam && !fam.soldLimited && Number(fam.soldRaw && fam.soldRaw.count) >= 3
+                  && lo > 0 && hi > 0) {
+                fam.mixedSerials     = true;
+                fam.serialRangeLow   = Math.round(lo * 100) / 100;
+                fam.serialRangeHigh  = Math.round(hi * 100) / 100;
+                fam.broadenedFrom    = searchQuery;
+                fam.broadenedTo      = famQ;
+                fam.broadenedTier    = "numbered-family";
+                fam.broadenedNote =
+                  "No completed sales matched this exact print run. Across ALL numbered " +
+                  "versions of this card, recent sales run $" + fam.serialRangeLow +
+                  " to $" + fam.serialRangeHigh + " \u2014 lower print runs sit at the top of " +
+                  "that range. Not a price for your copy: a range for the family it belongs to.";
+                sold      = fam;
+                soldQuery = famQ;
+                soldBroadened = { from: searchQuery, to: famQ, tier: "numbered-family",
+                                  found: fam.soldCount, mixedSerials: true,
+                                  note: fam.broadenedNote };
+                console.log("[broaden] numbered-family " + searchQuery + " -> " + famQ +
+                            " ($" + fam.serialRangeLow + "-$" + fam.serialRangeHigh + ")");
+              }
+            }
+          }
+        }
       }
 
       const verification  = await verifyPromise;
