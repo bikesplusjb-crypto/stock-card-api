@@ -24,6 +24,10 @@ const crypto = require("crypto");
 const app = express();
 
 // ── CORS — allow all origins (fixes Wix iframe fetch) ──────────
+/* One proxy hop: Render's. Anything more and req.ip starts trusting
+   client-supplied hops again. */
+app.set("trust proxy", 1);
+
 app.use(cors({ origin: "*" }));
 
 /* ══════════════════════════════════════════════════════════════
@@ -304,6 +308,8 @@ app.post(
       }
     }
 
+    let entitlementFailed = false;
+
     try {
       if (type === "checkout.session.completed") {
         // Ignore one-off payments — Pro is a subscription.
@@ -325,7 +331,21 @@ app.post(
           }
 
           if (email) {
-            await setProStatus(email, true, "Stripe subscribe via " + via);
+            /* ── A FAILED WRITE MUST FAIL THE WEBHOOK (19 Sept) ──────
+
+               This return value was ignored, and that is the worst bug
+               in this file. setProStatus catches its own Supabase
+               errors and returns false, so a temporary database failure
+               produced: payment taken, Pro never granted, webhook
+               returns 200, event permanently claimed in stripe_events,
+               Stripe never retries. The customer is stuck and nothing
+               anywhere says why.
+
+               Throwing hands the event to the outer catch, which
+               releases the claim -- so Stripe's own retry schedule
+               fixes it, which is exactly what that schedule is for. */
+            const granted = await setProStatus(email, true, "Stripe subscribe via " + via);
+            if (!granted) throw new Error("pro_users write failed for " + email + " (grant)");
             /* The id when we have it, so the click and the payment
                join. When Stripe could not give us one, 'unmatched'
                rather than nothing — a payment that cannot be traced
@@ -365,7 +385,13 @@ app.post(
 
       else if (type === "customer.subscription.deleted") {
         const email = await emailFromCustomer(obj.customer);
-        if (email) await setProStatus(email, false, "Stripe subscription canceled");
+        if (email) {
+          /* A failed REVOKE matters as much as a failed grant: it
+             leaves somebody with Pro they stopped paying for, and the
+             event is marked done so nothing ever corrects it. */
+          const revoked = await setProStatus(email, false, "Stripe subscription canceled");
+          if (!revoked) throw new Error("pro_users write failed for " + email + " (cancel)");
+        }
         else console.log("[stripe] cancel event but no email for customer " + obj.customer);
         /* Counted so that "active Pro" can be derived from events rather
            than inferred from a pro_users row — which checkPro()'s
@@ -379,9 +405,15 @@ app.post(
         if (!email) {
           console.log("[stripe] update event but no email for customer " + obj.customer);
         } else if (status === "active" || status === "trialing") {
-          await setProStatus(email, true, "Stripe subscription " + status);
+          {
+            const ok = await setProStatus(email, true, "Stripe subscription " + status);
+            if (!ok) throw new Error("pro_users write failed for " + email + " (status " + status + ")");
+          }
         } else if (status === "canceled" || status === "unpaid" || status === "incomplete_expired") {
-          await setProStatus(email, false, "Stripe subscription " + status);
+          {
+            const ok = await setProStatus(email, false, "Stripe subscription " + status);
+            if (!ok) throw new Error("pro_users write failed for " + email + " (status " + status + ")");
+          }
         } else {
           // past_due, incomplete, paused — leave access alone, Stripe is retrying.
           console.log("[stripe] subscription " + status + " for " + email + " — access unchanged");
@@ -402,14 +434,35 @@ app.post(
       }
     } catch (e) {
       console.error("[stripe] handler error on " + type + ":", e.message);
-      /* Release the claim, so resending this event from the Stripe
-         dashboard after the bug is fixed actually processes it instead
-         of being skipped as already handled. */
+      /* Release the claim, so a retry -- Stripe's own, or a resend from
+         the dashboard -- actually processes the event instead of being
+         skipped as already handled. */
       if (claimedInDb) releaseStripeEvent(event.id);
       seenStripeEvents.delete(event.id);
+
+      /* ── ASK STRIPE TO COME BACK, BUT ONLY FOR MONEY ─────────────
+
+         Releasing the claim was only half the fix: this still answered
+         200, so Stripe considered the event delivered and never tried
+         again. The release only helped somebody who noticed and resent
+         it by hand, which nobody would.
+
+         A failed entitlement write gets a 500, and Stripe's retry
+         schedule -- hours, then days -- does the rest. Every other
+         handler error still gets a 200, because a bug in analytics or
+         logging is not worth Stripe redelivering the same event for
+         three days while the real work is already done. */
+      if (/pro_users write failed/.test(e.message || "")) {
+        entitlementFailed = true;
+      }
     }
 
-    // Always 200 once the signature checked out, or Stripe retries forever.
+    if (entitlementFailed) {
+      console.error("[stripe] returning 500 so Stripe retries " + type + " " + event.id);
+      return res.status(500).json({ received: false, retry: true, type: type });
+    }
+
+    // 200 once the signature checked out, or Stripe retries forever.
     res.json({ received: true, type: type });
   }
 );
@@ -453,9 +506,22 @@ app.use(express.urlencoded({ extended: true }));
    is an environment variable, so a genuine rush can be let through
    without a deploy. A limited request gets a 429 with success:false and a
    plain sentence, which every page already shows as an error. */
+/* ── WHOSE ADDRESS IS THIS, REALLY (19 Sept) ────────────────────────
+
+   This read the FIRST entry of X-Forwarded-For, which is a header the
+   client writes. Anybody who wanted around the burst limits could send
+   a different value on every request and get a fresh allowance each
+   time -- the limiter counted a number the caller chose.
+
+   Render puts exactly one proxy in front of this service, so with
+   'trust proxy' set to 1 (below), Express computes req.ip as the last
+   hop it did not receive from the client: the real address. That is the
+   one to count.
+
+   The account-based limits are untouched and remain the primary
+   control; this only makes the address-based backstop honest. */
 function clientAddress(req) {
-  const fwd = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
-  return fwd || req.ip || (req.socket && req.socket.remoteAddress) || "unknown";
+  return req.ip || (req.socket && req.socket.remoteAddress) || "unknown";
 }
 function etDay() {
   return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
@@ -515,6 +581,24 @@ const visionLimiter = makeLimiter("vision", {
   windowMs: 10 * 60 * 1000,
   windowMax:      envNum("LIMIT_SCAN_PER_10MIN", 60),
   dailyMax:       envNum("LIMIT_SCAN_PER_DAY", 400)
+});
+/* ── THE ONE OPEN DOOR THAT SENDS EMAIL (19 Sept) ──────────────────
+
+   /api/watch-email deliberately takes an address with no account --
+   that is the point of it, and it stays that way. But it is the only
+   unauthenticated endpoint here that causes mail to be sent to an
+   address the caller chose, which makes it the one worth abusing: a
+   script could sign a stranger up to hundreds of alerts, or bury the
+   sending domain in complaints and take the real alerts down with it.
+
+   Deliberately generous. A person adding alerts while going through a
+   box might add a dozen in ten minutes; nobody legitimately adds forty.
+   Cheap to raise if it ever bites somebody real. */
+const watchLimiter = makeLimiter("watch-email", {
+  noun: "alerts",
+  windowMs: 10 * 60 * 1000,
+  windowMax: envNum("LIMIT_WATCH_PER_10MIN", 12),
+  dailyMax:  envNum("LIMIT_WATCH_PER_DAY", 40)
 });
 const lookupLimiter = makeLimiter("lookup", {
   noun: "price lookups",
@@ -4502,7 +4586,14 @@ async function broadenTypedLookup(clean, market, sold, compact) {
     let tried   = 0;
 
     for (const t of tiers) {
-      if (tried >= 3) break;
+      /* The three-call cap exists so an ordinary lookup cannot quietly
+         turn into a dozen API calls. The numbered-family tier is exempt
+         because it is the LAST one and the only one that can answer at
+         all for a numbered card: capping it off leaves the person with
+         nothing, which is the failure this whole step exists to end.
+         It adds at most one call, and only to lookups that have already
+         found nothing. */
+      if (tried >= 3 && t.tier !== "numbered-family") break;
       const q = t && t.query;
       if (!q || seen.has(q)) continue;
       seen.add(q);
@@ -10827,7 +10918,7 @@ function buildAlertEmailHtml(rows) {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
-app.post("/api/watch-email", async (req, res) => {
+app.post("/api/watch-email", watchLimiter, async (req, res) => {
   try {
     if (!supabaseAdmin) return res.json({ success: false, error: "Not configured" });
 
@@ -10840,6 +10931,26 @@ app.post("/api/watch-email", async (req, res) => {
       return res.json({ success: false, error: "That doesn't look like an email address." });
     }
     if (!card) return res.json({ success: false, error: "No card to watch." });
+
+    /* A CEILING PER ADDRESS, NOT JUST PER CALLER.
+
+       The rate limit above counts the machine making the request. This
+       counts the mailbox on the receiving end, which is the one that
+       gets buried -- and the two are not the same attacker. Somebody
+       spreading requests across addresses still cannot sign one
+       stranger up to five hundred alerts. */
+    try {
+      const { count } = await supabaseAdmin
+        .from("email_watches")
+        .select("id", { count: "exact", head: true })
+        .eq("email", email)
+        .eq("unsubscribed", false);
+      if (Number(count) >= envNum("MAX_WATCHES_PER_EMAIL", 50)) {
+        console.log("[watch-email] per-address cap reached for " + email);
+        return res.json({ success: false, error:
+          "That address already has the maximum number of alerts. Remove one first, or make a free account for unlimited alerts." });
+      }
+    } catch (e) { /* counting must never block a legitimate watch */ }
 
     /* ALREADY HAS AN ACCOUNT? SAY SO RATHER THAN BUILDING A SHADOW ONE.
 
