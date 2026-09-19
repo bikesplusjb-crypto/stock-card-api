@@ -7429,6 +7429,23 @@ app.post(
       try { condition = JSON.parse(req.body.condition || "{}") || {}; } catch (e) { condition = {}; }
       const notes = String(req.body.notes || "").slice(0, 500);
 
+      /* HOW THE PHOTO WAS TAKEN, LOGGED BESIDE WHAT WAS MADE OF IT.
+
+         GradeFrame sends what its detector measured -- whether it found
+         the card at all, sharpness, glare, tilt, which camera, what
+         resolution. It no longer decides whether a capture is allowed,
+         so this is the useful thing it does instead: it says how much
+         the evidence is worth, and the server log lines it up with the
+         range that came out.
+
+         Read-only. Nothing here changes a grade. If it ever does, the
+         detector is back to being in charge of the answer, which is the
+         arrangement that failed. */
+      const captureMode = String(req.body.capture_mode || "upload").slice(0, 30);
+      let captureQuality = null;
+      try { captureQuality = JSON.parse(req.body.capture_quality || "null"); } catch (e) { captureQuality = null; }
+      const cq = (captureQuality && captureQuality.front) || null;
+
       const ai = await gradeWithOpenAI(front, back, condition, notes);
 
       /* ── THE RANGE IS WORKED OUT HERE, NOT GUESSED ─────────────────
@@ -7549,16 +7566,14 @@ app.post(
         ? "A crease is the one thing that makes this decision easy: at a 3 or below, grading almost never pays unless the card is genuinely rare. Check sold comps for graded 3s before you spend anything."
         : "Surface is the factor a photo shows worst. Graders catch fine scratches and print lines under magnification and strong light that a camera will not resolve — the real grade can land below this range for reasons no photo would have revealed.";
 
-      console.log(
-        "[grade] " + (ai.cardName || "unidentified") +
-        " | back=" + (back ? "yes" : "no") +
-        " | range=" + low + "-" + high +
-        " | conf=" + confidence +
-        " | reported=" + (Object.keys(condition).filter(k => condition[k]).length || 0) +
-        " | caps=" + (capsHit.join(",") || "-") +
-        " | limiter=" + limiter + " | photoQ=" + photoQuality + " | spread=" + spread
-      );
+      /* MOVED ABOVE THE LOG LINE (19 Sept).
 
+         The log prints the limiting factor, and this block is what
+         works it out -- but it sat below the log, so every pre-screen
+         threw "Cannot access 'limiter' before initialization" and the
+         page showed "Pre-screen failed on server". A const is not
+         hoisted the way a function is; reading one before its line runs
+         is an error, not undefined, so the whole request died. */
       /* WHAT IS HOLDING THE CARD BACK, in the card's own terms. The old
          response gave a range and four numbers and left the person to
          work out which number mattered. The limiter is the answer to
@@ -7583,6 +7598,25 @@ app.post(
 
       const photoIssues = Array.isArray(ai.photoIssues)
         ? ai.photoIssues.filter(Boolean).map(x => String(x).slice(0,120)).slice(0,4) : [];
+
+      console.log(
+        "[grade] " + (ai.cardName || "unidentified") +
+        " | capture=" + captureMode +
+        (cq ? (" " + (cq.detected ? "detected" : "undetected") +
+               (cq.forced ? " forced" : " locked") +
+               (cq.failed ? " fail:" + cq.failed : "") +
+               " cov" + (cq.cov == null ? "-" : cq.cov) +
+               " shp" + (cq.sharp == null ? "-" : cq.sharp) +
+               " glr" + (cq.glare == null ? "-" : cq.glare) +
+               " res" + (cq.res || "-") +
+               (cq.cam ? " cam:" + String(cq.cam).slice(0, 28) : "")) : "") +
+        " | back=" + (back ? "yes" : "no") +
+        " | range=" + low + "-" + high +
+        " | conf=" + confidence +
+        " | reported=" + (Object.keys(condition).filter(k => condition[k]).length || 0) +
+        " | caps=" + (capsHit.join(",") || "-") +
+        " | limiter=" + limiter + " | photoQ=" + photoQuality + " | spread=" + spread
+      );
 
       return res.json({
         success: true,
