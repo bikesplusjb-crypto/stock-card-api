@@ -2471,6 +2471,32 @@ function buildQueryTiers(ai) {
             : joinParts([year, brand, player, serial, auto, patch]))
     : "";
 
+  /* ── THE LAST RESORT FOR A NUMBERED CARD (19 Sept) ────────────────
+
+     A numbered card that finds nothing currently ends there: the ladder
+     refuses to drop the serial, on the sound reasoning that a /10 and a
+     /250 are different cards at different prices.
+
+     But "no price at all" is its own wrong answer, and it is the common
+     one: 17 of 29 lookups in six hours came back empty, nearly all of
+     them numbered. One visitor today searched the same /50 autograph
+     fourteen times in five minutes, rephrasing the serial each way he
+     could think of, and left with nothing.
+
+     So there is one more step, and only for numbered cards: the same
+     query without the serial, which finds every numbered version of
+     that card. That pool genuinely mixes print runs, so the answer is
+     NOT presented as a price -- it is marked mixedSerials, and what
+     comes back is a range across numbered versions with the plain
+     warning that a lower print run sits at the top of it.
+
+     A range across the right family beats silence, and beats a median
+     that pretends the /250 sales describe a /10. */
+  const numberedFamily = serial
+    ? (poke ? joinParts(["pokemon", lang, player, par, auto, patch])
+            : joinParts([year, brand, set, player, par, auto, patch]))
+    : "";
+
   const tiers = [];
   if (tight) tiers.push({ tier: "tight", query: tight });
   if (serialTier && serialTier !== tight) tiers.push({ tier: "serial", query: serialTier });
@@ -2480,6 +2506,10 @@ function buildQueryTiers(ai) {
   }
   if (core && core !== tight && core !== setNoNum) tiers.push({ tier: "core", query: core });
   if (loose && loose !== core && loose !== tight && loose !== setNoNum) tiers.push({ tier: "loose", query: loose });
+  /* Last, so every narrower attempt is exhausted first. */
+  if (numberedFamily && !tiers.some(t => t.query === numberedFamily)) {
+    tiers.push({ tier: "numbered-family", query: numberedFamily, mixedSerials: true });
+  }
   return tiers;
 }
 
@@ -3329,7 +3359,12 @@ const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
    Every v7 sealed row was filtered by a list that let group-break team
    slots through -- 31 of 62 on the measured case, producing a $13
    median for a $220 box. */
-const SOLD_LOGIC_VERSION = 9;
+/* 10 (19 Sept): numbered cards may now fall back to a serial-free
+   family search, reported as a range. Bumped so the empty results the
+   old ladder cached for every /50 and /250 card are not served back --
+   those cache rows are exactly the 59% of lookups that returned nothing
+   this afternoon. */
+const SOLD_LOGIC_VERSION = 10;
 
 /* The cache key must carry the limit. Without it a 50-record compact pull
    gets stored under the same key as a full lookup and is then served back
@@ -4457,7 +4492,12 @@ async function broadenTypedLookup(clean, market, sold, compact) {
                           !!serialDenominator(ai);
 
     const tiers = (buildQueryTiers(ai) || []).filter(t =>
-      t && (!keepsIdentity || t.tier === "tight" || t.tier === "serial"));
+      t && (!keepsIdentity || t.tier === "tight" || t.tier === "serial"
+            /* The numbered-family tier keeps the parallel and the auto
+               and drops only the print run, which is exactly the
+               identity question it exists to answer -- so it is allowed
+               through the filter that blocks every other broadening. */
+            || t.tier === "numbered-family"));
     const seen  = new Set([clean]);
     let tried   = 0;
 
@@ -4484,9 +4524,42 @@ async function broadenTypedLookup(clean, market, sold, compact) {
       alt.broadenedFrom = clean;
       alt.broadenedTo   = q;
       alt.broadenedTier = t.tier;
-      alt.broadenedNote =
-        "No completed sales matched the full description. This is priced from " +
-        "a broader search (" + q + ") \u2014 check it describes your card.";
+
+      if (t.mixedSerials) {
+        /* A POOL OF DIFFERENT PRINT RUNS IS A RANGE, NOT A PRICE.
+
+           These sales are every numbered version of this card: /10s,
+           /50s, /250s together. Their median describes no card that
+           exists. The spread does describe something real -- what
+           numbered copies of this card trade for -- provided it is
+           labelled as such and the person is told which end their print
+           run sits at. */
+        /* soldRaw already carries a TRIMMED low and high -- extreme 10%
+           dropped each end, computed by the same trimmedRange every
+           other range in this file uses. Reusing it means this range
+           cannot disagree with the ones beside it, which is the exact
+           class of mismatch that has caused trouble here before. */
+        const lo = alt.soldRaw ? Number(alt.soldRaw.low)  : 0;
+        const hi = alt.soldRaw ? Number(alt.soldRaw.high) : 0;
+        if (lo > 0 && hi > 0 && Number(alt.soldRaw.count) >= 3) {
+          alt.mixedSerials   = true;
+          alt.serialRangeLow  = Math.round(lo * 100) / 100;
+          alt.serialRangeHigh = Math.round(hi * 100) / 100;
+          alt.broadenedNote =
+            "No completed sales matched this exact print run. Across ALL numbered " +
+            "versions of this card, recent sales run $" + alt.serialRangeLow +
+            " to $" + alt.serialRangeHigh + " \u2014 lower print runs sit at the top " +
+            "of that range. Not a price for your copy: a range for the family it belongs to.";
+        } else {
+          alt.broadenedNote =
+            "No completed sales matched this exact print run, and too few sales of any " +
+            "numbered version to give even a range.";
+        }
+      } else {
+        alt.broadenedNote =
+          "No completed sales matched the full description. This is priced from " +
+          "a broader search (" + q + ") \u2014 check it describes your card.";
+      }
       console.log("[broaden] " + clean + " -> " + q + " (" + t.tier + ", " +
                   alt.soldRaw.count + " base sales)");
       return { sold: alt };
