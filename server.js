@@ -4548,6 +4548,79 @@ async function getSoldComps(query, askMedian, compact, skipCache) {
    then refuse to call it a deal if the gap is too large to be real. */
 const IMPLAUSIBLE_GAP_PCT = 65;
 
+
+/* ── HOW FAST DOES THIS CARD SELL? ────────────────────────────────
+
+   18 Sept 2026. Every lookup already fetches both halves of this and
+   throws one away: how many copies are listed right now, and how many
+   sold in the last 30 days. The ratio between them is the question
+   underneath most card decisions -- a $40 card with two sellers is
+   money; a $40 card with sixty sellers is a $40 card you own forever.
+
+   Nobody in the hobby shows it, because marketplaces have no reason to
+   tell you a card is hard to sell.
+
+   The arithmetic is the estate agent's "months of supply", borrowed
+   whole: listings divided by the monthly sale rate gives how long the
+   current queue takes to clear. It is a rate, not a promise about your
+   particular card, and it is worded that way.
+
+   WHEN IT STAYS SILENT:
+     - the sold pool is contaminated (those sales are several different
+       cards, so the rate is not this card's rate)
+     - fewer than 3 sales in 30 days, which is not a rate, it is a
+       couple of events
+     - no active listings to compare against
+   Refusing here matters as much as anywhere else in the engine: a
+   confident "sells in 6 days" from three sales is exactly the kind of
+   number this whole product exists to not print. */
+const LIQ_MIN_SOLD = 3;
+
+function computeLiquidity(market, sold) {
+  const listed = Number(market && market.listingCount) || 0;
+  const sold30 = Number(sold && sold.soldCount) || 0;
+
+  if (!sold || sold.soldContaminated)
+    return { known: false, reason: "sales mix several versions of this card" };
+  if (sold30 < LIQ_MIN_SOLD)
+    return { known: false, sold30, listed, reason: sold30 === 0
+      ? "no completed sales in the last 30 days"
+      : "only " + sold30 + " sale" + (sold30 === 1 ? "" : "s") + " in 30 days — too few to call a rate" };
+  if (!listed)
+    return { known: false, sold30, reason: "nothing currently listed to compare against" };
+
+  const ratio = listed / sold30;              // sellers waiting per monthly buyer
+  const days  = Math.round(ratio * 30);       // how long today's queue takes to clear
+
+  /* Labelled off the CLEARING TIME, not the raw ratio. A first pass
+     labelled 31-listed-against-8-sold "moves steadily" while the very
+     next line said the queue takes four months -- the label and the
+     sentence have to agree or neither is trusted. */
+  let label, tone;
+  if (days <= 21)       { label = "Sells fast";     tone = "hot";  }
+  else if (days <= 60)  { label = "Moves steadily"; tone = "ok";   }
+  else if (days <= 150) { label = "Slow";           tone = "warn"; }
+  else                  { label = "Hard to move";   tone = "cold"; }
+
+  /* Plain words, and deliberately a range rather than a single figure:
+     the listing count is a snapshot and the sale count is a month, so
+     precision here would be false. */
+  const plain =
+    sold30 + " sold in 30 days, " + listed + " listed now" +
+    (ratio <= 1.5 ? " — more buyers than sellers."
+     : ratio <= 4  ? " — about " + ratio.toFixed(1) + " sellers per monthly buyer."
+     : " — about " + Math.round(ratio) + " sellers for every monthly buyer.");
+
+  const wait =
+    days <= 21  ? "At this rate the copies listed now clear in about " + Math.max(1, Math.round(days / 7)) + " week" + (Math.round(days/7) === 1 ? "" : "s") + "."
+  : days <= 60  ? "About " + Math.round(days / 7) + " weeks for the cards listed now to clear."
+  : days <= 150 ? "Around " + Math.round(days / 30) + " months for the cards listed now to clear."
+  :               "Over " + Math.round(days / 30) + " months to clear at this rate. Price it to move, or be patient.";
+
+  return { known: true, sold30, listed, ratio: Number(ratio.toFixed(1)),
+           daysToClear: days, label, tone, plain, wait };
+}
+
 function askVsSold(market, sold) {
   if (!sold || !sold.soldCount) return null;
 
@@ -5358,6 +5431,7 @@ app.get("/api/card-market", async (req, res) => {
       searchQuery:       clean,
       sold:              sold || null,
       askVsSold:         askVsSold(market, sold),
+      liquidity:         computeLiquidity(market, sold),
       avgPrice:          market.avgPrice,
       avgSoldPrice:      market.avgPrice,
       lowPrice:          market.lowPrice,
@@ -6511,6 +6585,7 @@ app.post(
         soldBroadened:     soldBroadened,
         sold:              sold || null,
         askVsSold:         askVsSold(market, sold),
+      liquidity:         computeLiquidity(market, sold),
         matchQuality:      market.matchQuality || "exact",
         tierUsed:          market.tierUsed     || "",
         priceNote:         market.priceNote    || "",
@@ -6775,6 +6850,7 @@ app.get("/api/psa-cert", async (req, res) => {
     searchQuery: searchQuery,
     sold: sold || null,
     askVsSold: askVsSold(market, sold),
+    liquidity: computeLiquidity(market, sold),
     matchQuality: market.matchQuality || "exact",
     tierUsed: market.tierUsed || "",
     priceNote: market.priceNote || "",
@@ -7254,19 +7330,34 @@ async function gradeWithOpenAI(frontFile, backFile, condition, notes) {
     "Pre-screen this trading card for grading. Return ONLY a JSON object with these exact keys: "
     + "cardName, gradeLow, gradeHigh, centering, corners, edges, surface, findings, confidence, summary.\\n\\n"
     + "HOW TO SCORE:\\n"
-    + "- gradeLow and gradeHigh are WHOLE NUMBERS from 1 to 10 describing the likely PSA range. "
-    + "The gap between them is your uncertainty — never return the same number for both unless the card is obviously damaged.\\n"
-    + "- centering, corners, edges and surface are each 0-100.\\n"
-    + "- BE CONSERVATIVE. A 10 requires near-perfect centering, four sharp corners, clean edges and a flawless surface. "
-    + "Most raw cards from a pack are 8-9. If you are unsure, score lower and widen the range.\\n"
-    + "- CENTERING is the one factor a photo shows reliably: compare the border widths left-to-right and top-to-bottom on BOTH sides. "
-    + "A 60/40 border is roughly a 9; 65/35 is an 8; worse than 70/30 caps most cards at 7.\\n"
-    + "- SURFACE is the least reliable from a photo. Say so in your summary and keep the range wide unless damage is clearly visible.\\n"
+    + "SCORE THE FOUR FACTORS FIRST. Do not think about an overall grade until they are done, and do not "
+    + "let a general impression of the card pull them up or down.\\n"
+    + "- centering, corners, edges, surface: each 0-100, judged independently.\\n"
+    + "WHAT THE 0-100 MEANS, the same on every factor: 93-100 nothing a grader would mark; 85-92 one very "
+    + "minor thing; 76-84 one clear flaw; 66-75 a flaw anyone would see; 55-65 several; below 55 heavy wear.\\n"
+    + "- CENTERING is the factor a photo shows reliably. Measure the border widths left-to-right and "
+    + "top-to-bottom on BOTH sides and report them. 55/45 or better scores 93+; 60/40 about 88; 65/35 about 78; "
+    + "70/30 about 62; worse than that, lower still.\\n"
+    + "- CORNERS: look at all four individually at the highest zoom the image allows. Four visibly sharp "
+    + "corners score 90+. One soft corner is the whole score, not an average.\\n"
+    + "- EDGES: whitening, chipping, roughness along each edge, front and back.\\n"
+    + "- SURFACE is the least reliable from a photo. Score what you can actually see: print lines, scratches, "
+    + "dimples, gloss breaks, indentations. If glare or focus hides the surface, say so in findings and set "
+    + "surfaceVisible to false rather than guessing.\\n\\n"
+    + "THEN, and only then:\\n"
+    + "- limitingFactor: which ONE of centering/corners/edges/surface is holding this card back. "
+    + "If nothing visible is holding it back, use \'none\'.\\n"
+    + "- limitingReason: one short sentence naming what you saw and where.\\n"
+    + "- surfaceVisible: true only if the surface is genuinely readable in the photo.\\n"
+    + "- photoQuality: 0-100 for how gradeable these photos are. Glare over the surface, blur, a card that "
+    + "does not fill the frame, a sleeve or top loader, heavy shadow or a tilted shot all lower it.\\n"
+    + "- photoIssues: array of short strings naming what is wrong with the photos, empty if nothing is.\\n"
     + "- findings is an array of 2-5 SHORT plain-English observations, each naming what you saw and where "
-    + "(e.g. 'Left border noticeably wider than right on the front', 'Slight whitening along the bottom edge'). "
+    + "(e.g. \'Left border noticeably wider than right on the front\', \'Slight whitening along the bottom edge\'). "
     + "Never invent a flaw you cannot see. If the card looks clean, say that.\\n"
     + "- confidence must be exactly one of: Lower, Moderate, Higher. Use Lower when only one side was provided, "
     + "when the photo is blurry or glare-heavy, or when the card is sleeved.\\n"
+    + "- DO NOT return gradeLow or gradeHigh. The grade range is worked out from your factor scores, not by you.\\n"
     + "- cardName: identify the card if you can (year, brand, set, player). Empty string if you cannot.\\n"
     + "- Never estimate a dollar value.\\n\\n"
     + (reported ? ("THE OWNER IS HOLDING THE CARD AND REPORTS: " + reported
@@ -7282,7 +7373,7 @@ async function gradeWithOpenAI(frontFile, backFile, condition, notes) {
        grading fee on a card that was never going to make the grade. */
     model: VISION_MODEL,
     messages: [
-      { role: "system", content: "You are a conservative trading card grading pre-screener. You examine photos and estimate a likely grade RANGE, never a single definitive grade. You know a camera cannot resolve fine surface scratches or print lines, and you say so. You return ONLY valid JSON with no markdown, no code fences, and no commentary. You never estimate dollar values. You would rather under-promise a grade than have someone waste money on a submission." },
+      { role: "system", content: "You are a trading card grading pre-screener. You score four condition factors from photographs, name what limits the card, and never guess at an overall grade definitive grade. You know a camera cannot resolve fine surface scratches or print lines, and you say so. You return ONLY valid JSON with no markdown, no code fences, and no commentary. You never estimate dollar values. You would rather under-promise a grade than have someone waste money on a submission." },
       { role: "user", content: [{ type: "text", text: userText }, ...images] }
     ],
     /* Grader ran at 0.2 for the same reason; same family rule. */
@@ -7340,24 +7431,75 @@ app.post(
 
       const ai = await gradeWithOpenAI(front, back, condition, notes);
 
-      let low  = clampGrade(ai.gradeLow, 0);
-      let high = clampGrade(ai.gradeHigh, 0);
-      if (!low && !high) {
-        return res.json({
-          success: false,
-          error: ai.summary || "Could not pre-screen this card. Try a flatter, brighter photo."
-        });
-      }
-      if (!low)  low  = Math.max(1, high - 2);
-      if (!high) high = Math.min(10, low + 2);
-      if (low > high) { const t = low; low = high; high = t; }
+      /* ── THE RANGE IS WORKED OUT HERE, NOT GUESSED ─────────────────
 
+         Four people on Facebook said the same thing: it always answers
+         7-9. They were right, and the prompt was the reason -- it told
+         the model "most raw cards from a pack are 8-9", then forbade a
+         single number, then told it to widen when unsure. Anchor, floor,
+         widen: every card came out 7-9.
+
+         The model now scores the four factors and names what limits the
+         card. The grade comes from those numbers by the rule graders
+         actually work to: A CARD IS ITS WORST FACTOR. One soft corner
+         caps a card whatever the other three look like, which is why an
+         average would be wrong here.
+
+         The width of the range is uncertainty, and it is earned rather
+         than assumed: a clear photo of both sides where the surface is
+         readable gives a tight range; one side, glare, or an unreadable
+         surface widens it. A card can now come back "9" flat, and a
+         rough one can come back "5-6" -- which is the whole point. */
       const subs = {
         centering: clampSub(ai.centering),
         corners:   clampSub(ai.corners),
         edges:     clampSub(ai.edges),
         surface:   clampSub(ai.surface)
       };
+
+      if (!subs.centering && !subs.corners && !subs.edges && !subs.surface) {
+        return res.json({
+          success: false,
+          error: ai.summary || "Could not pre-screen this card. Try a flatter, brighter photo."
+        });
+      }
+
+      /* 0-100 on a factor to the grade that factor alone would allow.
+         Deliberately steep at the top: the difference between a 9 and a
+         10 is small on the score and enormous on the invoice. */
+      /* Calibrated against what PSA actually tolerates, not a hunch: a
+         65/35 card is an 8 in the real world, and a first pass that
+         called it a 6 would have been wrong in the same confident way
+         the 7-9 answer was. The bands here mean the same thing as the
+         bands quoted to the model, so the two halves agree. */
+      const factorToGrade = (v) =>
+          v >= 93 ? 10
+        : v >= 85 ? 9
+        : v >= 76 ? 8
+        : v >= 66 ? 7
+        : v >= 55 ? 6
+        : v >= 45 ? 5
+        : v >= 35 ? 4
+        : v >= 25 ? 3
+        : 2;
+
+      const scored  = ["centering","corners","edges","surface"].filter(k => subs[k] > 0);
+      const worstKey = scored.reduce((a,k) => (subs[k] < subs[a] ? k : a), scored[0] || "surface");
+      const ceiling  = factorToGrade(subs[worstKey] || 0);
+
+      /* How much room to leave around it. Each doubt adds a point of
+         spread, and the photo's own quality is part of that. */
+      const photoQuality   = clampSub(ai.photoQuality != null ? ai.photoQuality : (back ? 80 : 65));
+      const surfaceVisible = ai.surfaceVisible !== false;
+      let spread = 0;
+      if (!back)                       spread += 1;   // back unseen: centering and edges half-judged
+      if (!surfaceVisible)             spread += 1;   // the factor that decides 9 vs 10
+      if (photoQuality < 70)           spread += 1;
+      if (String(ai.confidence||"") === "Lower") spread += 1;
+      spread = Math.min(spread, 3);
+
+      let high = ceiling;
+      let low  = Math.max(1, ceiling - spread);
 
       /* Apply what the owner reported. Downward only — the page promises
          exactly that, and it is the honest direction anyway: a hand can
@@ -7413,8 +7555,34 @@ app.post(
         " | range=" + low + "-" + high +
         " | conf=" + confidence +
         " | reported=" + (Object.keys(condition).filter(k => condition[k]).length || 0) +
-        " | caps=" + (capsHit.join(",") || "-")
+        " | caps=" + (capsHit.join(",") || "-") +
+        " | limiter=" + limiter + " | photoQ=" + photoQuality + " | spread=" + spread
       );
+
+      /* WHAT IS HOLDING THE CARD BACK, in the card's own terms. The old
+         response gave a range and four numbers and left the person to
+         work out which number mattered. The limiter is the answer to
+         "why not a 10", and it is the one thing they can check by hand
+         before spending $25. */
+      const FACTOR_WORDS = { centering:"Centering", corners:"Corners", edges:"Edges", surface:"Surface" };
+      let limiter = String(ai.limitingFactor || "").toLowerCase();
+      if (!FACTOR_WORDS[limiter]) limiter = worstKey;
+      if (creased) limiter = "surface";
+
+      const limiterReason = creased
+        ? "You reported a crease, which caps the card regardless of everything else."
+        : String(ai.limitingReason || "").slice(0, 200);
+
+      const whyNotTen = high >= 10
+        ? "Nothing visible in these photos is holding this card back from the top grade \u2014 but a camera cannot see what a grader sees under magnification, and surface is where that gap lives."
+        : (FACTOR_WORDS[limiter] + " is what is capping this card at a " + high + "."
+            + (limiterReason ? " " + limiterReason : "")
+            + (limiter === "surface" && !surfaceVisible
+                ? " The surface could not be read properly in these photos, so check it yourself under angled light."
+                : ""));
+
+      const photoIssues = Array.isArray(ai.photoIssues)
+        ? ai.photoIssues.filter(Boolean).map(x => String(x).slice(0,120)).slice(0,4) : [];
 
       return res.json({
         success: true,
@@ -7428,6 +7596,17 @@ app.post(
         usedBack: !!back,
         reportedCondition: condition,
         summary: String(ai.summary || ""),
+
+        /* new, and additive -- the old page keeps working without them */
+        gradeCeiling: high,
+        limitingFactor: limiter,
+        limitingReason: limiterReason,
+        whyNotTen: whyNotTen,
+        surfaceVisible: surfaceVisible,
+        photoQuality: photoQuality,
+        photoIssues: photoIssues,
+        rangeSpread: spread,
+
         timestamp: Date.now()
       });
     } catch (error) {
@@ -7458,7 +7637,8 @@ app.get("/api/sold-comps", async (req, res) => {
       cacheKey:  cacheKeyFor(query, compact ? CARDAPI_LIMIT_COMPACT : CARDAPI_LIMIT),
       askMedian: market.avgPrice,
       sold:      sold || null,
-      askVsSold: askVsSold(market, sold)
+      askVsSold: askVsSold(market, sold),
+      liquidity: computeLiquidity(market, sold)
     });
   } catch (error) {
     res.status(500).json({ success: false, error: "Sold comps lookup failed", details: error.message });
@@ -10164,6 +10344,107 @@ async function refreshWatchlistPrices() {
     console.error("[watchlist-refresh] fatal error:", e.message);
   }
 }
+
+/* ── SHOP INVENTORY GOES STALE AND NOBODY NOTICES (18 Sept) ──────
+
+   Collectors' binders are re-priced every night. Shop inventory never
+   was: 76 cards across two shops, every one last priced when it was
+   added three weeks earlier. A shop tool whose prices rot is worse than
+   no shop tool -- somebody buys a card at 60% of a number that stopped
+   being true in August.
+
+   Same rules as the binder refresh: raw sales for a raw card, refuse
+   rather than write a number when the sales mix versions or are too
+   thin, and keep the previous price when refusing. The shop's ASK is
+   never touched -- that is the shop's decision. Only market_price and
+   the freshness stamps change.
+
+   Runs at 4:20am ET, between the binder refresh (4:00) and the price
+   alert emails (4:30), so the three never overlap on eBay calls. */
+const SHOP_REFRESH_MAX   = 300;
+const SHOP_REFRESH_PACE  = 1000;
+
+async function refreshShopInventoryPrices() {
+  if (!supabaseAdmin) {
+    console.log("[shop-refresh] skipped — no Supabase client");
+    return;
+  }
+  const started = Date.now();
+  let updated = 0, skipped = 0, failed = 0, stopped = false;
+
+  try {
+    /* Status values in this table are 'Available' and 'Sold', capital
+       first letter. A lower-case "not sold" filter matched nothing and
+       would have spent eBay calls re-pricing cards the shop has already
+       sold, so this compares case-insensitively. */
+    const { data: items, error } = await supabaseAdmin
+      .from("shop_inventory")
+      .select("id, shop_id, card_name, year, brand, set_name, card_number, parallel, market_price, market_checked_at, status")
+      .not("status", "ilike", "sold")
+      .order("market_checked_at", { ascending: true, nullsFirst: true })
+      .limit(SHOP_REFRESH_MAX);
+
+    if (error) { console.error("[shop-refresh] fetch error:", error.message); return; }
+    if (!items || !items.length) { console.log("[shop-refresh] nothing to refresh"); return; }
+
+    console.log("[shop-refresh] refreshing " + items.length + " cards…");
+
+    for (const item of items) {
+      try {
+        /* Built from the saved fields when they exist: a shop's
+           card_name is whatever the scanner read, and the separate
+           fields are more reliable than that string. */
+        const parts = [item.year, item.brand, item.set_name, item.card_name,
+                       item.card_number ? "#" + String(item.card_number).replace(/^#/, "") : "", item.parallel]
+          .map(v => String(v || "").trim()).filter(Boolean);
+        const query = (parts.length >= 3 ? parts.join(" ") : String(item.card_name || "")).trim();
+        if (!query) { skipped++; continue; }
+
+        const market = await getEbayCardMarket(query);
+        const sold   = await getSoldComps(query, market && market.avgPrice);
+
+        if (sold && sold.rateLimited) {
+          stopped = true;
+          console.log("[shop-refresh] daily allowance reached — stopping early");
+          break;
+        }
+
+        /* The same bar the scanner uses. A contaminated or thin pool
+           keeps yesterday's number, and the card is still stamped as
+           checked so it moves to the back of the queue instead of being
+           retried every night. */
+        const usable = sold && !sold.soldContaminated && !sold.soldLimited && Number(sold.soldMedian) > 0;
+        const patch  = { market_checked_at: new Date().toISOString() };
+        if (usable) {
+          patch.market_price     = Number(sold.soldMedian);
+          patch.price_basis      = sold.soldBasis || "sold";
+          patch.price_updated_at = new Date().toISOString();
+        } else {
+          skipped++;
+        }
+
+        const { error: upErr } = await supabaseAdmin
+          .from("shop_inventory").update(patch).eq("id", item.id);
+        if (upErr) { failed++; console.error("[shop-refresh] update failed " + item.id + ":", upErr.message); }
+        else if (usable) updated++;
+
+      } catch (e) {
+        failed++;
+        console.error("[shop-refresh] error on " + item.id + ":", e.message);
+      }
+      await new Promise(r => setTimeout(r, SHOP_REFRESH_PACE));
+    }
+
+    console.log("[shop-refresh] done. updated=" + updated + " kept=" + skipped +
+                " failed=" + failed + (stopped ? " STOPPED-ON-BUDGET" : "") +
+                " elapsed=" + Math.round((Date.now() - started) / 1000) + "s");
+  } catch (e) {
+    console.error("[shop-refresh] fatal:", e.message);
+  }
+}
+
+cron.schedule("20 4 * * *", refreshShopInventoryPrices, { timezone: "America/New_York" });
+console.log("Shop inventory refresh scheduled for 4:20 AM ET");
 
 cron.schedule("0 4 * * *", function () { refreshWatchlistPricesGuarded("nightly cron"); }, {
   timezone: "America/New_York"
