@@ -7441,6 +7441,43 @@ app.post(
          Read-only. Nothing here changes a grade. If it ever does, the
          detector is back to being in charge of the answer, which is the
          arrangement that failed. */
+      /* ── A MEASURED CARD BEATS A LOOKED-AT ONE ────────────────────
+
+         A scan carries its resolution inside the file, so the browser
+         can work out how many pixels a millimetre is and measure the
+         borders properly. That arrives here as scan_measure.
+
+         Centring is the one factor a photograph can pin down exactly,
+         and a measurement is better evidence than a model's impression
+         of the same borders -- so when a real measurement is present it
+         REPLACES the model's centring score. Nothing else is touched:
+         corners, edges and surface still come from the picture, and the
+         ceiling is still the worst factor.
+
+         This can lower a grade as easily as raise it. A 65/35 card the
+         model called "about 88" becomes 78, and the ceiling drops from
+         9 to 8 -- which is the honest answer, and the reason somebody
+         about to spend $75 on a submission would scan the card first. */
+      let scanMeasure = null;
+      try { scanMeasure = JSON.parse(req.body.scan_measure || "null"); } catch (e) { scanMeasure = null; }
+      const measuredFront = (scanMeasure && scanMeasure.front && scanMeasure.front.ok) ? scanMeasure.front : null;
+      const measuredBack  = (scanMeasure && scanMeasure.back  && scanMeasure.back.ok)  ? scanMeasure.back  : null;
+
+      /* Worst side of the worst axis, as a percentage: 50 is perfect,
+         65 means a 65/35 border. The bands match the ones quoted to the
+         model, so a measured card and a read card speak the same
+         language. */
+      function centringScore(worstPct) {
+        const p = Number(worstPct) || 50;
+        return p <= 53 ? 97
+             : p <= 57 ? 93
+             : p <= 61 ? 88
+             : p <= 66 ? 78
+             : p <= 71 ? 62
+             : p <= 76 ? 48
+             : 35;
+      }
+
       const captureMode = String(req.body.capture_mode || "upload").slice(0, 30);
       let captureQuality = null;
       try { captureQuality = JSON.parse(req.body.capture_quality || "null"); } catch (e) { captureQuality = null; }
@@ -7473,6 +7510,30 @@ app.post(
         edges:     clampSub(ai.edges),
         surface:   clampSub(ai.surface)
       };
+
+      /* Both sides count: PSA grades the worse of them, and a back is
+         very often the worse one. */
+      let measuredCentring = null;
+      if (measuredFront || measuredBack) {
+        const worst = Math.max(
+          measuredFront ? Number(measuredFront.worst) || 50 : 0,
+          measuredBack  ? Number(measuredBack.worst)  || 50 : 0
+        );
+        const reliable = (!measuredFront || measuredFront.reliable !== false)
+                      && (!measuredBack  || measuredBack.reliable  !== false);
+        /* Borders under a millimetre were flagged approximate by the
+           browser; those are not worth overriding a read with. */
+        if (reliable) {
+          measuredCentring = {
+            worst: worst,
+            score: centringScore(worst),
+            front: measuredFront ? measuredFront.leftRight + ' / ' + measuredFront.topBottom : null,
+            back:  measuredBack  ? measuredBack.leftRight  + ' / ' + measuredBack.topBottom  : null,
+            dpi: (measuredFront || measuredBack).dpi
+          };
+          subs.centering = measuredCentring.score;
+        }
+      }
 
       if (!subs.centering && !subs.corners && !subs.edges && !subs.surface) {
         return res.json({
@@ -7615,7 +7676,9 @@ app.post(
         " | conf=" + confidence +
         " | reported=" + (Object.keys(condition).filter(k => condition[k]).length || 0) +
         " | caps=" + (capsHit.join(",") || "-") +
-        " | limiter=" + limiter + " | photoQ=" + photoQuality + " | spread=" + spread
+        " | limiter=" + limiter + " | photoQ=" + photoQuality + " | spread=" + spread +
+        (measuredCentring ? (" | MEASURED centring " + measuredCentring.worst + "% -> " + measuredCentring.score
+                             + " @" + measuredCentring.dpi + "dpi") : "")
       );
 
       return res.json({
@@ -7632,6 +7695,7 @@ app.post(
         summary: String(ai.summary || ""),
 
         /* new, and additive -- the old page keeps working without them */
+        measuredCentring: measuredCentring,
         gradeCeiling: high,
         limitingFactor: limiter,
         limitingReason: limiterReason,
