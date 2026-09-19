@@ -6512,6 +6512,9 @@ app.post(
            adopts nothing -- it reports a span and says what it spans. */
         if (!sold || !Number(sold.soldCount)) {
           const denomWanted = serialDenominator(ai);
+          if (!denomWanted) {
+            console.log("[broaden] numbered-family skipped: no serial read on this card");
+          }
           if (denomWanted) {
             const famQ = (buildQueryTiers(ai) || [])
               .filter(t => t && t.mixedSerials)
@@ -6521,6 +6524,17 @@ app.post(
               const fam = await getSoldComps(famQ, market.avgPrice);
               const lo = fam && fam.soldRaw ? Number(fam.soldRaw.low)  : 0;
               const hi = fam && fam.soldRaw ? Number(fam.soldRaw.high) : 0;
+              /* LOG THE ATTEMPT, NOT JUST THE SUCCESS.
+
+                 The first version only printed a line when a range came
+                 back, so a scan that found nothing looked identical to
+                 one where this never ran -- and the first real test was
+                 exactly that case, with no way to tell them apart. */
+              console.log("[broaden] numbered-family try: " + famQ +
+                          " -> raw=" + (fam && fam.soldRaw ? fam.soldRaw.count : "none") +
+                          " low=" + lo + " high=" + hi +
+                          (fam && fam.soldLimited ? " LIMITED" : "") +
+                          (fam && fam.soldContaminated ? " CONTAMINATED" : ""));
               if (fam && !fam.soldLimited && Number(fam.soldRaw && fam.soldRaw.count) >= 3
                   && lo > 0 && hi > 0) {
                 fam.mixedSerials     = true;
