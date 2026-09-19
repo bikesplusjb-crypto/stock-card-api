@@ -7860,6 +7860,28 @@ app.post(
 
         /* new, and additive -- the old page keeps working without them */
         measuredCentring: measuredCentring,
+
+        /* ── WHY A CLEAN CARD STILL CAME BACK LOW ────────────────────
+
+           Somebody answers "clean surface, sharp corners, no creases"
+           and the estimate does not move, because reported condition is
+           applied downward only -- a hand can confirm damage a camera
+           missed, but nobody's opinion of their own card is evidence of
+           a 10. That rule is right and it stays.
+
+           What was wrong is that the page never said so. The person
+           sees four clean answers and a 7, and reasonably concludes the
+           tool ignored them or is broken. Both these flags exist so it
+           can say the true thing instead: your answers were read, they
+           cannot raise an estimate, and what is actually holding this
+           card back is the photograph. */
+        reportedCount: Object.keys(condition).filter(k => condition[k]).length,
+        reportedAllClean: (() => {
+          const benign = { surface: "clean", corners: "sharp", edges: "clean", creases: "none" };
+          const given = Object.keys(condition).filter(k => condition[k]);
+          return given.length > 0 && given.every(k => condition[k] === benign[k]);
+        })(),
+        photoLimited: Number(photoQuality) > 0 && Number(photoQuality) < 80,
         gradeCeiling: high,
         limitingFactor: limiter,
         limitingReason: limiterReason,
