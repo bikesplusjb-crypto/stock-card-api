@@ -10716,6 +10716,18 @@ async function refreshWatchlistPrices() {
 const SHOP_REFRESH_MAX   = 300;
 const SHOP_REFRESH_PACE  = 1000;
 
+/* shop_inventory.price_basis is constrained to four values. Anything
+   the engine produces that is not plainly a clean sold median is
+   recorded as 'none' rather than squeezed into a label that overstates
+   it -- a wrong basis is worse than a missing one, because the shop UI
+   uses it to decide how much to trust the number. */
+function shopPriceBasis(soldBasis) {
+  const b = String(soldBasis || "").toLowerCase();
+  if (b === "mixed") return "sold_mixed";
+  if (b === "raw" || b === "graded" || b === "all" || b === "sold") return "sold";
+  return "none";
+}
+
 async function refreshShopInventoryPrices() {
   if (!supabaseAdmin) {
     console.log("[shop-refresh] skipped — no Supabase client");
@@ -10769,7 +10781,21 @@ async function refreshShopInventoryPrices() {
         const patch  = { market_checked_at: new Date().toISOString() };
         if (usable) {
           patch.market_price     = Number(sold.soldMedian);
-          patch.price_basis      = sold.soldBasis || "sold";
+          /* ── TWO VOCABULARIES, ONE COLUMN (20 Sept) ────────────────
+
+             The pricing engine's soldBasis says how the median was
+             formed: "raw", "graded", "mixed", "limited", "none". The
+             shop_inventory column accepts only 'sold', 'sold_mixed',
+             'ask', 'none'. Nothing translated between them, so every
+             nightly update was rejected by the check constraint and the
+             whole run reported updated=0 while looking like it had
+             worked -- the cards were stamped as checked, so they moved
+             to the back of the queue with yesterday's price still on
+             them.
+
+             Found on the first real run, 20 Sept: 70 cards, 0 updated,
+             1 hard failure, the rest "kept". */
+          patch.price_basis      = shopPriceBasis(sold.soldBasis);
           patch.price_updated_at = new Date().toISOString();
         } else {
           skipped++;
