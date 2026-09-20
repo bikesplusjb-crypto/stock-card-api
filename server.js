@@ -4416,6 +4416,17 @@ function soldSummaryForLog(sold) {
     flags: {
       contaminated: !!s.soldContaminated, limited: !!s.soldLimited, wide_base: !!s.soldWideBase,
       broadened: !!s.broadenedTo, broadened_tier: s.broadenedTier || null,
+      /* ── ATTEMPTED, NOT JUST ADOPTED ────────────────────────────
+         `broadened` says whether a wider search was USED. It says
+         nothing about whether one was TRIED, and the two look
+         identical in the log when the wider search also found
+         nothing. Both scans that failed on 20 Sept read
+         broadened:false after running five queries each -- so the
+         data could not distinguish "the ladder never ran" from "the
+         ladder ran and the card genuinely has no comps", which is
+         the difference between a bug and an honest answer. It took
+         four queries against the comp cache to tell them apart. */
+      broaden_tried: Number(s.broadenTried) || 0,
       low: Number(r.low || s.soldLow) || null, high: Number(r.high || s.soldHigh) || null,
       cached: !!s.cached
     }
@@ -4694,6 +4705,7 @@ async function broadenTypedLookup(clean, market, sold, compact) {
       alt.broadenedFrom = clean;
       alt.broadenedTo   = q;
       alt.broadenedTier = t.tier;
+      alt.broadenTried  = tried;
 
       if (t.mixedSerials) {
         /* A POOL OF DIFFERENT PRINT RUNS IS A RANGE, NOT A PRICE.
@@ -5456,15 +5468,30 @@ async function fetchDollarBinCategory(category) {
   }
 }
 
+/* ── ONE REFILL AT A TIME ─────────────────────────────────────────
+   The cache check and the refill are not atomic, and this endpoint is
+   public. Every request arriving while the pool is cold starts its own
+   refill, and each refill is six eBay calls -- ten simultaneous
+   visitors on an expired cache is sixty. The window is small and it
+   opens on a schedule: every six hours, and on every cold start.
+
+   Same shape as watchlistRefreshRunning, same fix: the first caller
+   owns the refill and everyone else waits on the promise it already
+   started. */
+let dollarBinInFlight = null;
+
 app.get("/api/dollar-bin", async (req, res) => {
   try {
     if (dollarBinPool.cats.length && Date.now() < dollarBinPool.expires) {
       return res.json(buildDollarBinResponse(dollarBinPool.cats, dollarBinPool.fetchedAt));
     }
 
-    const results = await Promise.all(
-      DOLLAR_BIN_QUERIES.map(cat => fetchDollarBinCategory(cat))
-    );
+    if (!dollarBinInFlight) {
+      dollarBinInFlight = Promise.all(
+        DOLLAR_BIN_QUERIES.map(cat => fetchDollarBinCategory(cat))
+      ).finally(() => { dollarBinInFlight = null; });
+    }
+    const results = await dollarBinInFlight;
 
     const cats = results.map(items => items.slice(0, 20)).filter(arr => arr.length);
 
@@ -6513,6 +6540,7 @@ app.post(
       }
 
       let soldBroadened = null;
+      let broadenTried = 0;
       /* ── THE GATE TESTED THE WRONG NUMBER (20 Sept) ──────────────────
 
          This read `!sold.soldCount`, so broadening only ran when the
@@ -6569,6 +6597,7 @@ app.post(
           }
 
           already.add(q);
+          broadenTried++;
           const broader = await getSoldComps(q, market.avgPrice);
           /* A broader query only counts as an answer if it produced a
              number worth showing. soldCount is the raw record count --
@@ -6653,6 +6682,7 @@ app.post(
               .map(t => t.query)[0];
             if (famQ && !already.has(famQ)) {
               already.add(famQ);
+              broadenTried++;
               const fam = await getSoldComps(famQ, market.avgPrice);
               const lo = fam && fam.soldRaw ? Number(fam.soldRaw.low)  : 0;
               const hi = fam && fam.soldRaw ? Number(fam.soldRaw.high) : 0;
@@ -6692,6 +6722,10 @@ app.post(
           }
         }
       }
+
+      /* Attached after the ladder, to whichever payload survived it --
+         adopted or not, the attempt count belongs on the record. */
+      if (sold && broadenTried) sold.broadenTried = broadenTried;
 
       const verification  = await verifyPromise;
       /* The scanner already renders verified.yearCorrected as "Confirmed in
@@ -8494,11 +8528,30 @@ async function getStockQuote(symbol) {
   }
 }
 
+/* Same guard as /api/dollar-bin: public endpoint, non-atomic cache
+   check, and each refill is five stock quotes plus five eBay market
+   lookups. A 15-minute TTL means this window opens four times an
+   hour. */
+let vsMarketInFlight = null;
+
 app.get("/api/vs-market", async (req, res) => {
+  /* Declared OUTSIDE the try, because the catch below has to release
+     the gate and a `let` inside the try is not in scope there -- that
+     is a ReferenceError on the error path, which is exactly the path
+     where the gate most needs releasing. node --check does not catch
+     it; it is scope, not syntax. */
+  let resolveShared = null;
   try {
     if (vsMarketCache.data && Date.now() < vsMarketCache.expires) {
       return res.json(vsMarketCache.data);
     }
+
+    if (vsMarketInFlight) {
+      const shared = await vsMarketInFlight;
+      return res.json(shared);
+    }
+
+    vsMarketInFlight = new Promise(r => { resolveShared = r; });
 
     const rows = await Promise.all(
       VS_MARKET_MATCHUPS.map(async (m) => {
@@ -8574,8 +8627,14 @@ app.get("/api/vs-market", async (req, res) => {
     }
 
     vsMarketCache = { data: payload, expires: Date.now() + VS_MARKET_CACHE_MIN * 60 * 1000 };
+    if (resolveShared) resolveShared(payload);
+    vsMarketInFlight = null;
     res.json(payload);
   } catch (error) {
+    /* Release the gate on failure too, or one bad refill locks every
+       later request out until the process restarts. */
+    if (resolveShared) resolveShared(vsMarketCache.data || null);
+    vsMarketInFlight = null;
     console.error("vs-market error:", error);
     res.status(500).json({ success: false, error: "vs-market failed", details: error.message });
   }
@@ -10894,7 +10953,13 @@ async function refreshShopInventoryPrices() {
     const { data: items, error } = await supabaseAdmin
       .from("shop_inventory")
       .select("id, shop_id, card_name, year, brand, set_name, card_number, parallel, market_price, market_checked_at, status")
-      .not("status", "ilike", "sold")
+      /* NULL IS NOT "NOT SOLD" TO POSTGRES. `not ilike` evaluates to
+         NULL for a NULL status, and PostgREST drops those rows -- so a
+         card whose status was never set would be excluded from pricing
+         permanently, and silently, with nothing in the log. Every row
+         happens to carry a status today, which is exactly why this
+         would have gone unnoticed the day one did not. */
+      .or("status.is.null,status.not.ilike.sold")
       .order("market_checked_at", { ascending: true, nullsFirst: true })
       .limit(SHOP_REFRESH_MAX);
 
