@@ -10912,6 +10912,167 @@ async function refreshShopInventoryPrices() {
   }
 }
 
+/* ── HOT / COLD: A MONTHLY REPRICE, NOT A NIGHTLY ONE (20 Sept) ──
+
+   60 curated cards whose prices were last touched by hand on 23 July.
+   The page says so in a banner, which is honest and is also the reason
+   nobody opens it twice.
+
+   MONTHLY IS THE RIGHT CADENCE, AND NIGHTLY WOULD BE WRONG. The value
+   on this page is the MOVE, and the table stores it as exactly two
+   numbers: prev_price and current_price. Repriced nightly, those two
+   are last night and the night before, every card reads about 0%, and
+   a page built entirely on movement goes flat. Repriced monthly they
+   are a real interval -- this month against last -- which is the shape
+   the table was designed for and the shape a collector thinks in.
+
+   It also costs almost nothing: 60 cards x 100 records is 6,000 of a
+   50,000/day allowance, twelve times a year.
+
+   THE REFUSALS MATTER MORE HERE THAN ANYWHERE. This is a curated list
+   of high-end cards -- the active rows average $2,735 and top out over
+   $90,000 -- so most of them trade graded, and a raw-first read would
+   refuse nearly all of them. The basis is therefore chosen per card
+   rather than assumed, and where the engine will not stand behind a
+   number the row is LEFT ENTIRELY ALONE: no price, no prev_price
+   shuffle, and critically no updated_at. A refused card keeps its old
+   date and the page keeps telling the truth about it. Moving the
+   timestamp without moving the price is how a stale page starts
+   claiming to be fresh. */
+const HOTCOLD_PACE_MS = 1000;
+
+async function refreshHotColdPrices() {
+  if (!supabaseAdmin) { console.log("[hot-cold] skipped — no Supabase client"); return; }
+  const started = Date.now();
+  let repriced = 0, refused = 0, failed = 0, stopped = false;
+
+  try {
+    const { data: rows, error } = await supabaseAdmin
+      .from("hot_cold_cards")
+      .select("id, card_name, sport, current_price, prev_price, direction")
+      .eq("is_active", true)
+      .order("updated_at", { ascending: true, nullsFirst: true });
+
+    if (error) { console.error("[hot-cold] fetch error:", error.message); return; }
+    if (!rows || !rows.length) { console.log("[hot-cold] nothing to refresh"); return; }
+
+    console.log("[hot-cold] repricing " + rows.length + " cards…");
+
+    for (const row of rows) {
+      try {
+        const query = String(row.card_name || "").trim();
+        if (!query) { refused++; continue; }
+
+        const market = await getEbayCardMarket(query);
+        const sold   = await getSoldComps(query, market && market.avgPrice);
+
+        if (sold && sold.rateLimited) {
+          stopped = true;
+          console.log("[hot-cold] daily allowance reached — stopping early");
+          break;
+        }
+
+        const s = sold || {};
+
+        /* Every refusal the scanner makes, made here too. soldWideBase
+           is included -- unlike the nightly binder refresh -- for the
+           same reason the email alerts include it: this number is
+           published as a MOVE, and a move computed between two medians
+           of a pool that spans several cards is noise with a
+           percentage on it. */
+        if (s.soldContaminated || s.soldLimited || s.soldWideBase || !Number(s.soldCount)) {
+          refused++;
+          console.log("[hot-cold] refused " + query + " — " +
+            (s.soldContaminated ? "contaminated" :
+             s.soldLimited ? "limited" :
+             s.soldWideBase ? "wide base pool" : "no sales"));
+          continue;
+        }
+
+        /* WHICH POOL DESCRIBES THIS CARD.
+
+           A name carrying PSA/BGS/SGC/CGC is a slab, and its price is
+           the graded median -- reading soldRaw on it would price the
+           ungraded copy of a card nobody on this list owns ungraded.
+           Everything else prefers the base pool when it is deep enough,
+           which is the same choice refreshWatchlistPrices makes. */
+        const wantsGraded = /\b(psa|bgs|sgc|cgc)\b/i.test(query);
+        const gradedMed = Number(s.soldGraded && s.soldGraded.median) || 0;
+        const gradedN   = Number(s.soldGraded && s.soldGraded.count)  || 0;
+        const rawMed    = Number(s.soldRaw && s.soldRaw.median) || 0;
+        const rawN      = Number(s.soldRaw && s.soldRaw.count)  || 0;
+
+        let next = 0, basis = "";
+        if (wantsGraded) {
+          if (gradedN >= MIN_GROUP && gradedMed > 0) { next = gradedMed; basis = "graded"; }
+        } else if (rawN >= MIN_GROUP && rawMed > 0) {
+          next = rawMed; basis = "raw";
+        } else if (Number(s.soldMedian) > 0) {
+          next = Number(s.soldMedian); basis = "headline";
+        }
+
+        if (!(next > 0)) {
+          refused++;
+          console.log("[hot-cold] refused " + query + " — no usable pool for a " +
+                      (wantsGraded ? "graded" : "raw") + " card");
+          continue;
+        }
+
+        const prev = Number(row.current_price) || 0;
+        const patch = {
+          current_price: Math.round(next * 100) / 100,
+          updated_at:    new Date().toISOString()
+        };
+        /* prev_price only moves when there WAS a real previous price.
+           Otherwise the first refresh would invent a 0 to compare
+           against and every card would read as an infinite gain. */
+        if (prev > 0) {
+          patch.prev_price = prev;
+          const pct = ((next - prev) / prev) * 100;
+          patch.pct_change = Math.round(pct * 100) / 100;
+          patch.direction  = pct >= 0 ? "hot" : "cold";
+        }
+
+        const { error: upErr } = await supabaseAdmin
+          .from("hot_cold_cards").update(patch).eq("id", row.id);
+        if (upErr) { failed++; console.error("[hot-cold] update failed " + row.id + ":", upErr.message); }
+        else {
+          repriced++;
+          console.log("[hot-cold] " + query + " $" + prev + " -> $" + patch.current_price +
+                      " (" + basis + (patch.pct_change != null ? ", " + patch.pct_change + "%" : ", first price") + ")");
+        }
+      } catch (e) {
+        failed++;
+        console.error("[hot-cold] error on " + row.id + ":", e.message);
+      }
+      await new Promise(r => setTimeout(r, HOTCOLD_PACE_MS));
+    }
+
+    console.log("[hot-cold] done. repriced=" + repriced + " refused=" + refused +
+                " failed=" + failed + (stopped ? " STOPPED-ON-BUDGET" : "") +
+                " elapsed=" + Math.round((Date.now() - started) / 1000) + "s");
+  } catch (e) {
+    console.error("[hot-cold] fatal:", e.message);
+  }
+}
+
+/* 1st of the month, 5:00 AM ET — after the binder refresh (4:00), the
+   shop refresh (4:20), the price alerts (4:30) and the watch alerts
+   (4:45), so the five never contend for the record allowance. */
+cron.schedule("0 5 1 * *", refreshHotColdPrices, { timezone: "America/New_York" });
+console.log("Hot/Cold monthly reprice scheduled for the 1st at 5:00 AM ET");
+
+/* Manual trigger, same auth as the other jobs. The first run should be
+   done by hand rather than waited for: the list is two months stale
+   today and the 1st is eleven days away. */
+app.get("/api/refresh-hot-cold", async (req, res) => {
+  if (!process.env.REFRESH_SECRET || req.query.key !== process.env.REFRESH_SECRET) {
+    return res.status(403).json({ success: false, error: "Forbidden" });
+  }
+  res.json({ success: true, message: "Hot/Cold reprice started — check server logs" });
+  refreshHotColdPrices();
+});
+
 cron.schedule("20 4 * * *", refreshShopInventoryPrices, { timezone: "America/New_York" });
 console.log("Shop inventory refresh scheduled for 4:20 AM ET");
 
