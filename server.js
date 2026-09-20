@@ -3448,7 +3448,14 @@ const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
    old ladder cached for every /50 and /250 card are not served back --
    those cache rows are exactly the 59% of lookups that returned nothing
    this afternoon. */
-const SOLD_LOGIC_VERSION = 10;
+/* 10 -> 11 (20 Sept). A pool that found records and could price from
+   none of them now comes back soldLimited TRUE with a sentence saying
+   so, where before it came back limited FALSE with an empty warning.
+   Same query, different answer, so every v10 row is an answer from
+   logic that no longer exists -- and the rows this affects are exactly
+   the ones that were failing silently. Not bumping is the mistake this
+   constant has now recorded five times. */
+const SOLD_LOGIC_VERSION = 11;
 
 /* The cache key must carry the limit. Without it a 50-record compact pull
    gets stored under the same key as a full lookup and is then served back
@@ -3849,6 +3856,44 @@ function summarizeSold(records, query, limitUsed) {
     warning = "Auction closes (median $" + auctionMed + ") sit far below fixed-price sales " +
               "(median $" + fixedMed + ", only " + fixedP.length + " of them). " +
               "Too thin to call a market price — review before pricing.";
+  } else if (basis === "none" && clean.length > 0) {
+    /* ── A REFUSAL WITH NOTHING SAID (20 Sept) ─────────────────────
+
+       filt.rawThin is the flag that produces "Only N clean base-card
+       sales out of M". narrow() sets it -- and narrow() returns early,
+       before setting anything, when the card being priced is itself a
+       parallel, an auto, a patch or a variation. That early return is
+       correct: those pools must not be filtered against themselves.
+
+       The consequence was not. A parallel whose pool came back under
+       MIN_GROUP produced basis "none", median 0, soldLimited FALSE and
+       soldWarning EMPTY. Nothing anywhere said why. A base card in the
+       same position got a sentence; a parallel got a blank screen.
+
+       Read off the De Paula /499 scan: 6 records, 2 raw, 4 graded,
+       limited false, warning "". The graded median was $878.
+
+       This branch is last, so it only fires when none of the checks
+       above claimed the result -- it cannot mask contamination, a thin
+       base pool, or the penny-auction split. It states what was found
+       rather than guessing at a price. */
+    limited = true;
+    /* soldBaseCount / soldUngradedCount feed the scanner's wording
+       directly -- scanner.html reads soldBaseCount to print "there are
+       only N clean sales of this exact card". narrow() returns early
+       for a parallel and never sets them, so without this they stay 0
+       and the page would say "only 0 clean sales" next to two visible
+       sales. For a parallel the raw pool IS the clean pool: nothing was
+       filtered out of it, so its own size is the honest number. */
+    if (!filt.rawAll) { filt.rawBase = rawP.length; filt.rawAll = rawAll.length; }
+    const gradedN = graded.length;
+    warning = "Found " + clean.length + " completed sale" + (clean.length === 1 ? "" : "s") +
+              " but only " + rawP.length + " ungraded " +
+              (rawP.length === 1 ? "one" : "ones") +
+              (gradedN ? " (" + gradedN + " graded)" : "") +
+              " — below the " + MIN_GROUP + " needed to call a raw price. " +
+              (gradedN ? "The graded sales are shown below. " : "") +
+              "Check the sold listings before pricing.";
   }
   /* THE BASE POOL DISAGREES WITH ITSELF.
 
@@ -6409,7 +6454,31 @@ app.post(
       }
 
       let soldBroadened = null;
-      if ((!sold || !sold.soldCount) && !yearCorrection) {
+      /* ── THE GATE TESTED THE WRONG NUMBER (20 Sept) ──────────────────
+
+         This read `!sold.soldCount`, so broadening only ran when the
+         lookup found NOTHING AT ALL. soldCount is the raw record count,
+         and this file says six times over that the raw record count is
+         not evidence -- broadenTypedLookup() on the typed path already
+         gates on soldRaw.count instead. The scan path never did.
+
+         Measured on a real scan, 13:27 today. A 2023 Bowman Chrome
+         Josue De Paula Refractor 461/499:
+
+           6 records -> 4 graded (median $878), 2 raw (median $232)
+           raw 2 < MIN_GROUP, fixed 2 < MIN_FIXED -> basis "none", $0
+
+         soldCount was 6, so this gate was false, so the tier ladder AND
+         the numbered-family fallback shipped yesterday for exactly this
+         card were both skipped. The person saw no price on a /499
+         rookie whose graded copies sell near $878.
+
+         Across 20 Sept, 7 of the 8 scans that ended with no price had
+         records in hand and broadened zero times.
+
+         A published median is the only thing that means "we answered".
+         Anything else is a card still waiting for a wider search. */
+      if ((!sold || !Number(sold.soldMedian)) && !yearCorrection) {
         const tiers   = buildQueryTiers(ai) || [];
         const already = new Set([searchQuery]);
         for (let i = 0; i < tiers.length; i++) {
@@ -6510,7 +6579,11 @@ app.post(
 
            The $2 bug was adopting a base median as the answer. This
            adopts nothing -- it reports a span and says what it spans. */
-        if (!sold || !Number(sold.soldCount)) {
+        /* Same correction as the gate above: soldCount counts records,
+           not answers. A numbered card that found six records and could
+           price from none of them needs this fallback exactly as much as
+           one that found zero. */
+        if (!sold || !Number(sold.soldMedian)) {
           const denomWanted = serialDenominator(ai);
           if (!denomWanted) {
             console.log("[broaden] numbered-family skipped: no serial read on this card");
