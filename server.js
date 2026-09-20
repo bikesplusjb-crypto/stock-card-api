@@ -10941,6 +10941,44 @@ async function refreshShopInventoryPrices() {
    claiming to be fresh. */
 const HOTCOLD_PACE_MS = 1000;
 
+/* A refusal is not a dead end, it is a worklist entry. The reason is
+   written to the row so the cards needing a basis decision can be
+   listed with one query instead of read out of a log that rotates.
+   Deliberately does NOT touch updated_at -- the page's staleness
+   banner reads that, and a refused card is exactly as old as it was. */
+async function noteRefusal(id, why) {
+  try {
+    if (!supabaseAdmin) return;
+    await supabaseAdmin.from("hot_cold_cards").update({
+      last_refusal:    String(why || "").slice(0, 200),
+      last_refused_at: new Date().toISOString()
+    }).eq("id", id);
+  } catch (e) { /* a note that fails to save must not cost the run */ }
+}
+/* Declared beside the pace constant rather than below the function
+   that reads it. It worked where it was -- the function only runs
+   after module load -- but this file has already lost an afternoon to
+   "Cannot access 'limiter' before initialization" for exactly that
+   shape, and a const that happens to be safe is not a const that is
+   obviously safe. */
+const HOTCOLD_MAX_MOVE_PCT = 60;
+
+/* ── A CARD WHOSE BASIS IS UNKNOWN GETS A STRICTER BAR ────────────
+   60% catches a graded-vs-raw flip on most cards and misses it on
+   some. Simulated against the nine real cases from the bad run, it
+   refuses eight and lets the 2016 XY Evolutions Charizard through at
+   52% -- $116 is the graded copy, $56 the raw one. Written, that would
+   also RECORD price_basis as raw and lock the error in for good, which
+   is worse than the bad number.
+
+   So the bar depends on what is known. Once price_basis is recorded
+   the pool is fixed and a large move is a real move, so 60% stands.
+   While it is null the job is guessing, and a guess should survive
+   only where the new read closely agrees with the stored price -- 25%
+   is loose enough for a quarter of genuine drift and tight enough that
+   a basis flip cannot hide inside it. */
+const HOTCOLD_MAX_MOVE_UNKNOWN_PCT = 25;
+
 async function refreshHotColdPrices() {
   if (!supabaseAdmin) { console.log("[hot-cold] skipped — no Supabase client"); return; }
   const started = Date.now();
@@ -10949,7 +10987,7 @@ async function refreshHotColdPrices() {
   try {
     const { data: rows, error } = await supabaseAdmin
       .from("hot_cold_cards")
-      .select("id, card_name, sport, current_price, prev_price, direction")
+      .select("id, card_name, sport, current_price, prev_price, direction, price_basis, grade_label")
       .eq("is_active", true)
       .order("updated_at", { ascending: true, nullsFirst: true });
 
@@ -10982,21 +11020,38 @@ async function refreshHotColdPrices() {
            percentage on it. */
         if (s.soldContaminated || s.soldLimited || s.soldWideBase || !Number(s.soldCount)) {
           refused++;
-          console.log("[hot-cold] refused " + query + " — " +
-            (s.soldContaminated ? "contaminated" :
-             s.soldLimited ? "limited" :
-             s.soldWideBase ? "wide base pool" : "no sales"));
+          const why = s.soldContaminated ? "contaminated pool"
+                    : s.soldLimited ? "too few clean sales"
+                    : s.soldWideBase ? "sales span more than one card"
+                    : "no completed sales";
+          console.log("[hot-cold] refused " + query + " — " + why);
+          await noteRefusal(row.id, why);
           continue;
         }
 
-        /* WHICH POOL DESCRIBES THIS CARD.
+        /* ── WHICH POOL DESCRIBES THIS CARD ─────────────────────────
 
-           A name carrying PSA/BGS/SGC/CGC is a slab, and its price is
-           the graded median -- reading soldRaw on it would price the
-           ungraded copy of a card nobody on this list owns ungraded.
-           Everything else prefers the base pool when it is deep enough,
-           which is the same choice refreshWatchlistPrices makes. */
-        const wantsGraded = /\b(psa|bgs|sgc|cgc)\b/i.test(query);
+           THE BASIS IS READ, NOT GUESSED, ONCE IT IS KNOWN. The first
+           run inferred it from the card name and got 56 of 60 wrong:
+           the curated prices are graded prices for cards whose names
+           say nothing about grading, so a raw median went over a slab
+           price and every card read as a crash.
+
+           price_basis is now stored per card. Where it is set, it is
+           obeyed -- a card priced graded stays graded, forever, and no
+           amount of raw sales will flip it. Where it is null (every
+           row carried over from the July curation) the name is still
+           the only hint available, and the move guard below is what
+           stands between a wrong hint and a wrong write.
+
+           grade_label goes one step finer: a 2003 Chrome LeBron at
+           $12,344 is a PSA 10, not "graded generally", so the ladder
+           rung is read directly when the label names one. */
+        const knownBasis = String(row.price_basis || "").toLowerCase();
+        const wantsGraded = knownBasis
+          ? knownBasis === "graded"
+          : /\b(psa|bgs|sgc|cgc)\b/i.test(query);
+
         const gradedMed = Number(s.soldGraded && s.soldGraded.median) || 0;
         const gradedN   = Number(s.soldGraded && s.soldGraded.count)  || 0;
         const rawMed    = Number(s.soldRaw && s.soldRaw.median) || 0;
@@ -11004,24 +11059,71 @@ async function refreshHotColdPrices() {
 
         let next = 0, basis = "";
         if (wantsGraded) {
-          if (gradedN >= MIN_GROUP && gradedMed > 0) { next = gradedMed; basis = "graded"; }
+          /* A named grade beats the graded pool: PSA 10 and PSA 8 of
+             the same card are different markets, and averaging them is
+             the same mistake one rung up. */
+          const label = String(row.grade_label || "").trim().toUpperCase();
+          const rung = label && Array.isArray(s.soldGradeBreakdown)
+            ? s.soldGradeBreakdown.find(function (g) {
+                return String(g.grade || "").toUpperCase() === label; })
+            : null;
+          if (rung && Number(rung.median) > 0) { next = Number(rung.median); basis = "graded:" + label; }
+          else if (gradedN >= MIN_GROUP && gradedMed > 0) { next = gradedMed; basis = "graded"; }
         } else if (rawN >= MIN_GROUP && rawMed > 0) {
           next = rawMed; basis = "raw";
-        } else if (Number(s.soldMedian) > 0) {
+        } else if (!knownBasis && Number(s.soldMedian) > 0) {
+          /* Headline is a last resort and only when the basis is
+             unknown. A card KNOWN to be raw must not quietly fall back
+             to a blended median. */
           next = Number(s.soldMedian); basis = "headline";
         }
 
         if (!(next > 0)) {
           refused++;
-          console.log("[hot-cold] refused " + query + " — no usable pool for a " +
-                      (wantsGraded ? "graded" : "raw") + " card");
+          const why = "no usable " + (wantsGraded ? "graded" : "raw") + " pool";
+          console.log("[hot-cold] refused " + query + " — " + why);
+          await noteRefusal(row.id, why);
           continue;
         }
 
         const prev = Number(row.current_price) || 0;
+
+        /* ── A MOVE THIS BIG IS A CHANGE OF BASIS, NOT OF MARKET ─────
+           The guard that should have existed on the first run. Nine
+           cards were repriced and all nine read as an 80-98% collapse,
+           because a graded July price was being compared against a raw
+           September one. No pool was contaminated; the wrong pool was
+           read cleanly.
+
+           So the size of the change is itself evidence. A curated card
+           does not lose 97% of its value between two checks, and if it
+           truly has, that deserves a human look rather than a silent
+           write. Refused, logged, row untouched -- including
+           updated_at, so the page keeps telling the truth about how
+           old the number is. */
+        if (prev > 0) {
+          const movePct = Math.abs((next - prev) / prev) * 100;
+          const bar = knownBasis ? HOTCOLD_MAX_MOVE_PCT : HOTCOLD_MAX_MOVE_UNKNOWN_PCT;
+          if (movePct > bar) {
+            refused++;
+            const why = "move of " + Math.round(movePct) + "% ($" + prev + " -> $" +
+              (Math.round(next * 100) / 100) + ", read as " + basis + ", bar " + bar +
+              "%)" + (knownBasis ? "" : " — set price_basis to confirm which pool is right");
+            console.log("[hot-cold] REFUSED " + query + " — " + why);
+            await noteRefusal(row.id, why);
+            continue;
+          }
+        }
+
         const patch = {
           current_price: Math.round(next * 100) / 100,
-          updated_at:    new Date().toISOString()
+          updated_at:    new Date().toISOString(),
+          /* Recorded so the NEXT run does not have to guess. "graded:PSA 10"
+             collapses to graded here; the rung lives in grade_label. */
+          price_basis:   basis.indexOf("graded") === 0 ? "graded"
+                       : basis === "raw" ? "raw" : null,
+          last_refusal:  null,
+          last_refused_at: null
         };
         /* prev_price only moves when there WAS a real previous price.
            Otherwise the first refresh would invent a 0 to compare
@@ -11056,11 +11158,60 @@ async function refreshHotColdPrices() {
   }
 }
 
-/* 1st of the month, 5:00 AM ET — after the binder refresh (4:00), the
-   shop refresh (4:20), the price alerts (4:30) and the watch alerts
-   (4:45), so the five never contend for the record allowance. */
-cron.schedule("0 5 1 * *", refreshHotColdPrices, { timezone: "America/New_York" });
-console.log("Hot/Cold monthly reprice scheduled for the 1st at 5:00 AM ET");
+/* ── CRON DISABLED, 20 Sept, AFTER THE FIRST RUN WENT WRONG ───────
+
+   This was scheduled for the 1st at 5:00 AM ET. It is not registered
+   any more, deliberately, and the reason is worth keeping:
+
+   The first manual run repriced nine cards and every one of them read
+   as a crash -- Haaland -98%, Julio Rodriguez -97%, Bellinger -97%,
+   LeBron -80%. None was a market move. The curated July prices are
+   GRADED prices for cards whose names do not say "PSA": a 2003 Topps
+   Chrome LeBron RC at $12,344 is a PSA 10, and raw trades near $2,500.
+   The wantsGraded test below keys on the name, only 4 of 60 names
+   carry a grader, so 56 cards were priced off the raw pool and written
+   over a graded number.
+
+   THE REFUSALS DID NOT CATCH IT, AND COULD NOT. Contaminated, limited
+   and wide-base all ask whether the POOL is sound. Every one of those
+   pools was sound. The error was reading the right pool for the wrong
+   question -- clean comps, wrong version -- which is the one failure
+   shape this file has no guard for, and the one that produces
+   confident, well-formed, entirely wrong output.
+
+   TWO THINGS BEFORE THIS RUNS AGAIN:
+
+     1. hot_cold_cards must record what each price IS -- a basis column
+        ('raw' | 'graded') and the grade where graded. Sixty judgement
+        calls, and they belong to whoever curated the list, not to a
+        heuristic reading the name.
+
+     2. The guard below has to exist: refuse to WRITE any card whose
+        new price differs from the stored one by more than
+        HOTCOLD_MAX_MOVE_PCT, and log it for review instead. That one
+        rule would have stopped all nine writes. A move that large
+        between two checks is nearly always a change of basis, not a
+        change of market.
+
+   The function and the manual route are left in place so the guard can
+   be tested by hand. Nothing fires on a schedule. */
+
+/* ── WEEKLY, SUNDAY 5:00 AM ET ───────────────────────────────────
+
+   Re-enabled once the basis was recorded rather than inferred, and
+   once the move guard existed. The two together are what make an
+   unattended run safe: a card whose basis is known is priced from that
+   pool and no other, and a card whose basis is still unknown cannot
+   move more than HOTCOLD_MAX_MOVE_PCT without a human looking first.
+
+   Sunday rather than Monday so the numbers are settled before the
+   weekly digest goes out at 08:00 Monday, and 5:00 so it sits after
+   the binder (4:00), shop (4:20), price alerts (4:30) and watch alerts
+   (4:45) without contending for the record allowance.
+
+   60 cards x 100 records is 6,000 of 50,000 a day, once a week. */
+cron.schedule("0 5 * * 0", refreshHotColdPrices, { timezone: "America/New_York" });
+console.log("Hot/Cold weekly reprice scheduled for Sundays 5:00 AM ET");
 
 /* Manual trigger, same auth as the other jobs. The first run should be
    done by hand rather than waited for: the list is two months stale
