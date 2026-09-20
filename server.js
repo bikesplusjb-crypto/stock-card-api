@@ -89,6 +89,20 @@ function verifyStripeSignature(rawBody, sigHeader, secret) {
   });
 }
 
+/* A stable, non-reversible id for an email address. Lets opens,
+   clicks and cancellations be counted per person without an address
+   ever reaching scan_events. Declared here, beside the other crypto
+   helper, rather than beside its first caller -- a function
+   declaration hoists, but this file has lost an afternoon to
+   read-before-init once already. */
+function anonId(value) {
+  try {
+    return crypto.createHash("sha256")
+      .update(String(value || "").trim().toLowerCase() + "|cg")
+      .digest("hex").slice(0, 12);
+  } catch (e) { return null; }
+}
+
 async function stripeGet(path) {
   if (!STRIPE_SECRET_KEY) {
     console.log("[stripe] STRIPE_SECRET_KEY missing — cannot look up " + path);
@@ -396,7 +410,9 @@ app.post(
         /* Counted so that "active Pro" can be derived from events rather
            than inferred from a pro_users row — which checkPro()'s
            fail-open behaviour makes unreliable as a source of truth. */
-        await logProEvent('subscription_cancelled', email || 'unknown');
+        /* Hashed for the same reason the SendGrid webhook hashes: this
+           lands in scan_events, which is not a place for addresses. */
+        await logProEvent('subscription_cancelled', email ? anonId(email) : 'unknown');
       }
 
       else if (type === "customer.subscription.updated") {
@@ -906,6 +922,24 @@ async function lookupGate(req, res, next) {
 
 app.use(["/api/scan-card", "/api/grade-estimate"], visionGate);
 app.use(["/api/card-market", "/api/card-price", "/api/sold-comps", "/api/buymax"], lookupGate);
+/* ── THE THREE THAT SPENT MONEY WITH NOTHING IN FRONT OF THEM ─────
+
+   Every other endpoint that costs something is behind a gate. These
+   three were not, and /api/set-checklist is the expensive one:
+   buildChecklist pulls CHECKLIST_MAX_PAGES x CHECKLIST_PAGE = 400
+   catalog records per call, against a Builder allowance of 500 A DAY.
+   Two requests from anyone with the URL empties the catalog until
+   midnight -- and the catalog is what verifyAgainstCatalog() and the
+   set-size lookups depend on, so the damage shows up as cards that
+   cannot be verified rather than as an obvious outage.
+
+   /api/set-lookup spends 5 records a call plus a detail fetch, and
+   /api/psa-cert runs a full market + sold lookup per request.
+
+   lookupGate is the right gate: it meters per account when a session
+   is present, per shop for staff, and per connection otherwise, and it
+   never blocks a scan outright. */
+app.use(["/api/set-checklist", "/api/set-lookup", "/api/psa-cert"], lookupGate);
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -6014,7 +6048,32 @@ async function lookupCorrections(ai) {
    Called by the scanner when somebody fixes a read. Fire-and-forget
    from the caller's side -- the correction has already been applied
    locally and the person is not waiting on us to remember it. */
-app.post("/api/correction", async (req, res) => {
+/* ── THE LEARNING LOOP HAD AN OPEN DOOR ──────────────────────────
+
+   record_scan_correction is service-role only at the database, which
+   is right. But /api/correction is an unauthenticated POST that calls
+   it through supabaseAdmin -- so locking the RPC down moved the door,
+   it did not close it. Anyone with the URL could still write
+   corrections, and CORRECTION_MIN_AGREEMENT is 2.
+
+   The endpoint SHOULD stay open: somebody fixing a misread scan is the
+   most useful thing a stranger can do here, and putting an account in
+   front of it would kill the one feature that gets better with
+   traffic. So it is metered rather than authenticated.
+
+   Deliberately generous. Somebody working through a box might correct
+   a dozen cards in ten minutes; nobody legitimately submits sixty.
+   The RPC now also counts DISTINCT SESSIONS, so a single caller can no
+   longer manufacture agreement by repeating itself -- the two together
+   are what make "2 people corrected this" true. */
+const correctionLimiter = makeLimiter("correction", {
+  noun: "corrections",
+  windowMs: 10 * 60 * 1000,
+  windowMax: envNum("LIMIT_CORRECTION_PER_10MIN", 25),
+  dailyMax:  envNum("LIMIT_CORRECTION_PER_DAY", 120)
+});
+
+app.post("/api/correction", correctionLimiter, async (req, res) => {
   try {
     const b = req.body || {};
     const field = String(b.field || "");
@@ -10846,17 +10905,56 @@ async function refreshShopInventoryPrices() {
 
     for (const item of items) {
       try {
-        /* Built from the saved fields when they exist: a shop's
-           card_name is whatever the scanner read, and the separate
-           fields are more reliable than that string. */
-        const parts = [item.year, item.brand, item.set_name, item.card_name,
-                       item.card_number ? "#" + String(item.card_number).replace(/^#/, "") : "", item.parallel]
-          .map(v => String(v || "").trim()).filter(Boolean);
-        const query = (parts.length >= 3 ? parts.join(" ") : String(item.card_name || "")).trim();
+        /* ── THE QUERY WAS COUNTING EVERY TERM TWICE ─────────────────
+
+           This built year + brand + set + card_name + #number +
+           parallel. card_name is what the scanner wrote, and it
+           ALREADY contains the year, the brand and the set -- measured
+           on the live table it averages 6.3 words. Joining the fields
+           in front of it produced roughly twelve words with each one
+           duplicated, and eBay ANDs every word in a title.
+
+           The cost, measured this morning: the 4:20 run checked 69
+           cards and repriced ZERO. Every one was stamped as checked
+           and pushed to the back of the queue, so the shop's prices
+           sat frozen while the log reported a clean run. The 13 Sept
+           measurement in this file predicts exactly that -- a ten-word
+           query is 4% usable and 92% empty.
+
+           So the name is used as it stands, and the structured fields
+           are used the way refreshFallbackSold uses them: to build a
+           proper tier ladder when the name alone finds nothing. Same
+           function, same protections -- a parallel never broadens to a
+           tier without it, a numbered card never loses its print run. */
+        const query = String(item.card_name || "").trim();
         if (!query) { skipped++; continue; }
 
         const market = await getEbayCardMarket(query);
-        const sold   = await getSoldComps(query, market && market.avgPrice);
+        let   sold   = await getSoldComps(query, market && market.avgPrice);
+
+        if (sold && !sold.rateLimited && !soldPoolUsable(sold) && !sold.soldContaminated) {
+          /* refreshFallbackSold needs a player and shop_inventory has
+             no player column -- only card_name. parseCardQuery() is
+             the function that already pulls year, brand, set, player
+             and parallel out of a typed string, and this is the same
+             job. Where it cannot find a name it returns null and the
+             fallback simply does not run, which is the honest outcome:
+             a wrong player name would search for a card nobody owns. */
+          const pq = parseCardQuery(item.card_name) || {};
+          if (pq.player) {
+            const fb = await refreshFallbackSold({
+              card_name:   item.card_name,
+              year:        item.year || pq.year,
+              brand:       item.brand || pq.brand,
+              set_name:    item.set_name || pq.set,
+              player:      pq.player,
+              card_number: item.card_number,
+              parallel:    item.parallel || pq.parallel,
+              sport:       pq.sport
+            }, market);
+            if (fb) sold = fb;
+          }
+        }
 
         if (sold && sold.rateLimited) {
           stopped = true;
@@ -12232,10 +12330,40 @@ app.get("/api/run-weekly-digest", async (req, res) => {
    refinement, not a blocker for having open/click data at all.
 ══════════════════════════════════════════════════════════════ */
 
+/* ── AN OPEN ENDPOINT THAT WROTE WHATEVER IT WAS SENT ────────────
+
+   Two problems, both quiet.
+
+   NOBODY WAS CHECKING WHO SENT IT. Anything could POST an array of
+   fake opens and clicks and they landed in scan_events as real
+   engagement. The numbers that would be poisoned are exactly the ones
+   used to decide whether the email programme is working.
+
+   SendGrid signs its webhook with ECDSA, which is the proper answer
+   and needs the public key from their dashboard. A shared secret on
+   the URL is the smaller version of the same idea and takes one
+   setting: point SendGrid at
+   /api/sendgrid-webhook?key=<SENDGRID_WEBHOOK_KEY>. When the variable
+   is unset the endpoint behaves exactly as before, so nothing breaks
+   on deploy -- it tightens the moment the key is set.
+
+   AND IT STORED EMAIL ADDRESSES. Every open and click wrote the
+   recipient's address into scan_events.card_name -- a table named for
+   card scans, with whatever retention that has. The question this data
+   answers is "are people opening these at all", which needs a stable
+   identifier, not an address. A short hash counts distinct openers
+   without keeping anyone's email. */
+const SENDGRID_WEBHOOK_KEY = process.env.SENDGRID_WEBHOOK_KEY || "";
+
 app.post("/api/sendgrid-webhook", async (req, res) => {
   // Always 200 quickly — SendGrid retries on non-2xx, and a slow or
   // failing analytics write must never cause repeated redelivery.
   res.status(200).send("ok");
+
+  if (SENDGRID_WEBHOOK_KEY && req.query.key !== SENDGRID_WEBHOOK_KEY) {
+    console.log("[sendgrid] webhook rejected — bad or missing key");
+    return;
+  }
 
   if (!supabaseAdmin) return;
   const events = Array.isArray(req.body) ? req.body : [];
@@ -12254,7 +12382,8 @@ app.post("/api/sendgrid-webhook", async (req, res) => {
     try {
       await supabaseAdmin.rpc("log_scan_event", {
         p_event: mapped,
-        p_card_name: ev.email ? String(ev.email).slice(0, 200) : null,
+        /* A hash, not the address. See the note above the route. */
+        p_card_name: ev.email ? anonId(ev.email) : null,
         p_used_back: false,
         p_is_owner: false
       });
