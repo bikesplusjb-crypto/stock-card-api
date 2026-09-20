@@ -11109,10 +11109,10 @@ const HOTCOLD_PACE_MS = 1000;
    listed with one query instead of read out of a log that rotates.
    Deliberately does NOT touch updated_at -- the page's staleness
    banner reads that, and a refused card is exactly as old as it was. */
-async function noteRefusal(id, why) {
+async function noteRefusal(table, id, why) {
   try {
     if (!supabaseAdmin) return;
-    await supabaseAdmin.from("hot_cold_cards").update({
+    await supabaseAdmin.from(table).update({
       last_refusal:    String(why || "").slice(0, 200),
       last_refused_at: new Date().toISOString()
     }).eq("id", id);
@@ -11142,22 +11142,45 @@ const HOTCOLD_MAX_MOVE_PCT = 60;
    a basis flip cannot hide inside it. */
 const HOTCOLD_MAX_MOVE_UNKNOWN_PCT = 25;
 
+/* ── TWO CURATED BOARDS, ONE JOB ─────────────────────────────────
+   hot_cold_cards and pokemon_cards are the same shape and the same
+   problem: a hand-checked list of mostly-graded cards, frozen since
+   July, with no record of which pool each price came from. Pokemon is
+   the harder of the two -- 50 cards averaging $12,764 -- so it needs
+   the basis handling more, not less.
+
+   Kept as one function over a table list rather than copied, because a
+   second copy is how the two quietly stop agreeing about what a
+   refusal means. pokemon_cards has no direction column; that is the
+   only difference and it is handled by the flag below. */
+const CURATED_BOARDS = [
+  { table: "hot_cold_cards", label: "hot-cold", hasDirection: true },
+  { table: "pokemon_cards",  label: "pokemon",  hasDirection: false }
+];
+
 async function refreshHotColdPrices() {
-  if (!supabaseAdmin) { console.log("[hot-cold] skipped — no Supabase client"); return; }
+  for (const board of CURATED_BOARDS) {
+    await refreshCuratedBoard(board);
+  }
+}
+
+async function refreshCuratedBoard(board) {
+  if (!supabaseAdmin) { console.log("[" + board.label + "] skipped — no Supabase client"); return; }
+  const TABLE = board.table, TAG = "[" + board.label + "]";
   const started = Date.now();
   let repriced = 0, refused = 0, failed = 0, stopped = false;
 
   try {
     const { data: rows, error } = await supabaseAdmin
-      .from("hot_cold_cards")
-      .select("id, card_name, sport, current_price, prev_price, direction, price_basis, grade_label")
+      .from(TABLE)
+      .select("id, card_name, current_price, prev_price, price_basis, grade_label")
       .eq("is_active", true)
       .order("updated_at", { ascending: true, nullsFirst: true });
 
-    if (error) { console.error("[hot-cold] fetch error:", error.message); return; }
-    if (!rows || !rows.length) { console.log("[hot-cold] nothing to refresh"); return; }
+    if (error) { console.error(TAG + " fetch error:", error.message); return; }
+    if (!rows || !rows.length) { console.log(TAG + " nothing to refresh"); return; }
 
-    console.log("[hot-cold] repricing " + rows.length + " cards…");
+    console.log(TAG + " repricing " + rows.length + " cards…");
 
     for (const row of rows) {
       try {
@@ -11169,26 +11192,47 @@ async function refreshHotColdPrices() {
 
         if (sold && sold.rateLimited) {
           stopped = true;
-          console.log("[hot-cold] daily allowance reached — stopping early");
+          console.log(TAG + " daily allowance reached — stopping early");
           break;
         }
 
         const s = sold || {};
 
-        /* Every refusal the scanner makes, made here too. soldWideBase
-           is included -- unlike the nightly binder refresh -- for the
-           same reason the email alerts include it: this number is
-           published as a MOVE, and a move computed between two medians
-           of a pool that spans several cards is noise with a
-           percentage on it. */
-        if (s.soldContaminated || s.soldLimited || s.soldWideBase || !Number(s.soldCount)) {
+        /* ── HOW OFTEN IT TRADES IS RECORDED EITHER WAY ─────────────
+
+           computeLiquidity() has run on scans and typed lookups since
+           18 Sept and nothing on these boards used it -- yet liquidity
+           is what this page is really about. Measured across the 60
+           active rows: 31 cards sell 10+ times a month and reprice
+           cleanly, 23 sell twice a month or less, and the 7 that
+           barely trade average $15,187.
+
+           No pricing logic fixes the second group. They are cards that
+           do not change hands weekly, and the honest thing a page can
+           do is say so -- "sold 0 times in 30 days" beats an
+           unexplained date from July.
+
+           Written BEFORE any refusal, because the sale count is
+           observed even when no price can be published, and it is the
+           reason for most refusals. Its own timestamp, because knowing
+           how often a card trades is not the same as having a current
+           price for it. */
+        try {
+          const liq = computeLiquidity(market, s);
+          await supabaseAdmin.from(TABLE).update({
+            sold_30d:   Number(s.soldCount) || 0,
+            listed_now: Number(market && market.listingCount) || 0,
+            liquidity_checked_at: new Date().toISOString()
+          }).eq("id", row.id);
+          if (liq && liq.known) {
+            console.log(TAG + " liquidity " + query + " — " + liq.plain);
+          }
+        } catch (e) { /* never let a note cost the run */ }
+
+        if (!Number(s.soldCount)) {
           refused++;
-          const why = s.soldContaminated ? "contaminated pool"
-                    : s.soldLimited ? "too few clean sales"
-                    : s.soldWideBase ? "sales span more than one card"
-                    : "no completed sales";
-          console.log("[hot-cold] refused " + query + " — " + why);
-          await noteRefusal(row.id, why);
+          console.log(TAG + " refused " + query + " — no completed sales");
+          await noteRefusal(TABLE, row.id, "no completed sales");
           continue;
         }
 
@@ -11234,6 +11278,30 @@ async function refreshHotColdPrices() {
           else if (gradedN >= MIN_GROUP && gradedMed > 0) { next = gradedMed; basis = "graded"; }
         } else if (rawN >= MIN_GROUP && rawMed > 0) {
           next = rawMed; basis = "raw";
+        } else if (!knownBasis && gradedN >= MIN_GROUP && gradedMed > 0) {
+          /* ── BOTH MARKETS EXIST. THAT IS NOT CONTAMINATION. ────────
+
+             35 of the 60 cards refused on 20 Sept HAD three or more
+             clean sales. They were turned away as "contaminated" or
+             "sales span more than one card" -- flags that fire because
+             the raw pool and the graded pool are BOTH healthy and sit
+             an order of magnitude apart. A 1996 Topps Chrome Kobe RC
+             with 7 raw sales and 18 slabbed ones is not a poisoned
+             read; it is a card that trades in two forms, which is the
+             normal state of every vintage rookie on this list.
+
+             The engine is right to refuse to blend them into one
+             number. It is wrong to conclude there is no number. When
+             the raw pool is too thin to stand on but the graded pool
+             is deep, the graded pool is the honest read -- and the
+             card is recorded as graded, so the next run stops
+             guessing.
+
+             Deliberately only where the basis is UNKNOWN. A card
+             recorded as raw must never drift to graded because raw
+             sales dried up for a month; that is a change of market
+             being silently relabelled as a change of basis. */
+          next = gradedMed; basis = "graded";
         } else if (!knownBasis && Number(s.soldMedian) > 0) {
           /* Headline is a last resort and only when the basis is
              unknown. A card KNOWN to be raw must not quietly fall back
@@ -11244,9 +11312,50 @@ async function refreshHotColdPrices() {
         if (!(next > 0)) {
           refused++;
           const why = "no usable " + (wantsGraded ? "graded" : "raw") + " pool";
-          console.log("[hot-cold] refused " + query + " — " + why);
-          await noteRefusal(row.id, why);
+          console.log(TAG + " refused " + query + " — " + why);
+          await noteRefusal(TABLE, row.id, why);
           continue;
+        }
+
+        /* ── THE REFUSAL FLAGS DESCRIBE THE RAW POOL, NOT THE CARD ───
+
+           soldContaminated, soldLimited and soldWideBase are all
+           computed inside summarizeSold from the BASE pool: whether
+           the ungraded sales are mixed, too few, or span several
+           cards. That is the right question for a raw card and the
+           wrong one for a slab, which has no raw sales at all by
+           definition.
+
+           Checking them before working out the basis refused every
+           graded card on a fact about a pool it does not use. Read off
+           the 20 Sept run: a 1989 Upper Deck Griffey RC PSA 9 came
+           back with 23 sales, ALL PSA 9, median $464, contaminated
+           false, wide false, ladder clean -- and was refused as "too
+           few clean sales" because the raw pool it never consulted
+           held zero. Twenty cards averaging $5,518 landed in that
+           bucket, most of them slabs judged by a raw-card test.
+
+           So the guard now runs after the basis is known, and only
+           where it applies. A graded read is already narrow -- one
+           grader, one grade, off the ladder -- and the pool it is
+           taken from has its own count check above. */
+        if (basis === "headline") {
+          /* A blended median is the only read these flags genuinely
+             describe, because it is the only one computed across the
+             whole pool. A "raw" read is soldRaw.median -- already the
+             base pool after CompGuard, already MIN_GROUP deep by the
+             branch above -- so refusing it because the WIDER pool also
+             contains slabs would throw away the clean number on the
+             evidence of the dirty one. */
+          if (s.soldContaminated || s.soldLimited || s.soldWideBase) {
+            refused++;
+            const why = s.soldContaminated ? "contaminated pool"
+                      : s.soldLimited ? "too few clean sales"
+                      : "sales span more than one card";
+            console.log(TAG + " refused " + query + " — " + why);
+            await noteRefusal(TABLE, row.id, why);
+            continue;
+          }
         }
 
         const prev = Number(row.current_price) || 0;
@@ -11272,8 +11381,8 @@ async function refreshHotColdPrices() {
             const why = "move of " + Math.round(movePct) + "% ($" + prev + " -> $" +
               (Math.round(next * 100) / 100) + ", read as " + basis + ", bar " + bar +
               "%)" + (knownBasis ? "" : " — set price_basis to confirm which pool is right");
-            console.log("[hot-cold] REFUSED " + query + " — " + why);
-            await noteRefusal(row.id, why);
+            console.log(TAG + " REFUSED " + query + " — " + why);
+            await noteRefusal(TABLE, row.id, why);
             continue;
           }
         }
@@ -11295,29 +11404,30 @@ async function refreshHotColdPrices() {
           patch.prev_price = prev;
           const pct = ((next - prev) / prev) * 100;
           patch.pct_change = Math.round(pct * 100) / 100;
-          patch.direction  = pct >= 0 ? "hot" : "cold";
+          /* pokemon_cards has no direction column. */
+          if (board.hasDirection) patch.direction = pct >= 0 ? "hot" : "cold";
         }
 
         const { error: upErr } = await supabaseAdmin
-          .from("hot_cold_cards").update(patch).eq("id", row.id);
-        if (upErr) { failed++; console.error("[hot-cold] update failed " + row.id + ":", upErr.message); }
+          .from(TABLE).update(patch).eq("id", row.id);
+        if (upErr) { failed++; console.error(TAG + " update failed " + row.id + ":", upErr.message); }
         else {
           repriced++;
-          console.log("[hot-cold] " + query + " $" + prev + " -> $" + patch.current_price +
+          console.log(TAG + " " + query + " $" + prev + " -> $" + patch.current_price +
                       " (" + basis + (patch.pct_change != null ? ", " + patch.pct_change + "%" : ", first price") + ")");
         }
       } catch (e) {
         failed++;
-        console.error("[hot-cold] error on " + row.id + ":", e.message);
+        console.error(TAG + " error on " + row.id + ":", e.message);
       }
       await new Promise(r => setTimeout(r, HOTCOLD_PACE_MS));
     }
 
-    console.log("[hot-cold] done. repriced=" + repriced + " refused=" + refused +
+    console.log(TAG + " done. repriced=" + repriced + " refused=" + refused +
                 " failed=" + failed + (stopped ? " STOPPED-ON-BUDGET" : "") +
                 " elapsed=" + Math.round((Date.now() - started) / 1000) + "s");
   } catch (e) {
-    console.error("[hot-cold] fatal:", e.message);
+    console.error(TAG + " fatal:", e.message);
   }
 }
 
