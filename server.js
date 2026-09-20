@@ -7976,6 +7976,24 @@ app.post(
                " glr" + (cq.glare == null ? "-" : cq.glare) +
                " res" + (cq.res || "-") +
                (cq.cam ? " cam:" + String(cq.cam).slice(0, 28) : "")) : "") +
+        /* ── THE MEASUREMENT, NEXT TO THE ANSWER IT DID NOT SET ──────
+           GradeFrame now sends the mat's own centring figures (see
+           matMeasure in gradeframe.js). They deliberately do NOT feed
+           the grade -- a phone over a printed square is not a 600dpi
+           scan -- but they are the only measured centring the camera
+           path produces, and printing them beside the range this
+           pre-screen actually returned is what makes the question
+           answerable later: does the mat agree with the model, and does
+           it agree with the flatbed?
+
+           Without this the mat is a feature that tells the person a
+           number and tells us nothing. */
+        ((cq && cq.matMeasure)
+          ? (" | MAT " + cq.matMeasure.leftRight + " lr, " + cq.matMeasure.topBottom + " tb"
+             + " worst" + cq.matMeasure.worst
+             + (cq.matMeasure.reliable === false ? " THIN" : "")
+             + " @" + cq.matMeasure.pxPerMm + "px/mm")
+          : (cq && cq.mat ? " | mat:" + cq.mat : "")) +
         " | back=" + (back ? "yes" : "no") +
         " | range=" + low + "-" + high +
         " | conf=" + confidence +
