@@ -6063,7 +6063,7 @@ async function matchLocalIdentity(ai, extras) {
     if (r.error) { console.log("[identity] local match failed: " + r.error.message); return null; }
     const d = r.data || {};
     const b = d.best || null;
-    return {
+    const out = {
       band:        d.band || "none",
       seenBefore:  Number(d.seen_before) || 0,
       candidates:  Array.isArray(d.candidates) ? d.candidates.length : 0,
@@ -6073,6 +6073,30 @@ async function matchLocalIdentity(ai, extras) {
         score: b.score, evidence: b.evidence || [], image_url: b.image_url || null
       } : null
     };
+    /* THE SURE CHECKLIST ROW, EVEN WHEN IT IS NOT "best" (21 Sept).
+
+       Live, the second scan of a PFL 030 Yamper came back with best =
+       our own confirmed card (score 85) and the TCGdex row for the same
+       card tied at 85 behind it. The local-first test only looked at
+       best, saw an owned card with no set name, and ran the catalog path
+       -- so the first scan of a card taught the system something and the
+       second scan ignored it.
+
+       sureRef is the one reference row carrying all three pieces of
+       evidence, scoring at least as high as best. Two such rows means
+       the checklist itself can't tell them apart, so there is none.
+       Non-enumerable: internal to the scan handler, never serialised, so
+       identityMatch in the response is unchanged. */
+    const sure = (Array.isArray(d.candidates) ? d.candidates : []).filter(c => c
+      && c.source === "tcgdex" && !c.card_id && Array.isArray(c.evidence)
+      && c.evidence.indexOf("number in set") >= 0 && c.evidence.indexOf("name matches") >= 0
+      && c.evidence.indexOf("year and set") >= 0
+      && Number(c.score) >= Number((b && b.score) || 0));
+    Object.defineProperty(out, "sureRef", { enumerable: false, value: sure.length === 1 ? {
+      source: sure[0].source, id: sure[0].id, card_id: null, set_name: sure[0].set_name,
+      set_code: sure[0].set_code, card_number: sure[0].card_number, evidence: sure[0].evidence
+    } : null });
+    return out;
   } catch (e) {
     return null;
   }
@@ -6507,7 +6531,7 @@ app.post(
           copyrightYear: yearFromLine,
           alias:         buildDisplayName(ai)
         });
-        const lb = localEarly && localEarly.best;
+        const lb = (localEarly && localEarly.sureRef) || (localEarly && localEarly.best);
         const ev = (lb && lb.evidence) || [];
         localSure = !!(lb && !lb.card_id && lb.source === "tcgdex"
                        && ev.indexOf("number in set") >= 0
@@ -6695,8 +6719,41 @@ app.post(
           if (unique.length) {
             const results = await Promise.all(unique.map(t =>
               getSoldComps(t.query, market.avgPrice, false, wantFresh).catch(() => null)));
+            /* ── "PRECISE" MUST NEVER MEAN LESS OF THE CARD (21 Sept) ──
+
+               Seen live today, twice: a 2021 Panini Luka Doncic Holo
+               Parallel 052/149 searched "2021 Panini Luka Doncic /149",
+               and this block swapped it for set-noNum "2021 Panini Luka
+               Doncic" -- 33 sales of every Doncic Panini printed that year
+               -- and published $6 against a $30 ask. set-noNum never
+               carries the serial or the parallel, so on a numbered card
+               it is the base pool the broadening ladder already refuses
+               (see "A NUMBERED CARD IS NOT THE BASE CARD" below).
+
+               So two of the ladder's rules now apply here too:
+                 - a card with a print run only takes a tier that keeps it;
+                 - a trusted parallel the current search carries is never
+                   dropped in favour of a query without it.
+               A contaminated precise tier is still adopted, as before: it
+               carries its refusal with it, and skipping it would let the
+               wider listing-tier pool publish a price the narrower search
+               had already said the sales can't support. */
+            const serialWanted = serialDenominator(ai);
+            const parRawP = cleanVal(ai.parallel);
+            const parWanted = (parRawP && !GENERIC_SET.test(parRawP) && parallelIsTrustworthy(ai))
+              ? parRawP.toLowerCase() : "";
+            const curQ = String(searchQuery || "").toLowerCase();
             for (let i = 0; i < unique.length; i++) {
               const r = results[i];
+              const q = String(unique[i].query || "");
+              if (serialWanted && q.indexOf(serialWanted) < 0) {
+                console.log("[sold-precise] " + unique[i].tier + " \"" + q + "\" skipped: drops print run " + serialWanted);
+                continue;
+              }
+              if (parWanted && curQ.indexOf(parWanted) >= 0 && q.toLowerCase().indexOf(parWanted) < 0) {
+                console.log("[sold-precise] " + unique[i].tier + " \"" + q + "\" skipped: drops parallel " + parRawP);
+                continue;
+              }
               if (r && !r.rateLimited && Number(r.soldCount) >= SOLD_PRECISE_MIN
                   && Number(r.soldMedian) > 0) {
                 console.log("[sold-precise] " + unique[i].tier + " \"" + unique[i].query + "\" "
