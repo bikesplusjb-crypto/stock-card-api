@@ -11206,13 +11206,36 @@ const CURATED_BOARDS = [
   { table: "pokemon_cards",  label: "pokemon",  hasDirection: false, history: "pokemon" }
 ];
 
-async function refreshHotColdPrices() {
-  for (const board of CURATED_BOARDS) {
-    await refreshCuratedBoard(board);
+/* One run at a time. The weekly job, the daily chart run and a manual
+   trigger can otherwise overlap and race the same rows. */
+let curatedRunning = false;
+
+async function refreshHotColdPrices(opts) {
+  if (curatedRunning) { console.log("[curated] already running — skipped"); return; }
+  curatedRunning = true;
+  try {
+    for (const board of CURATED_BOARDS) {
+      await refreshCuratedBoard(board, opts || {});
+    }
+  } finally {
+    curatedRunning = false;
   }
 }
 
-async function refreshCuratedBoard(board) {
+/* opts.historyOnly -- the DAILY chart run.
+
+   Same pricing, same basis selection, same refusals and the same move
+   guard as the weekly job. The only difference is the last step: it
+   records a chart point and does NOT write the board's price.
+
+   That separation is the whole point. The board shows "change since
+   last check", and that number is only meaningful if the check is the
+   weekly one. A daily run writing the board would make the change a
+   one-day figure and, through the three-day anchor, freeze the baseline
+   so it never rolled forward at all. So the board moves weekly, and
+   the chart gets a point every day. */
+async function refreshCuratedBoard(board, opts) {
+  opts = opts || {};
   if (!supabaseAdmin) { console.log("[" + board.label + "] skipped — no Supabase client"); return; }
   const TABLE = board.table, TAG = "[" + board.label + "]";
   const started = Date.now();
@@ -11476,8 +11499,11 @@ async function refreshCuratedBoard(board) {
           if (board.hasDirection) patch.direction = pct >= 0 ? "hot" : "cold";
         }
 
-        const { error: upErr } = await supabaseAdmin
-          .from(TABLE).update(patch).eq("id", row.id);
+        let upErr = null;
+        if (!opts.historyOnly) {
+          const r = await supabaseAdmin.from(TABLE).update(patch).eq("id", row.id);
+          upErr = r.error;
+        }
         if (upErr) { failed++; console.error(TAG + " update failed " + row.id + ":", upErr.message); }
         else {
           repriced++;
@@ -11499,7 +11525,7 @@ async function refreshCuratedBoard(board) {
               price:    patch.current_price,
               basis:    patch.price_basis || null,
               sold_30d: Number(s.soldCount) || null,
-              source:   "weekly"
+              source:   opts.historyOnly ? "daily" : "weekly"
             }, { onConflict: "board,card_id,day" });
             if (hErr) console.log(TAG + " history write failed for " + row.id + ": " + hErr.message);
           } catch (e) { /* never let the chart cost a price */ }
@@ -11573,7 +11599,20 @@ async function refreshCuratedBoard(board) {
    (4:45) without contending for the record allowance.
 
    60 cards x 100 records is 6,000 of 50,000 a day, once a week. */
-cron.schedule("0 5 * * 0", refreshHotColdPrices, { timezone: "America/New_York" });
+cron.schedule("0 5 * * 0", function () { refreshHotColdPrices(); }, { timezone: "America/New_York" });
+
+/* DAILY CHART POINTS, Monday to Saturday.
+
+   Sunday is covered by the weekly run, which records its own point. On
+   the other six days this prices every card for the chart only -- see
+   opts.historyOnly -- so a card that trades reaches the four points the
+   chart needs in about four days instead of three weeks.
+
+   About 105 cards x 100 records = 10,500 of the 50,000 daily allowance.
+   05:30 ET sits after every other job (04:00-05:00). */
+cron.schedule("30 5 * * 1-6", function () { refreshHotColdPrices({ historyOnly: true }); },
+              { timezone: "America/New_York" });
+console.log("Curated boards: chart points daily Mon-Sat 5:30 AM ET");
 console.log("Hot/Cold weekly reprice scheduled for Sundays 5:00 AM ET");
 
 /* Manual trigger, same auth as the other jobs. The first run should be
