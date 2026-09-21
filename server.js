@@ -3490,6 +3490,9 @@ const CARDAPI_LIMIT_COMPACT = Number(process.env.CARDAPI_LIMIT_COMPACT || 50);
    the ones that were failing silently. Not bumping is the mistake this
    constant has now recorded five times. */
 const SOLD_LOGIC_VERSION = 11;
+/* Fewest sales a precise tier needs before it is preferred over the
+   broadened pool the listing search landed on. See [sold-precise]. */
+const SOLD_PRECISE_MIN = 3;
 
 /* The cache key must carry the limit. Without it a 50-record compact pull
    gets stored under the same key as a full lookup and is then served back
@@ -6314,6 +6317,64 @@ app.post(
         + " frontKB=" + Math.round((front && front.size ? front.size : 0) / 1024)
         + " backKB=" + Math.round((back && back.size ? back.size : 0) / 1024));
       let soldQuery = searchQuery;
+
+      /* ── SOLD SEARCH STARTS FROM THE CARD, NOT FROM THE ASK (21 Sept) ──
+
+         The sold lookup above used market.searchQuery -- the query the
+         ACTIVE-listing search settled on. That search broadens whenever
+         fewer than four copies happen to be listed right now, which is
+         normal for a new insert, a parallel or a numbered card. So the
+         sold lookup inherited a broadening it never needed, and priced
+         the card off a pool that mixed other cards:
+
+           2026 Panini Monopoly Prizm World Cup Messi Blue Parallel
+             sold_query = "2026 Panini Lionel Messi"      wide_base = true
+           2025 Topps Chrome All-Etch Ohtani #CAE-1
+             sold_query = "2025 Topps Chrome All-Etch Shohei Ohtani"
+                                                          wide_base = true
+
+         How many are listed today says nothing about how many SOLD in the
+         last 30 days. So when the listing search broadened, the precise
+         tiers are asked for sold comps directly -- tight first, then the
+         serial tier, then same-set-no-number, then same-set-no-grade --
+         and the first with at least SOLD_PRECISE_MIN real sales wins.
+         Only if none of them has enough does the broadened pool stand.
+
+         Asked in parallel, so the wait is one lookup, not four. Only runs
+         when the listing search left the tight tier, so a card with
+         plenty of listings costs nothing extra. Record usage runs ~2% of
+         the daily allowance; this is not the place to economise. */
+      try {
+        const listTier = String(market.tierUsed || "");
+        if (listTier.indexOf("tight") !== 0) {
+          const order = ["tight", "serial", "set-noNum", "set-noGrade"];
+          const tiersAll = buildQueryTiers(ai);
+          const precise = order
+            .map(name => tiersAll.find(t => t.tier === name))
+            .filter(t => t && t.query && t.query !== searchQuery);
+          const seen = {};
+          const unique = precise.filter(t => (seen[t.query] ? false : (seen[t.query] = true)));
+          if (unique.length) {
+            const results = await Promise.all(unique.map(t =>
+              getSoldComps(t.query, market.avgPrice, false, wantFresh).catch(() => null)));
+            for (let i = 0; i < unique.length; i++) {
+              const r = results[i];
+              if (r && !r.rateLimited && Number(r.soldCount) >= SOLD_PRECISE_MIN
+                  && Number(r.soldMedian) > 0) {
+                console.log("[sold-precise] " + unique[i].tier + " \"" + unique[i].query + "\" "
+                  + r.soldCount + " sales, used instead of \"" + searchQuery + "\" (listings tier "
+                  + listTier + ")");
+                sold      = r;
+                soldQuery = unique[i].query;
+                sold.soldPreciseTier = unique[i].tier;
+                break;
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.log("[sold-precise] skipped: " + (e && e.message));
+      }
 
       /* See detectListingYear() above. Only fires when the sold lookup
          as-read came back empty, which is exactly the signature a bad
