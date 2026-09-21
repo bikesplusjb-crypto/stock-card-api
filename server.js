@@ -1036,10 +1036,59 @@ app.get("/api/affiliate-test", (req, res) => {
    occurrence is diagnosable rather than mysterious. */
 const OPENAI_OK_MIME = /^image\/(jpeg|png|gif|webp)$/i;
 
+/* ── READ THE FORMAT FROM THE BYTES, NOT THE LABEL (22 Sept) ─────────
+
+   The note above describes a relabel, and a relabel is not a conversion:
+   a HEIC renamed image/jpeg is still HEIC, OpenAI still refuses it, and
+   the person still gets a generic failure. The audit called that out.
+
+   What the file actually is can be read off its first bytes, no library
+   needed. That gives two real fixes:
+     - a file the browser mislabelled (octet-stream, blank, wrong type)
+       but that IS jpeg/png/gif/webp now goes up with its true type;
+     - a HEIC/HEIF/AVIF is refused BEFORE the vision call with a sentence
+       the person can act on (see imageFormatProblem), instead of spending
+       a vision call to fail.
+   The scanner still converts HEIC in Safari first; this is for everything
+   that gets past it (Chrome/Android picking an iPhone photo, cached older
+   builds, direct API calls). */
+function sniffImageType(buf) {
+  if (!buf || buf.length < 12) return "";
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return "image/jpeg";
+  if (buf[0] === 0x89 && buf.toString("ascii", 1, 4) === "PNG") return "image/png";
+  if (buf.toString("ascii", 0, 4) === "GIF8") return "image/gif";
+  if (buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") return "image/webp";
+  if (buf.toString("ascii", 4, 8) === "ftyp") {
+    const brand = buf.toString("ascii", 8, 12).toLowerCase();
+    if (/^(heic|heix|hevc|hevx|heim|heis|mif1|msf1)$/.test(brand)) return "image/heic";
+    if (/^(avif|avis)$/.test(brand)) return "image/avif";
+  }
+  return "";
+}
+
+/* null when the files can go to the vision model; otherwise the message
+   to show. Only refuses what is KNOWN to fail -- an unrecognised header
+   still goes through as before, so nothing that works today stops. */
+function imageFormatProblem(files) {
+  for (const file of files) {
+    if (!file || !file.buffer) continue;
+    const t = sniffImageType(file.buffer);
+    if (t === "image/heic" || t === "image/avif") {
+      console.log("[scan] refused " + t + " upload (" + (file.originalname || "unnamed") + ", labelled " +
+                  (file.mimetype || "none") + ")");
+      return "That photo is in the iPhone HEIC format, which the scanner can't read here. " +
+             "Take the photo with the camera button instead of picking it from your library, " +
+             "or on iPhone set Settings > Camera > Formats to \"Most Compatible\".";
+    }
+  }
+  return null;
+}
+
 function fileToDataUrl(file) {
-  let mime = file.mimetype || "image/jpeg";
+  const sniffed = sniffImageType(file.buffer);
+  let mime = OPENAI_OK_MIME.test(sniffed) ? sniffed : (file.mimetype || "image/jpeg");
   if (!OPENAI_OK_MIME.test(mime)) {
-    console.log("[scan] unsupported image type from client: " + mime +
+    console.log("[scan] unrecognised image type from client: " + mime +
                 " (" + (file.originalname || "unnamed") + ") — sending as jpeg");
     mime = "image/jpeg";
   }
@@ -4439,42 +4488,51 @@ function soldSummaryForLog(sold) {
   };
 }
 
-/* ── CROSSWALK + CONFIRMATION (21 Sept) ─────────────────────────────
+/* ── CROSSWALK + CONFIRMATION (21 Sept, narrowed 22 Sept) ────────────
 
-   After a scan has been filed under a CardGauge card_id:
+   After a scan has been filed under a CardGauge card_id, the TheCardAPI
+   catalog id it matched goes into card_external_ids (their terms: delete
+   within 30 days of cancelling, hence licensed=true).
 
-   - the TheCardAPI catalog id it matched goes into card_external_ids,
-     flagged licensed (their terms: delete within 30 days of cancelling);
-   - a strong match in ref_cards (TCGdex / CardLists, MIT) goes in too,
-     not licensed;
-   - the card is marked CONFIRMED only when something other than the
-     model agreed with it: the catalog found the number AND the player
-     (verification high), or the open checklist scored 85+.
+   WHAT THIS NO LONGER DOES, AND WHY (audit, 21 Sept).
+
+   The first version also linked the best TCGdex / CardLists checklist row
+   and marked the card CONFIRMED whenever that row scored 85+. A score of
+   85 is number + name + year + copyright year. It never compares the
+   parallel, the variation or the insert, and a blank set counted as a
+   set match -- so a Blue /149 could be "confirmed" off the base
+   checklist row, and that confirmation then counted as evidence for
+   every later scan. A fuzzy rank is a way to ORDER candidates, not proof
+   of which card is in the photo. Checklist rows stay a lookup reference;
+   nothing here promotes them.
+
+   A card is confirmed only when the catalog found this number and player
+   in this set (verification "high") AND the card carries nothing the
+   catalog check cannot see: no parallel, no insert, no print run. A
+   catalog hit for #95 says nothing about whether this copy is the Blue
+   one, so a variant card stays observed until a person confirms it.
 
    Only confirmed cards count as evidence for later scans (see
    cg_match_identity), so a misread cannot confirm itself. Never throws. */
-async function linkCardEvidence(cardId, verification, identityMatch) {
+async function linkCardEvidence(cardId, verification, ai) {
   try {
     if (!supabaseAdmin || !cardId) return;
-    const links = [];
     const v = verification || {};
-    if (v.checked && v.exists === true && v.ucid) {
-      links.push({ card_id: cardId, source: "thecardapi", external_id: String(v.ucid), licensed: true,
-                   last_verified: new Date().toISOString() });
-    }
-    const b = identityMatch && identityMatch.best;
-    const strongRef = !!(b && !b.card_id && Number(b.score) >= 85 && b.id);
-    if (strongRef) {
-      links.push({ card_id: cardId, source: String(b.source || "ref"), external_id: String(b.id).slice(0, 200),
-                   external_url: b.image_url || null, licensed: false, last_verified: new Date().toISOString() });
-    }
-    if (links.length) {
-      const { error } = await supabaseAdmin.from("card_external_ids")
-        .upsert(links, { onConflict: "source,external_id", ignoreDuplicates: true });
+    /* High only: a "low" catalog answer is a near miss, and linking its id
+       would record a guess as this card's TheCardAPI identity. */
+    if (v.checked && v.exists === true && v.confidence === "high" && v.ucid) {
+      const { error } = await supabaseAdmin.from("card_external_ids").upsert([{
+        card_id: cardId, source: "thecardapi", external_id: String(v.ucid), licensed: true,
+        last_verified: new Date().toISOString() }], { onConflict: "source,external_id", ignoreDuplicates: true });
       if (error) console.log("[data] crosswalk write failed: " + error.message);
     }
-    const catalogSure = v.checked && v.exists === true && v.confidence === "high";
-    if (catalogSure || strongRef) {
+    const a = ai || {};
+    const variant = !!(cleanVal(a.parallel) && !GENERIC_SET.test(cleanVal(a.parallel)))
+                 || !!(cleanVal(a.insert) && !GENERIC_SET.test(cleanVal(a.insert)))
+                 || !!cleanVal(a.insertName) || !!serialDenominator(a);
+    const catalogSure = v.checked && v.exists === true && v.confidence === "high"
+                     && v.source !== "reference";
+    if (catalogSure && !variant) {
       await supabaseAdmin.from("cards").update({ status: "confirmed" })
         .eq("card_id", cardId).eq("status", "observed");
     }
@@ -4487,7 +4545,7 @@ async function logScanRead(x) {
     const ai = x.ai || {};
     const ident = identityFromAi(ai, x.surface, [x.soldQuery, x.searchQuery]);
     const cardId = ident ? await recordCard(ident) : null;
-    if (cardId) await linkCardEvidence(cardId, x.verification, x.identityMatch);
+    if (cardId) await linkCardEvidence(cardId, x.verification, ai);
     const sum = soldSummaryForLog(x.sold);
     const final = {};
     ["year", "brand", "set", "insertName", "player", "cardNumber", "parallel", "parallelEvidence",
@@ -6053,6 +6111,10 @@ async function matchLocalIdentity(ai, extras) {
     language:    /^(jap|jpn)/i.test(cleanVal(ai.language)) ? "ja" : "en",
     copyright_year:     x.copyrightYear || "",
     parallel_confirmed: !!x.parallelConfirmed,
+    /* The variant as read, so an owned card is only a candidate for a
+       scan of the SAME variant -- see cg_match_identity (22 Sept). */
+    parallel:    (cleanVal(ai.parallel) && !GENERIC_SET.test(cleanVal(ai.parallel))) ? cleanVal(ai.parallel) : "",
+    serial:      serialDenominator(ai) || "",
     alias:       x.alias || ""
   };
   try {
@@ -6360,6 +6422,13 @@ app.post(
       const backStrip = req.files?.backStrip?.[0] || null;
 
       if (!front) return res.status(400).json({ success: false, error: "Front image required" });
+      /* Refuse a format the vision model cannot read before paying for
+         the call -- see imageFormatProblem. 415 with the same
+         { success:false, error } shape the scanner already displays. */
+      const formatProblem = imageFormatProblem([front, back, backStrip]);
+      if (formatProblem) {
+        return res.status(415).json({ success: false, error: formatProblem, code: "unsupported_image_format" });
+      }
 
       /* WHERE THE THIRTEEN SECONDS GO.
 
@@ -6646,13 +6715,28 @@ app.post(
          check that usually passes; in parallel it is nearly free in
          wall-clock time and the result is ready when the response is
          assembled. */
-      /* A sure local match IS the verification -- see localSure above.
-         Same shape verifyAgainstCatalog returns, so every reader of
-         `verified` (the badge, the warning, scan_reads) works unchanged. */
+      /* A CHECKLIST MATCH IS A REFERENCE, NOT A VERIFICATION (22 Sept).
+
+         The first version returned checked/exists/confidence "high" here,
+         which the page shows as "Confirmed in the card catalog" and the
+         identity label counts as independent confirmation. It is neither:
+         TCGdex saying card 030 of Phantasmal Flames is a Yamper says the
+         card EXISTS. It does not say the photo is that card, and it says
+         nothing about reverse holo or any other print variant.
+
+         So when the catalog call is skipped, `verified` says exactly that:
+         not checked, with a note naming the checklist row. Same shape as
+         verifyAgainstCatalog's "could not ask" answer, so the page renders
+         "Card catalog: not checked -- ..." and nothing reads it as proof. */
+      const localRef = localSure && localEarly
+        ? (localEarly.sureRef || localEarly.best) : null;
       const verifyPromise = localSure
         ? Promise.resolve({
-            checked: true, exists: true, confidence: "high", ucid: null,
-            note: "", yearCorrected: null, candidates: [], source: "cardgauge"
+            checked: false, exists: null, confidence: null, ucid: null,
+            note: "matched the TCGdex checklist" +
+                  (localRef ? " (" + [localRef.set_name, localRef.card_number].filter(Boolean).join(" ") + ")" : "") +
+                  " -- a reference, not a check of this copy",
+            yearCorrected: null, candidates: [], source: "reference"
           })
         : verifyAgainstCatalog(ai);
       /* Report-only -- see matchLocalIdentity. Runs alongside the
@@ -8324,6 +8408,10 @@ app.post(
       const front = (req.files && req.files.front && req.files.front[0]) || null;
       const back  = (req.files && req.files.back  && req.files.back[0])  || null;
       if (!front) return res.status(400).json({ success: false, error: "Front image required" });
+      const formatProblem = imageFormatProblem([front, back]);
+      if (formatProblem) {
+        return res.status(415).json({ success: false, error: formatProblem, code: "unsupported_image_format" });
+      }
 
       let condition = {};
       try { condition = JSON.parse(req.body.condition || "{}") || {}; } catch (e) { condition = {}; }
