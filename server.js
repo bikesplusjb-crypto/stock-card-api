@@ -10549,7 +10549,7 @@ async function refreshWatchlistPrices() {
     for (let attempt = 1; attempt <= FETCH_WAITS_MS.length + 1; attempt++) {
       const r = await supabaseAdmin
         .from("watchlist_items")
-        .select("id, card_name, last_checked_at, year, brand, set_name, player, card_number, parallel, sport")
+        .select("id, card_name, last_checked_at, year, brand, set_name, player, card_number, parallel, sport, grade")
         .order("last_checked_at", { ascending: true, nullsFirst: true })
         .limit(REFRESH_MAX_PER_RUN);
       items = r.data;
@@ -10657,8 +10657,49 @@ async function refreshWatchlistPrices() {
            consistent with it. */
         const limited = !!s.soldLimited;
 
-        const soldMed = (contaminated || limited) ? 0 : safeNumber(
-          (s.soldRaw && s.soldRaw.count >= 3 ? s.soldRaw.median : 0) || s.soldMedian, 0);
+        /* ── A SLAB WAS BEING PRICED AS A RAW CARD, EVERY NIGHT ─────
+
+           watchlist_items carries a grade column, and this loop never
+           read it. Every card was priced from soldRaw, so a graded card
+           was written over with the price of an ungraded copy. Measured
+           21 Sept against the same night's pools:
+
+             2017 Topps Judge      PSA 10   showed $65     PSA 10 rung $288
+             2003 Chrome LeBron    PSA 9    showed $2,788  PSA 9 rung $4,764
+             1986 Fleer Jordan     BGS 7    showed $3,575  no BGS 7 rung
+
+           Not a refusal failure -- a wrong number written confidently,
+           nightly, into somebody's binder and portfolio total.
+
+           The fix is the one made to the curated boards on 20 Sept: work
+           out what the card IS before judging the pool. A graded card
+           reads its own rung of the ladder -- PSA 10 and PSA 9 of one
+           card are separate markets -- and the raw-pool flags are not
+           consulted for it at all, because contaminated, limited and
+           wide-base all describe the UNGRADED sales, which a slab does
+           not use.
+
+           No matching rung means no price: the card keeps what it has
+           rather than taking the raw number again. "Raw" and an empty
+           grade take the original path unchanged. */
+        const gradeLabel = String(item.grade || "").trim();
+        const isGraded = !!gradeLabel && !/^raw$/i.test(gradeLabel);
+        let soldMed = 0, gradedMiss = false;
+        if (isGraded) {
+          const want = gradeLabel.toUpperCase().replace(/\s+/g, " ");
+          const rung = (Array.isArray(s.soldGradeBreakdown) ? s.soldGradeBreakdown : [])
+            .find(function (g) {
+              return String(g.grade || "").toUpperCase().replace(/\s+/g, " ") === want;
+            });
+          if (rung && Number(rung.count) >= MIN_GROUP && Number(rung.median) > 0) {
+            soldMed = Number(rung.median);
+          } else {
+            gradedMiss = true;
+          }
+        } else {
+          soldMed = (contaminated || limited) ? 0 : safeNumber(
+            (s.soldRaw && s.soldRaw.count >= 3 ? s.soldRaw.median : 0) || s.soldMedian, 0);
+        }
         const newPrice = soldMed;
 
         /* ── ONE ROW A DAY, FOR THE CHART THAT DOES NOT EXIST YET ──
@@ -10680,7 +10721,11 @@ async function refreshWatchlistPrices() {
            median holds at $76 while its range widens from $70-81 to
            $8-10,000 is a card whose comp pool broke, and only the
            spread shows that. */
-        if (newPrice && Array.isArray(s.sales) && s.sales.length) {
+        /* card_daily_prices is keyed by the card NAME, and that series
+           is the ungraded card's market. A slab's rung median entering it
+           would put a PSA 10 point in the middle of a raw line -- the
+           exact mixed-population row the range fix of 9 Sept removed. */
+        if (newPrice && !isGraded && Array.isArray(s.sales) && s.sales.length) {
           try {
             /* THE MEDIAN AND THE RANGE MUST DESCRIBE THE SAME SALES.
 
@@ -10833,7 +10878,10 @@ async function refreshWatchlistPrices() {
         }
 
         if (!newPrice) {
-          if (contaminated) {
+          if (gradedMiss) {
+            console.log("[watchlist-refresh] skipped GRADED " + item.card_name + " (" + gradeLabel +
+                        ") — no " + gradeLabel + " sales to price from; kept previous");
+          } else if (contaminated) {
             console.log("[watchlist-refresh] skipped CONTAMINATED — " + item.card_name);
           } else if (limited) {
             console.log("[watchlist-refresh] skipped LIMITED — " + item.card_name);
