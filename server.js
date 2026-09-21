@@ -1565,6 +1565,9 @@ function looksLikeSetCode(v) {
    all, which is the case for every sports card and for older Pokemon
    sets that never printed one. */
 function resolvePokemonSet(ai) {
+  /* Set name from CardGauge's own checklist when the local match was
+     sure (see localSure in /api/scan-card). */
+  if (ai && ai.setResolved) return ai.setResolved;
   const code  = String((ai && ai.setCode) || "").trim();
   const named = String((ai && ai.set) || "").trim();
 
@@ -6472,7 +6475,54 @@ app.post(
         ai.parallelCertain = true;
       }
 
-      const catalogYearFix = await catalogYearCheck(ai);
+      /* ── POKEMON: CARDGAUGE'S OWN CHECKLIST FIRST (21 Sept) ──────────
+
+         Measured on the live scanner the same day: a Phantasmal Flames
+         Yamper (PFL 030/094) waited ~4s for TheCardAPI's set-fill call to
+         time out before anything could be shown, and then their catalog
+         looked in "Prize Pack Series Seven", reported #030 missing, and
+         the page warned "This might not be the right card" over a card
+         that was read correctly.
+
+         ref_cards holds the full TCGdex Pokemon catalog (MIT). When the
+         read's set code, card number and name ALL match one card there,
+         and its year agrees, that is independent evidence the card
+         exists as read -- so the two catalog calls are skipped and the
+         local match stands in for verification.
+
+         Deliberately narrow:
+           - Pokemon only (sports coverage in ref_cards is 1981-1993);
+           - all three pieces of evidence required, never a score alone;
+           - ai.set is only FILLED when the model left it empty, exactly
+             the case catalogSetFill handled -- a set the model read is
+             never rewritten, so the query for any card that had a set
+             is unchanged;
+           - the display name comes from the match (setResolved), which
+             touches no query.
+         Anything short of that runs the catalog path as before. */
+      let localEarly = null;
+      let localSure  = false;
+      if (isPokemon(ai)) {
+        localEarly = await matchLocalIdentity(ai, {
+          copyrightYear: yearFromLine,
+          alias:         buildDisplayName(ai)
+        });
+        const lb = localEarly && localEarly.best;
+        const ev = (lb && lb.evidence) || [];
+        localSure = !!(lb && !lb.card_id && lb.source === "tcgdex"
+                       && ev.indexOf("number in set") >= 0
+                       && ev.indexOf("name matches") >= 0
+                       && ev.indexOf("year and set") >= 0);
+        if (localSure) {
+          ai.setResolved = lb.set_name || "";
+          if (!cleanVal(ai.set) && lb.set_name) ai.set = lb.set_name;
+          if (!String(ai.setCode || "").trim() && lb.set_code) ai.setCode = lb.set_code;
+          console.log("[identity] local Pokemon match " + lb.id + " (" + lb.set_name + " " +
+                      lb.card_number + ") -- catalog calls skipped");
+        }
+      }
+
+      const catalogYearFix = localSure ? null : await catalogYearCheck(ai);
       if (catalogYearFix) {
         console.log("[catalog-year] " + catalogYearFix.from + " -> " + catalogYearFix.to +
                     " | " + catalogYearFix.note);
@@ -6481,7 +6531,7 @@ app.post(
 
       /* After the year is settled, so the set is looked up for the right
          year. Only when the model returned no set at all. */
-      const catalogSetFix = await catalogSetFill(ai);
+      const catalogSetFix = localSure ? null : await catalogSetFill(ai);
       if (catalogSetFix) ai.set = catalogSetFix.set;
 
       const cleanCardName = buildDisplayName(ai);
@@ -6572,10 +6622,18 @@ app.post(
          check that usually passes; in parallel it is nearly free in
          wall-clock time and the result is ready when the response is
          assembled. */
-      const verifyPromise = verifyAgainstCatalog(ai);
+      /* A sure local match IS the verification -- see localSure above.
+         Same shape verifyAgainstCatalog returns, so every reader of
+         `verified` (the badge, the warning, scan_reads) works unchanged. */
+      const verifyPromise = localSure
+        ? Promise.resolve({
+            checked: true, exists: true, confidence: "high", ucid: null,
+            note: "", yearCorrected: null, candidates: [], source: "cardgauge"
+          })
+        : verifyAgainstCatalog(ai);
       /* Report-only -- see matchLocalIdentity. Runs alongside the
          catalog check and the price lookup, so it adds no wait. */
-      const identityPromise = matchLocalIdentity(ai, {
+      const identityPromise = localEarly ? Promise.resolve(localEarly) : matchLocalIdentity(ai, {
         copyrightYear:     yearFromLine,
         parallelConfirmed: parallelCertainFor(ai) && !!cleanVal(ai.parallel),
         alias:             cleanCardName
