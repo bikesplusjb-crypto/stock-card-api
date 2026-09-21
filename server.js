@@ -11202,8 +11202,8 @@ const HOTCOLD_MAX_MOVE_UNKNOWN_PCT = 25;
    refusal means. pokemon_cards has no direction column; that is the
    only difference and it is handled by the flag below. */
 const CURATED_BOARDS = [
-  { table: "hot_cold_cards", label: "hot-cold", hasDirection: true },
-  { table: "pokemon_cards",  label: "pokemon",  hasDirection: false }
+  { table: "hot_cold_cards", label: "hot-cold", hasDirection: true,  history: "hotcold" },
+  { table: "pokemon_cards",  label: "pokemon",  hasDirection: false, history: "pokemon" }
 ];
 
 async function refreshHotColdPrices() {
@@ -11481,6 +11481,28 @@ async function refreshCuratedBoard(board) {
         if (upErr) { failed++; console.error(TAG + " update failed " + row.id + ":", upErr.message); }
         else {
           repriced++;
+          /* ── ONE POINT PER CARD PER DAY, FOR THE CHART ──────────────
+             current and previous are all this row keeps; a chart needs
+             every price the job has ever published. Only successful
+             writes are recorded -- a refused card has no price to plot,
+             and a gap in the line is the honest picture of that. Keyed
+             (board, card_id, day), so a second run the same day
+             replaces the point rather than doubling it. Its own table,
+             because many of these are slab prices and card_daily_prices
+             is the ungraded card's series. Never allowed to fail the
+             reprice: a missing chart point costs nothing today. */
+          try {
+            const { error: hErr } = await supabaseAdmin.from("curated_price_history").upsert({
+              board:    board.history,
+              card_id:  row.id,
+              day:      new Date().toISOString().slice(0, 10),
+              price:    patch.current_price,
+              basis:    patch.price_basis || null,
+              sold_30d: Number(s.soldCount) || null,
+              source:   "weekly"
+            }, { onConflict: "board,card_id,day" });
+            if (hErr) console.log(TAG + " history write failed for " + row.id + ": " + hErr.message);
+          } catch (e) { /* never let the chart cost a price */ }
           console.log(TAG + " " + query + " $" + prev + " -> $" + patch.current_price +
                       " (" + basis + (patch.pct_change != null ? ", " + patch.pct_change + "%" : ", first price") + ")");
         }
