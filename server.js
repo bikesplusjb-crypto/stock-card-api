@@ -5975,6 +5975,92 @@ function swapYearInQuery(query, fromYear, toYear) {
   return q.replace(new RegExp("\\b" + fromYear + "\\b", "g"), toYear);
 }
 
+/* THE BACKEND DECIDES THIS, NOT THE MODEL -- see the parallelCertain
+   comment in the /api/scan-card response. Moved out of an inline
+   function there, unchanged, on 21 Sept so the early identity line and
+   the final response cannot disagree. */
+function parallelCertainFor(ai) {
+  var claimed  = ai.parallelCertain === true;
+  var hasPar   = !!String(ai.parallel || "").trim();
+  var opts     = Array.isArray(ai.parallelOptions) ? ai.parallelOptions.length : 0;
+  var evidence = String(ai.parallelEvidence || "").toLowerCase();
+  if (!hasPar) return claimed;
+  if (opts > 0) return false;
+  return claimed && (evidence === "serial" || evidence === "printed");
+}
+
+/* ── WHICH YEAR WAS USED, AND WHY (21 Sept) ────────────────────────
+
+   Four different mechanisms can move a card's year -- the copyright
+   line, the catalog, the listing vote, the empty-result retry -- and
+   each reported itself in its own field or not at all. Nothing said, in
+   one place, which year the price is for. This does, as plain data plus
+   one sentence the scanner can print.
+
+   `conflict` is the case the 21 Sept brief asked for: a back was sent
+   and its copyright year disagrees with the year the model reported.
+   The copyright year still wins -- that rule is not changed -- but the
+   disagreement is now flagged instead of silently resolved.
+
+   `otherYear` is the Chase Burns case: the empty-result retry found
+   records for a different year and refused them. The year is reported,
+   the refusal stands, and no price comes from it.
+
+   Pure: reads only what the route already computed. Never changes a
+   price, a query or an identity field. */
+function buildYearCheck(o) {
+  const q        = String(o.soldQuery || "");
+  const qm       = q.match(/^\s*(19[0-9]{2}|20[0-9]{2})\b/);
+  const final    = String(o.finalYear || "");
+  const priced   = qm ? qm[1] : (/^\d{4}$/.test(final) ? final : "");
+  const model    = /^\d{4}$/.test(String(o.yearModel || "")) ? String(o.yearModel) : "";
+  const line     = String(o.yearFromLine || "");
+  const conflict = !!(o.usedBack && model && line && model !== line);
+  const hasPrice = !!(o.sold && Number(o.sold.soldMedian) > 0 &&
+                      !o.sold.soldLimited && !o.sold.soldContaminated);
+
+  let source = "model";
+  if (o.yearGuess)                                    source = "empty-retry";
+  else if (o.yearCorrection && o.yearCorrection.adopted) source = "listings";
+  else if (o.catalogYearFix)                          source = "catalog";
+  else if (line)                                      source = "copyright";
+
+  let otherYear = null;
+  if (o.yearGuessRefused && !o.yearGuess) {
+    otherYear = {
+      year:    o.yearGuessRefused.year,
+      records: o.yearGuessRefused.records,
+      adopted: false,
+      reason:  o.yearGuessRefused.reason
+    };
+  }
+
+  let note = "";
+  if (conflict) {
+    note = "The front was read as " + model + " but the copyright line on the back says " +
+           line + ". " + (priced ? (hasPrice ? "Priced as " : "Searched as ") + priced +
+                                   ", because printed text on the back wins. "
+                                 : "The back's year was used. ") +
+           "Check the year if that looks wrong.";
+  } else if (otherYear && !hasPrice) {
+    note = "No sales found for " + (final || "the year read") + ". " + otherYear.records +
+           " sales came back for " + otherYear.year + ", but none matched this card closely " +
+           "enough to price, so there is no price. The card is probably from " + otherYear.year +
+           " — check the copyright line on the back and tap the year if so.";
+  }
+
+  return {
+    used:       priced || final || null,     // the year the shown price is for
+    source:     source,                      // what decided it
+    modelYear:  model || null,               // the model's own year field, before any override
+    lineYear:   line || null,                // the year in the copyright line, if one was read
+    lineSource: o.yearLineSource || null,    // "model" | "strip"
+    conflict:   conflict,
+    otherYear:  otherYear,
+    note:       note || null
+  };
+}
+
 
 /* ══════════════════════════════════════════════════════════════
    LEARNING FROM CORRECTIONS
@@ -6128,6 +6214,19 @@ app.post(
   "/api/scan-card",
   upload.fields([{ name: "front", maxCount: 1 }, { name: "back", maxCount: 1 }, { name: "backStrip", maxCount: 1 }]),
   async (req, res) => {
+    /* One exit for the scan route. After the identity line has been
+       streamed the status and headers are already sent, so the result
+       (or the error) has to go out as the last NDJSON line instead of a
+       fresh JSON body. Before that -- and always, for a client that did
+       not ask to stream -- this is plain res.json, unchanged. */
+    const sendScan = (obj, status) => {
+      if (res.headersSent) {
+        res.end(JSON.stringify(Object.assign({ stage: "final" }, obj)) + "\n");
+        return;
+      }
+      if (status) res.status(status);
+      return res.json(obj);
+    };
     try {
       const front = req.files?.front?.[0] || null;
       const back  = req.files?.back?.[0]  || null;
@@ -6175,13 +6274,32 @@ app.post(
       /* Only when the first pass did not produce one. A scan that read
          the line already costs nothing extra; one that did not gets a
          second call worth a few seconds against a wrong card. */
+      /* ── KEEP WHAT THE MODEL SAID BEFORE ANYTHING OVERWRITES IT (21 Sept) ──
+
+         The override below replaces ai.year with the copyright line's
+         year, and modelRead is taken AFTER it -- so scan_reads could never
+         show a front/back disagreement. Every row agreed by construction.
+         Measured on the 21 Sept test set: 86 scans with a copyright year,
+         0 disagreements, and still 5 cards priced from the wrong year,
+         because on those the model wrote the wrong year INTO the
+         transcription (Chase Burns: "(c) 2023 THE TOPPS COMPANY" on a 2026
+         card). A check that compares two fields the model filled in
+         together cannot catch a model that is wrong in both.
+
+         So the raw values are kept here, reported in yearCheck, and
+         logged, so the next question about years starts from data. */
+      const yearModel = String(ai.year || "");
+      let yearFromLine = "";
+      let yearLineSource = "";          // "model" | "strip" -- where the line came from
       try {
         let cl = String(ai.copyrightLine || '');
+        if (/(19[5-9]\d|20[0-4]\d)/.test(cl)) yearLineSource = "model";
         if (!/(19[5-9]\d|20[0-4]\d)/.test(cl) && backStrip) {
           const fromStrip = await readCopyrightStrip(backStrip);
           if (fromStrip) {
             cl = fromStrip;
             ai.copyrightLine = fromStrip;
+            yearLineSource = "strip";
             console.log('[strip] read: "' + fromStrip.slice(0, 90) + '"');
           } else {
             console.log('[strip] nothing readable in the crop');
@@ -6190,6 +6308,7 @@ app.post(
         const m  = cl.match(/(19[5-9]\d|20[0-4]\d)/);
         if (m) {
           const fromLine = m[1];
+          yearFromLine = fromLine;
           const said     = String(ai.year || '');
           if (said && said !== fromLine) {
             console.log("[year] copyright line says " + fromLine + " but model reported "
@@ -6236,7 +6355,12 @@ app.post(
         year: ai.year, brand: ai.brand, set: ai.set, player: ai.player, cardNumber: ai.cardNumber,
         parallel: ai.parallel, parallelEvidence: ai.parallelEvidence, serialNumber: ai.serialNumber,
         isRookie: ai.isRookie, isAutograph: ai.isAutograph, gradeCompany: ai.gradeCompany,
-        gradeValue: ai.gradeValue, copyrightLine: ai.copyrightLine, confidence: ai.confidence
+        gradeValue: ai.gradeValue, copyrightLine: ai.copyrightLine, confidence: ai.confidence,
+        /* The model's own year field before the copyright override, and
+           where the copyright line came from. Added 21 Sept -- see
+           yearModel above. New keys only; nothing that reads `read`
+           today looks for them. */
+        yearModel: yearModel, yearLineSource: yearLineSource || null
       };
       let parallelClearedFrom = "";
       if (retroBorderColourGuess(ai)) {
@@ -6293,6 +6417,55 @@ app.post(
          display) meant the price was already wrong by the time we knew
          what the card was. */
       ai.printCode = lookupPrintCode(ai.printCode, ai.year, ai.brand, ai.set);
+
+      /* ── PROGRESSIVE RESULT: THE CARD FIRST, THE PRICE AFTER (21 Sept) ──
+
+         Vision is ~85% of a scan (7s of the ~13s measured on 14 Sept),
+         and the person sees nothing until every sold lookup after it has
+         finished too. From this line on, the card's identity is settled --
+         year, set, player, number, parallel -- and nothing below changes
+         it. Everything after this only decides which SALES to count.
+
+         So a client that asks for it (stream=1 in the form) gets the
+         identity NOW as one line of NDJSON, then the complete result as
+         a second line when pricing finishes. The second line is the SAME
+         object the plain response returns, plus stage:"final".
+
+         A client that does not ask gets exactly what it always got: one
+         JSON body, same shape, same status codes. The rescan-with-back
+         path, business.html and every older installed PWA are untouched.
+
+         Nothing in the identity line is a price, so there is nothing a
+         refusal later could contradict. */
+      const wantStream = String((req.body && req.body.stream) || "") === "1";
+      if (wantStream) {
+        res.status(200);
+        res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+        res.setHeader("Cache-Control", "no-store");
+        res.setHeader("X-Accel-Buffering", "no");   // ask any proxy not to hold the first line
+        res.write(JSON.stringify({
+          stage:           "identity",
+          success:         true,
+          cardName:        cleanCardName || "Unknown Trading Card",
+          player:          ai.player     || "Unknown",
+          year:            ai.year       || "Unknown",
+          set:             resolvePokemonSet(ai) || "Unknown",
+          setCode:         String(ai.setCode || "").trim().toUpperCase() || null,
+          insert:          insertName || "",
+          brand:           ai.brand      || "Unknown",
+          cardNumber:      ai.cardNumber || "Unknown",
+          sport:           ai.sport      || "Unknown",
+          parallel:        ai.parallel   || "",
+          parallelCertain: parallelCertainFor(ai),
+          serialNumber:    ai.serialNumber || "",
+          isRookie:        !!ai.isRookie,
+          isAutograph:     !!ai.isAutograph,
+          isPatch:         !!ai.isPatch,
+          isRedemption:    ai.isRedemption === true,
+          usedBack:        !!back,
+          visionMs:        tVision
+        }) + "\n");
+      }
 
       /* Verification runs alongside the price lookup rather than before
          it. Sequencing them would add its latency to every scan for a
@@ -6564,6 +6737,20 @@ app.post(
          left alone -- this changes which sales were counted, not what
          the card is claimed to be. */
       let yearGuess = null;
+      /* THE RETRY THAT FOUND RECORDS AND RIGHTLY REFUSED THEM (21 Sept).
+
+         Chase Burns Big Ticket Gold /50, read as 2023. This retry asked
+         "2026 Topps Chase Burns /50" and got 35 records -- NSCC Gold
+         Refractors, 1991 Golds, Logofractors, Material autos. CompGuard
+         left 0 clean sales of this card, soldLimited was set, and the
+         result was correctly NOT adopted. Pricing it would have been the
+         $2 bug again with a different card's comps.
+
+         But the person was then shown nothing at all about it, when the
+         retry had learned something true: the year is very probably
+         2026. That is recorded here and reported in yearCheck. It never
+         becomes a price -- the adoption rule below is untouched. */
+      let yearGuessRefused = null;
       if (!sold || !sold.soldCount) {
         const claimed = parseInt(ai.year, 10);
         const nowYear = new Date().getFullYear();
@@ -6595,6 +6782,18 @@ app.post(
               console.log("[scan] empty-result year guess: " + claimed + " -> " + tryYear +
                           " (" + alt.soldCount + " sales)");
               break;
+            }
+            if (!yearGuessRefused && alt && Number(alt.soldCount) > 0) {
+              yearGuessRefused = {
+                year:    String(tryYear),
+                records: Number(alt.soldCount),
+                reason:  alt.soldContaminated ? "contaminated"
+                       : alt.soldLimited      ? "limited"
+                       : "no-median",
+                query:   q
+              };
+              console.log("[scan] empty-result year guess REFUSED: " + claimed + " -> " + tryYear +
+                          " (" + alt.soldCount + " records, " + yearGuessRefused.reason + ")");
             }
           }
         }
@@ -6788,6 +6987,19 @@ app.post(
          adopted or not, the attempt count belongs on the record. */
       if (sold && broadenTried) sold.broadenTried = broadenTried;
 
+      /* Reporting only -- see buildYearCheck(). Built after every step
+         that can move the year or the sold query, so it describes the
+         price actually being returned. */
+      const yearCheck = buildYearCheck({
+        usedBack: !!back, yearModel: yearModel, yearFromLine: yearFromLine,
+        yearLineSource: yearLineSource, finalYear: ai.year, catalogYearFix: catalogYearFix,
+        yearCorrection: yearCorrection, yearGuess: yearGuess, yearGuessRefused: yearGuessRefused,
+        soldQuery: soldQuery, sold: sold
+      });
+      if (yearCheck.conflict || yearCheck.otherYear) {
+        console.log("[year-check] " + JSON.stringify(yearCheck));
+      }
+
       const verification  = await verifyPromise;
       /* The scanner already renders verified.yearCorrected as "Confirmed in
          the card catalog - year corrected to X". Reuse it rather than add a
@@ -6899,6 +7111,8 @@ app.post(
           parallel_cleared: parallelClearedFrom || null,
           listing_year:     yearCorrection && yearCorrection.adopted ? yearCorrection : null,
           year_guess:       yearGuess || null,
+          year_check:       (yearCheck.conflict || yearCheck.otherYear || yearCheck.source !== "copyright")
+                              ? yearCheck : null,
           known_corrections: knownCorrections || null,
           verified: verification ? { checked: !!verification.checked, exists: verification.exists,
                                      confidence: verification.confidence || null } : null
@@ -6909,7 +7123,7 @@ app.post(
         visionMs:    tVision
       }));
 
-      return res.json({
+      return sendScan({
         success:           true,
         cardName:          cleanCardName || "Unknown Trading Card",
         player:            ai.player     || "Unknown",
@@ -6972,15 +7186,7 @@ app.post(
         /* Already resolved above so the query could use it -- passed
            straight through rather than looked up a second time. */
         printCode:         ai.printCode,
-        parallelCertain:   (function(){
-          var claimed  = ai.parallelCertain === true;
-          var hasPar   = !!String(ai.parallel || "").trim();
-          var opts     = Array.isArray(ai.parallelOptions) ? ai.parallelOptions.length : 0;
-          var evidence = String(ai.parallelEvidence || "").toLowerCase();
-          if (!hasPar) return claimed;
-          if (opts > 0) return false;
-          return claimed && (evidence === "serial" || evidence === "printed");
-        })(),
+        parallelCertain:   parallelCertainFor(ai),   /* moved verbatim, 21 Sept -- the identity line needs it too */
         parallelConfidence: (function(){
           var hasPar   = !!String(ai.parallel || "").trim();
           var opts     = Array.isArray(ai.parallelOptions) ? ai.parallelOptions.length : 0;
@@ -7041,6 +7247,9 @@ app.post(
            at all, which is a different piece of evidence and deserves
            its own field rather than being blended into one. */
         yearGuess:         yearGuess,
+        /* Which year the price is for and what decided it, in one place.
+           New field (21 Sept); every existing year field is unchanged. */
+        yearCheck:         yearCheck,
         soldBroadened:     soldBroadened,
         sold:              sold || null,
         askVsSold:         askVsSold(market, sold),
@@ -7089,7 +7298,7 @@ app.post(
       });
     } catch (error) {
       console.error("Scan server error:", error);
-      return res.status(500).json({ success: false, error: "Scanner failed on server", details: error.message });
+      return sendScan({ success: false, error: "Scanner failed on server", details: error.message }, 500);
     }
   }
 );
