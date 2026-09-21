@@ -11221,7 +11221,7 @@ async function refreshCuratedBoard(board) {
   try {
     const { data: rows, error } = await supabaseAdmin
       .from(TABLE)
-      .select("id, card_name, current_price, prev_price, price_basis, grade_label")
+      .select("id, card_name, current_price, prev_price, price_basis, grade_label, updated_at")
       .eq("is_active", true)
       .order("updated_at", { ascending: true, nullsFirst: true });
 
@@ -11448,9 +11448,29 @@ async function refreshCuratedBoard(board) {
         /* prev_price only moves when there WAS a real previous price.
            Otherwise the first refresh would invent a 0 to compare
            against and every card would read as an infinite gain. */
-        if (prev > 0) {
-          patch.prev_price = prev;
-          const pct = ((next - prev) / prev) * 100;
+        /* ── A SECOND RUN MUST NOT ERASE THE FIRST RUN'S BASELINE ────
+
+           On 21 Sept the job was triggered twice, an hour apart. The first
+           run rolled the July price into prev_price and wrote September's
+           into current_price -- a real two-month move. The second run
+           rolled THAT into prev_price, so every card repriced by both read
+           "+$0.00 (+0.0%) since last check": the interval had collapsed to
+           one hour and the July-to-September move was gone for good.
+
+           So the baseline only rolls forward when the stored price is at
+           least ANCHOR_DAYS old. A run inside that window updates the
+           current price but keeps measuring against the older baseline.
+           The weekly schedule is seven days apart and rolls normally; a
+           manual re-run the same afternoon no longer throws the history
+           away. */
+        const ANCHOR_DAYS = 3;
+        const lastWrite = row.updated_at ? new Date(row.updated_at).getTime() : 0;
+        const recent = lastWrite && (Date.now() - lastWrite) < ANCHOR_DAYS * 86400000;
+        const base = recent ? (Number(row.prev_price) || 0) : prev;
+
+        if (!recent && prev > 0) patch.prev_price = prev;
+        if (base > 0) {
+          const pct = ((next - base) / base) * 100;
           patch.pct_change = Math.round(pct * 100) / 100;
           /* pokemon_cards has no direction column. */
           if (board.hasDirection) patch.direction = pct >= 0 ? "hot" : "cold";
