@@ -4436,12 +4436,55 @@ function soldSummaryForLog(sold) {
   };
 }
 
+/* ── CROSSWALK + CONFIRMATION (21 Sept) ─────────────────────────────
+
+   After a scan has been filed under a CardGauge card_id:
+
+   - the TheCardAPI catalog id it matched goes into card_external_ids,
+     flagged licensed (their terms: delete within 30 days of cancelling);
+   - a strong match in ref_cards (TCGdex / CardLists, MIT) goes in too,
+     not licensed;
+   - the card is marked CONFIRMED only when something other than the
+     model agreed with it: the catalog found the number AND the player
+     (verification high), or the open checklist scored 85+.
+
+   Only confirmed cards count as evidence for later scans (see
+   cg_match_identity), so a misread cannot confirm itself. Never throws. */
+async function linkCardEvidence(cardId, verification, identityMatch) {
+  try {
+    if (!supabaseAdmin || !cardId) return;
+    const links = [];
+    const v = verification || {};
+    if (v.checked && v.exists === true && v.ucid) {
+      links.push({ card_id: cardId, source: "thecardapi", external_id: String(v.ucid), licensed: true,
+                   last_verified: new Date().toISOString() });
+    }
+    const b = identityMatch && identityMatch.best;
+    const strongRef = !!(b && !b.card_id && Number(b.score) >= 85 && b.id);
+    if (strongRef) {
+      links.push({ card_id: cardId, source: String(b.source || "ref"), external_id: String(b.id).slice(0, 200),
+                   external_url: b.image_url || null, licensed: false, last_verified: new Date().toISOString() });
+    }
+    if (links.length) {
+      const { error } = await supabaseAdmin.from("card_external_ids")
+        .upsert(links, { onConflict: "source,external_id", ignoreDuplicates: true });
+      if (error) console.log("[data] crosswalk write failed: " + error.message);
+    }
+    const catalogSure = v.checked && v.exists === true && v.confidence === "high";
+    if (catalogSure || strongRef) {
+      await supabaseAdmin.from("cards").update({ status: "confirmed" })
+        .eq("card_id", cardId).eq("status", "observed");
+    }
+  } catch (e) { /* never let this break a scan */ }
+}
+
 async function logScanRead(x) {
   try {
     if (!supabaseAdmin) return;
     const ai = x.ai || {};
     const ident = identityFromAi(ai, x.surface, [x.soldQuery, x.searchQuery]);
     const cardId = ident ? await recordCard(ident) : null;
+    if (cardId) await linkCardEvidence(cardId, x.verification, x.identityMatch);
     const sum = soldSummaryForLog(x.sold);
     const final = {};
     ["year", "brand", "set", "insertName", "player", "cardNumber", "parallel", "parallelEvidence",
@@ -5975,6 +6018,63 @@ function swapYearInQuery(query, fromYear, toYear) {
   return q.replace(new RegExp("\\b" + fromYear + "\\b", "g"), toYear);
 }
 
+/* ── CARDGAUGE'S OWN IDENTITY LOOKUP (21 Sept) ──────────────────────
+
+   One Postgres call, no external API: the read is matched against
+   ref_cards (openly licensed checklists -- TCGdex Pokemon, CardLists
+   baseball) and against cards CardGauge has CONFIRMED. The score is the
+   sum of evidence the database actually checked (number exists in that
+   set, name on that number matches, year and set agree, copyright year
+   agrees) -- see cg_match_identity in the migrations.
+
+   REPORT-ONLY for now. It changes no query, price or identity field. It
+   is returned as identityMatch and logged to scan_reads, so how often it
+   agrees with the catalog and with corrections can be measured before
+   anything is allowed to act on it.
+
+   Capped at 1.5s and never throws: an identity lookup must not cost
+   anybody their scan. */
+const IDENTITY_MATCH_TIMEOUT_MS = 1500;
+
+async function matchLocalIdentity(ai, extras) {
+  if (!supabaseAdmin || !ai) return null;
+  const x = extras || {};
+  const p = {
+    game:        cleanVal(ai.sport) || "",
+    year:        cleanVal(ai.year) || "",
+    brand:       cleanVal(ai.brand) || "",
+    set_name:    cleanVal(ai.set) || "",
+    set_code:    String(ai.setCode || "").trim(),
+    card_number: cleanVal(ai.cardNumber) || "",
+    player:      cleanVal(ai.player) || "",
+    language:    /^(jap|jpn)/i.test(cleanVal(ai.language)) ? "ja" : "en",
+    copyright_year:     x.copyrightYear || "",
+    parallel_confirmed: !!x.parallelConfirmed,
+    alias:       x.alias || ""
+  };
+  try {
+    const call = supabaseAdmin.rpc("cg_match_identity", { p: p });
+    const timeout = new Promise(res => setTimeout(() => res({ timedOut: true }), IDENTITY_MATCH_TIMEOUT_MS));
+    const r = await Promise.race([call, timeout]);
+    if (!r || r.timedOut) { console.log("[identity] local match timed out"); return null; }
+    if (r.error) { console.log("[identity] local match failed: " + r.error.message); return null; }
+    const d = r.data || {};
+    const b = d.best || null;
+    return {
+      band:        d.band || "none",
+      seenBefore:  Number(d.seen_before) || 0,
+      candidates:  Array.isArray(d.candidates) ? d.candidates.length : 0,
+      best: b ? {
+        source: b.source, id: b.id, card_id: b.card_id || null, year: b.year, brand: b.brand,
+        set_name: b.set_name, set_code: b.set_code, card_number: b.card_number, name: b.name,
+        score: b.score, evidence: b.evidence || [], image_url: b.image_url || null
+      } : null
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
 /* THE BACKEND DECIDES THIS, NOT THE MODEL -- see the parallelCertain
    comment in the /api/scan-card response. Moved out of an inline
    function there, unchanged, on 21 Sept so the early identity line and
@@ -6473,6 +6573,13 @@ app.post(
          wall-clock time and the result is ready when the response is
          assembled. */
       const verifyPromise = verifyAgainstCatalog(ai);
+      /* Report-only -- see matchLocalIdentity. Runs alongside the
+         catalog check and the price lookup, so it adds no wait. */
+      const identityPromise = matchLocalIdentity(ai, {
+        copyrightYear:     yearFromLine,
+        parallelConfirmed: parallelCertainFor(ai) && !!cleanVal(ai.parallel),
+        alias:             cleanCardName
+      });
 
       const market        = await getCardMarketForCard(ai);
       const tMarket = Date.now() - tMarketStart;
@@ -7001,6 +7108,7 @@ app.post(
       }
 
       const verification  = await verifyPromise;
+      const identityMatch = await identityPromise;
       /* The scanner already renders verified.yearCorrected as "Confirmed in
          the card catalog - year corrected to X". Reuse it rather than add a
          second UI for the same fact. */
@@ -7111,6 +7219,10 @@ app.post(
           parallel_cleared: parallelClearedFrom || null,
           listing_year:     yearCorrection && yearCorrection.adopted ? yearCorrection : null,
           year_guess:       yearGuess || null,
+          identity_match:   identityMatch ? { band: identityMatch.band, seen_before: identityMatch.seenBefore,
+                                              best: identityMatch.best ? { source: identityMatch.best.source,
+                                                id: identityMatch.best.id, score: identityMatch.best.score,
+                                                evidence: identityMatch.best.evidence } : null } : null,
           year_check:       (yearCheck.conflict || yearCheck.otherYear || yearCheck.source !== "copyright")
                               ? yearCheck : null,
           known_corrections: knownCorrections || null,
@@ -7120,7 +7232,9 @@ app.post(
         sold:        sold,
         soldQuery:   soldQuery,
         searchQuery: searchQuery,
-        visionMs:    tVision
+        visionMs:    tVision,
+        verification:  verification,
+        identityMatch: identityMatch
       }));
 
       return sendScan({
@@ -7271,6 +7385,9 @@ app.post(
            is real and the card number is not in it, which is what a
            misread looks like from the outside. */
         verified:          verification,
+        /* CardGauge's own identity lookup, report-only (21 Sept). New
+           field; nothing in the scanner reads it yet. */
+        identityMatch:     identityMatch,
         catalogYearFix:    catalogYearFix,
         catalogSetFix:     catalogSetFix ? { set: catalogSetFix.set, product: catalogSetFix.product } : null,
         summary:           ai.summary    || "AI scan complete. Verify exact version, condition, and comps.",
