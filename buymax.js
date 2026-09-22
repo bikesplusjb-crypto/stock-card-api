@@ -163,6 +163,21 @@ __def('config', function (module, exports, require) {
       maxRiskForBuy: num(process.env.BUYMAX_MAX_RISK_FOR_BUY, 70),
       // Asking price within this band above max buy price is REVIEW, not PASS.
       borderlineBand: num(process.env.BUYMAX_BORDERLINE_BAND, 0.10),
+      /* SOLD-FIRST, ENFORCED (22 Sept). With no completed sales the resale
+         figure is built from asking prices, and an ask is not a sale. Such
+         a result is a no-call, not a BUY or a PASS. Set false to restore the
+         old behaviour (asks-only estimates could BUY/PASS). */
+      requireSoldEvidence: bool(process.env.BUYMAX_REQUIRE_SOLD, true),
+      /* A card the scanner could not confirm is not bought on BuyMax's word:
+         a BUY becomes REVIEW, "confirm the card first". Only applies when
+         the caller says identity is uncertain (request.context.identity). */
+      requireConfirmedIdentityForBuy: bool(process.env.BUYMAX_REQUIRE_CONFIRMED_ID, true),
+      /* The cheapest-sale test for a withheld (mixed) pool, moved from the
+         scanner panel into the engine: BUY only if the ask leaves at least
+         this much -- and at least this share of the ask -- even when the
+         card sells at the LOWEST recent sale. */
+      floorClearMinProfit: num(process.env.BUYMAX_FLOOR_MIN_PROFIT, 3),
+      floorClearAskShare: num(process.env.BUYMAX_FLOOR_ASK_SHARE, 0.5),
     },
 
     // ---------------------------------------------------------------------
@@ -359,9 +374,46 @@ __def('core/normalize', function (module, exports, require) {
       other_costs: normalizeNumber(b.other_costs) || 0,
       desired_profit: normalizeNumber(b.desired_profit),
       sell_fee_rate: normalizeNumber(b.sell_fee_rate),
+      context: normalizeContext(b.context),
     };
 
     return { ok: errors.length === 0, errors, request };
+  }
+
+  /* WHAT THE CALLER ALREADY KNOWS ABOUT THE CARD (22 Sept).
+
+     The scanner has worked out things BuyMax cannot: whether the card was
+     confirmed (its identity label), how fast it sells (computeLiquidity)
+     and the lowest recent sale. Passed as facts, never as instructions --
+     every field is optional, typed and bounded, and anything else in the
+     object is dropped. */
+  function normalizeContext(c) {
+    const x = c && typeof c === 'object' ? c : {};
+    const out = { identity: null, liquidity: null, sold_floor: null };
+    const id = x.identity && typeof x.identity === 'object' ? x.identity : null;
+    if (id && (id.level === 'strong' || id.level === 'uncertain')) {
+      out.identity = {
+        level: id.level,
+        reasons: (Array.isArray(id.reasons) ? id.reasons : [])
+          .filter((r) => typeof r === 'string').slice(0, 5).map((r) => r.slice(0, 160)),
+      };
+    }
+    const lq = x.liquidity && typeof x.liquidity === 'object' ? x.liquidity : null;
+    if (lq) {
+      const str = (v) => (typeof v === 'string' ? v.slice(0, 200) : null);
+      out.liquidity = {
+        known: lq.known === true,
+        label: str(lq.label),
+        plain: str(lq.plain),
+        reason: str(lq.reason),
+        days_to_clear: normalizeNumber(lq.daysToClear),
+        sold_30d: normalizeNumber(lq.sold30),
+        listed: normalizeNumber(lq.listed),
+      };
+    }
+    const f = normalizeNumber(x.sold_floor);
+    if (f !== null && f > 0 && f < 1000000) out.sold_floor = f;
+    return out;
   }
 
   /** Fill gaps in the caller's identity from provider identity. Never overwrites a stated field. */
@@ -881,7 +933,9 @@ __def('core/explain', function (module, exports, require) {
     const lines = [];
 
     // --- what the decision is, in one sentence -------------------------
-    if (decision.result === 'BUY') {
+    if (decision.result === 'BUY' && decision.basis === 'sold_floor') {
+      lines.push(decision.reason);
+    } else if (decision.result === 'BUY') {
       lines.push(
         `Buy it. At ${money(request.asking_price)} you would clear about ${money(calc.expected_profit_at_asking)} after fees and costs, on an expected resale of ${money(calc.inputs.expected_resale)}.`
       );
@@ -985,7 +1039,11 @@ __def('core/explain', function (module, exports, require) {
       const f = decision.factors || [];
       const has = (x) => f.indexOf(x) > -1;
       lines.push(
-        has('borderline')
+        has('identity_unconfirmed')
+          ? `The numbers work. What stops this being a buy is the card itself: confirm it matches what was priced.`
+          : has('no_sold_evidence')
+          ? `Nothing here is a recommendation to buy or to pass — there are no completed sales, and asking prices are not a value.`
+          : has('borderline')
           ? `Nothing here is a recommendation either way — the ask is close enough to the ceiling that it comes down to how badly you want the card.`
           : has('risk_above_buy_ceiling')
           ? `The price itself works. It is the risks above that stop this being a straight buy.`
@@ -1014,7 +1072,10 @@ __def('core/decision', function (module, exports, require) {
    * Every threshold comes from config.decision. No magic numbers here.
    */
 
-  function decide({ calc, request, riskScore, confidence, market, evidence, soldRefusal, providerErrors, blockers }, cfg) {
+  function decide({ calc, request, riskScore, confidence, market, evidence, soldRefusal, providerErrors, blockers, floor }, cfg) {
+    const ctxId = request && request.context && request.context.identity;
+    const idUncertain = !!(cfg.decision.requireConfirmedIdentityForBuy && ctxId && ctxId.level === 'uncertain');
+    const idWhy = idUncertain && ctxId.reasons && ctxId.reasons.length ? ' (' + ctxId.reasons.join('; ') + ')' : '';
     const d = cfg.decision;
 
     if (blockers && blockers.length) {
@@ -1051,12 +1112,51 @@ __def('core/decision', function (module, exports, require) {
        to arrive via providerErrors, so a deliberate refusal was reported as
        a degraded provider. If the upstream will not publish its median,
        BuyMax will not turn asking prices into a buy or a pass either. */
+    /* THE CHEAPEST-SALE TEST, NOW IN THE ENGINE (22 Sept).
+
+       The panel used to overrule this refusal on its own, with its own copy
+       of the fee maths: when even the LOWEST recent sale leaves real money
+       at the ask, the answer does not depend on which version the card is.
+       Same test, same thresholds, but computed here from calculate() so the
+       fees are the engine's, and the answer is a backend decision the
+       receipt and the log both see. The refusal still stands for the
+       CEILING: maximum_buy_price stays unset on this path. */
+    if (soldRefusal && floor && Number.isFinite(floor.keep) && Number.isFinite(request.asking_price)
+        && floor.keep >= Math.max(cfg.decision.floorClearMinProfit, request.asking_price * cfg.decision.floorClearAskShare)) {
+      if (idUncertain) {
+        return {
+          result: 'REVIEW',
+          basis: 'sold_floor',
+          reason: `Even at the lowest recent sale (${fmt(floor.price)}) ${fmt(request.asking_price)} leaves about ${fmt(floor.keep)}, but the card itself is not confirmed${idWhy}. Confirm it first.`,
+          factors: ['identity_unconfirmed', 'floor_clear'],
+        };
+      }
+      return {
+        result: 'BUY',
+        basis: 'sold_floor',
+        reason: `Even if it sells at the lowest recent sale (${fmt(floor.price)}), ${fmt(request.asking_price)} leaves about ${fmt(floor.keep)} after fees and postage. The sales mix versions, so there is no ceiling above that.`,
+        factors: ['floor_clear'],
+      };
+    }
+
     if (soldRefusal) {
       return {
         result: 'REVIEW',
         no_call: true,
         reason: `Completed-sale data was withheld: ${soldRefusal.reason}. BuyMax will not call this off asking prices alone.`,
         factors: ['sold_comps_refused'],
+      };
+    }
+
+    /* SOLD-FIRST (22 Sept). No completed sales means the resale figure is
+       an asking-price estimate. That is context, not evidence: no BUY and
+       no PASS off it. */
+    if (d.requireSoldEvidence && evidence && !evidence.soldAvailable) {
+      return {
+        result: 'REVIEW',
+        no_call: true,
+        reason: 'No completed sales of this card were found. Asking prices alone cannot support a buy or a walk-away.',
+        factors: ['no_sold_evidence'],
       };
     }
 
@@ -1074,16 +1174,19 @@ __def('core/decision', function (module, exports, require) {
 
     // Evidence floor: a single completed sale with nothing corroborating it is
     // not enough to tell someone to hand over money, however good the price looks.
+    /* Tightened 22 Sept: active listings used to count as corroboration
+       here, so one sale plus five asks could BUY. Asks are not sales. At or
+       below veryThinSoldComps it is a no-call whatever is listed. */
     if (
       evidence &&
       evidence.soldAvailable &&
       Number.isFinite(evidence.soldCount) &&
-      evidence.soldCount <= cfg.market.veryThinSoldComps &&
-      (market.listings_used || 0) < cfg.market.minListingsForEstimate
+      evidence.soldCount <= cfg.market.veryThinSoldComps
     ) {
       return {
         result: 'REVIEW',
-        reason: `Only ${evidence.soldCount} completed sale${evidence.soldCount === 1 ? '' : 's'} to price against, with no active listings to corroborate it.`,
+        no_call: true,
+        reason: `Only ${evidence.soldCount} completed sale${evidence.soldCount === 1 ? '' : 's'} to price against. That is not enough to set a value.`,
         factors: ['evidence_floor'],
       };
     }
@@ -1097,6 +1200,13 @@ __def('core/decision', function (module, exports, require) {
           result: 'REVIEW',
           reason: `Price works but BuyMax Risk Score is ${riskScore}, above the ${d.maxRiskForBuy} ceiling for an automatic BUY.`,
           factors: ['risk_above_buy_ceiling'],
+        };
+      }
+      if (idUncertain) {
+        return {
+          result: 'REVIEW',
+          reason: `The price works -- ${fmt(ask)} is at or below the maximum buy price ${fmt(max)} -- but the card is not confirmed${idWhy}. Confirm it before paying.`,
+          factors: ['identity_unconfirmed'],
         };
       }
       return {
@@ -1127,6 +1237,310 @@ __def('core/decision', function (module, exports, require) {
 
 });
 
+// ==================== core/record.js ====================
+__def('core/record', function (module, exports, require) {
+
+  /**
+   * THE DECISION RECORD -- ONE CANONICAL SHAPE FOR "WHAT SHOULD I DO" (22 Sept).
+   *
+   * A projection of what the engine already decided. It computes no price,
+   * no fee, no ceiling and no profit: every number is copied from calc,
+   * payload or the caller's context. What it adds is vocabulary --
+   *
+   *   BUY         the evidence holds and the ask is at or under the ceiling
+   *   WALK_AWAY   the evidence holds and the ask is over it (engine: PASS)
+   *   REVIEW      the evidence holds but something needs a person
+   *               (borderline ask, risk ceiling, card not confirmed)
+   *   NO_DECISION there is not enough trustworthy evidence to decide at all
+   *               (engine: REVIEW with no_call)
+   *
+   * WALK_AWAY and NO_DECISION are different claims and are never merged:
+   * one is "we know, and it is a bad deal", the other is "we do not know".
+   *
+   * Reserved for callers that decide other things (SELL, HOLD, GRADE,
+   * TRADE, LIST, REPRICE, DISCOUNT); nothing produces them yet.
+   *
+   * CONFIDENCE IS A RATING OF THE EVIDENCE, NOT A PROBABILITY. Nothing here
+   * has been calibrated against outcomes, so it is a word (HIGH / MEDIUM /
+   * LOW / NONE) with the reasons that put it there -- never "91% chance".
+   */
+
+  const ACTIONS = ['BUY', 'SELL', 'HOLD', 'GRADE', 'TRADE', 'LIST', 'REPRICE', 'DISCOUNT',
+                   'REVIEW', 'WALK_AWAY', 'NO_DECISION'];
+  const CONFIDENCE_MEANING = 'A rating of the evidence behind this decision. It is not a probability of profit.';
+  const RECORD_VERSION = 1;
+  /* Fewest clean sales for anything better than THIN. 5 is the line the
+     scanner's own "Price evidence: STRONG" label has used since 21 Sept
+     (EVL_STRONG_MIN_SALES); one number now, used by both. */
+  const EVIDENCE_MIN_SALES = 5;
+
+  const n2 = (v) => (v === null || v === undefined || !Number.isFinite(Number(v)) ? null : Math.round(Number(v) * 100) / 100);
+  const $ = (v) => (v === null || v === undefined ? '—' : '$' + Number(v).toFixed(2));
+
+  function actionFor(decision) {
+    if (!decision) return 'NO_DECISION';
+    if (decision.result === 'BUY') return 'BUY';
+    if (decision.result === 'PASS') return 'WALK_AWAY';
+    return decision.no_call ? 'NO_DECISION' : 'REVIEW';
+  }
+
+  /* Evidence quality from the SOLD side only. Same thresholds the engine and
+     the scanner already use: veryThinSoldComps / minSoldComps from config,
+     the 3x "all over the place" spread, and the panel's old Strong test
+     (10+ sales within 1.6x of the median), moved here from the browser. */
+  function evidenceQuality({ soldAvailable, sold, soldRefusal, activeEstimate, cfg }) {
+    const reasons = [];
+    if (soldRefusal) {
+      /* Only a pool that was FOUND and judged untrustworthy is REFUSED.
+         "No sales at all" and "the lookup allowance was spent" are not
+         findings about the sales, and saying REFUSED for them would claim
+         a judgement nobody made. */
+      const k = soldRefusal.kind;
+      reasons.push(soldRefusal.reason || 'completed sales were found but withheld');
+      const quality = k === 'no_comps' || k === 'no_identity' || k === 'no_median'
+        ? (activeEstimate ? 'ACTIVE_ONLY' : 'NONE')
+        : k === 'rate_limited' ? 'UNAVAILABLE'
+        : k === 'limited' ? 'INSUFFICIENT'
+        : 'REFUSED';
+      return { quality, reasons, refusal: soldRefusal.reason || null, refusal_kind: k || null };
+    }
+    if (soldAvailable) {
+      const n = Number.isFinite(Number(sold.count)) ? Number(sold.count) : null;
+      const med = Number(sold.median) || 0, lo = Number(sold.low) || 0, hi = Number(sold.high) || 0;
+      if (n === null) return { quality: 'THIN', reasons: ['sales were returned without a count'], refusal: null };
+      reasons.push(n + ' completed sale' + (n === 1 ? '' : 's'));
+      if (n <= cfg.market.veryThinSoldComps) return { quality: 'INSUFFICIENT', reasons, refusal: null };
+      if (lo > 0 && hi > 0) reasons.push('sold ' + $(lo) + '–' + $(hi));
+      const wide = med > 0 && ((hi > 0 && hi / med >= 3) || (lo > 0 && med / lo >= 3));
+      if (wide) { reasons.push('sales run more than 3x apart'); return { quality: 'MIXED', reasons, refusal: null }; }
+      if (n < EVIDENCE_MIN_SALES) return { quality: 'THIN', reasons, refusal: null };
+      const snug = med > 0 && hi > 0 && lo > 0 && hi / med < 1.6 && med / lo < 1.6;
+      return { quality: n >= 10 && snug ? 'HIGH' : 'MODERATE', reasons, refusal: null };
+    }
+    if (activeEstimate) return { quality: 'ACTIVE_ONLY', reasons: ['asking prices only -- no completed sales'], refusal: null };
+    return { quality: 'NONE', reasons: ['no completed sales and no usable listings'], refusal: null };
+  }
+
+  function riskLevel(score) {
+    if (!Number.isFinite(score)) return null;
+    return score < 30 ? 'LOW' : score < 60 ? 'MEDIUM' : 'HIGH';
+  }
+
+  function confidenceLevel({ action, evidence, identity, risk, engineScore, cfg }) {
+    if (action === 'NO_DECISION') return { level: 'NONE', reasons: ['no decision was made'] };
+    const order = ['LOW', 'MEDIUM', 'HIGH'];
+    const reasons = [];
+    let i = evidence.quality === 'HIGH' ? 2 : evidence.quality === 'MODERATE' ? 1 : 0;
+    reasons.push('evidence ' + evidence.quality.toLowerCase().replace('_', ' '));
+    if (identity.status === 'uncertain') { i = Math.max(0, i - 1); reasons.push('card not confirmed'); }
+    if (risk.level === 'HIGH') { i = Math.max(0, i - 1); reasons.push('high risk'); }
+    /* Raw or graded unknown: a slab and a raw copy are different markets, so
+       the sales may not be this copy's sales. (Not parallel_unknown -- the
+       engine raises that for every base card, which would cap them all.) */
+    if (risk.codes && risk.codes.indexOf('condition_unknown') > -1) { i = Math.max(0, i - 1); reasons.push('raw or graded not stated'); }
+    if (Number.isFinite(engineScore) && engineScore < cfg.decision.minConfidenceForCall) { i = 0; reasons.push('engine confidence below its call threshold'); }
+    return { level: order[i], reasons };
+  }
+
+  function buildDecisionRecord({ payload, calc, decision, request, cfg, soldAvailable, sold, soldRefusal, floor, activeEstimate, risk }) {
+    const action = actionFor(decision);
+    const ctx = (request && request.context) || {};
+    const ask = n2(request && request.asking_price);
+    const f = decision && decision.factors ? decision.factors : [];
+    const floorBasis = !!(decision && decision.basis === 'sold_floor' && floor);
+
+    const evidence = evidenceQuality({ soldAvailable, sold: sold || {}, soldRefusal, activeEstimate, cfg });
+
+    const idCtx = ctx.identity || null;
+    const identity = {
+      status: idCtx ? (idCtx.level === 'strong' ? 'confirmed' : 'uncertain') : 'not_checked',
+      reasons: idCtx ? idCtx.reasons : [],
+      // How completely the card is DESCRIBED (field count). Not how sure we are
+      // it is right -- see identityConfidenceFromItem in server.js.
+      completeness: payload.confidence ? payload.confidence.identity_confidence : null,
+    };
+
+    const riskOut = {
+      score: risk ? risk.score : null,
+      level: riskLevel(risk ? risk.score : null),
+      reasons: (risk && risk.reasons ? risk.reasons : []).slice().sort((a, b) => b.points - a.points)
+        .slice(0, 4).map((r) => r.detail || r.code),
+      codes: (risk && risk.reasons ? risk.reasons : []).map((r) => r.code),
+    };
+
+    const c = calc || {};
+    const ci = c.inputs || {};
+    const extras = (Number(ci.shipping_cost) || 0) + (Number(ci.grading_cost) || 0) + (Number(ci.other_costs) || 0);
+    const economics = floorBasis ? {
+      basis: 'lowest_recent_sale',
+      maximum_buy: null,
+      target_offer: null,
+      expected_net: n2(floor.net - extras),
+      expected_profit: n2(floor.keep),
+      roi: ask > 0 ? n2(floor.keep / ask) : null,
+    } : {
+      basis: c.net_proceeds === null || c.net_proceeds === undefined ? null
+             : (soldAvailable ? 'sold_median' : 'asking_prices'),
+      maximum_buy: n2(c.maximum_buy_price),
+      target_offer: n2(c.target_offer),
+      expected_net: c.net_proceeds === null || c.net_proceeds === undefined ? null : n2(c.net_proceeds - extras),
+      expected_profit: n2(c.expected_profit_at_asking),
+      roi: n2(c.roi_at_asking),
+    };
+    Object.assign(economics, {
+      selling_cost: n2(c.selling_cost),
+      shipping_cost: n2(ci.shipping_cost),
+      grading_cost: n2(ci.grading_cost),
+      other_costs: n2(ci.other_costs),
+      desired_profit: n2(c.desired_profit),
+      risk_adjustment: n2(c.risk_adjustment),
+    });
+
+    const mkt = payload.market || {};
+    const market = {
+      value: floorBasis ? n2(floor.price) : n2(ci.expected_resale),
+      basis: floorBasis ? 'lowest_recent_sale'
+           : soldAvailable ? 'sold_median'
+           : (ci.expected_resale ? 'asking_prices' : null),
+      sold_count: mkt.sold_comp_count != null ? mkt.sold_comp_count : (soldRefusal ? soldRefusal.sold_count || null : null),
+      sold_low: mkt.sold_low != null ? mkt.sold_low : null,
+      sold_high: mkt.sold_high != null ? mkt.sold_high : null,
+      active_median: n2(mkt.median_active_price),
+      active_listings_used: mkt.listings_used != null ? mkt.listings_used : null,
+    };
+
+    /* WHAT TO PAY, INDEPENDENT OF ANY ASK (22 Sept).
+
+       The ceiling, the net after costs and the profit target do not depend
+       on what the seller asks -- only the verdict does. So the record
+       carries them on their own, and the scanner can show "what to pay"
+       on every result before anybody types a price (see the preview flag
+       on POST /buymax). Copied from calc, never recomputed. Absent when
+       there is no decision, or when the pool was withheld and only the
+       lowest-sale test ran (no ceiling exists then). */
+    const wtpMax = economics.maximum_buy;
+    const whatToPay = (action === 'NO_DECISION' || floorBasis || wtpMax === null || wtpMax === undefined) ? null : {
+      max: wtpMax,
+      market: market.value,
+      market_basis: market.basis,
+      expected_net: economics.expected_net,
+      desired_profit: economics.desired_profit,
+      target_margin: ci.expected_resale > 0 && Number.isFinite(Number(c.desired_profit))
+        ? Math.round((Number(c.desired_profit) / Number(ci.expected_resale)) * 100) / 100 : null,
+      not_flippable: wtpMax <= 0.75,
+      confirm_first: f.indexOf('identity_unconfirmed') > -1,
+      risk_hold: f.indexOf('risk_above_buy_ceiling') > -1,
+    };
+
+    /* NO DECISION MEANS NO NUMBERS TO ACT ON. On a no-call the engine may
+       still have computed a ceiling from the pool it then declined to trust
+       (two sales, asks only). Printing that ceiling beside "no decision" is
+       the contradiction the panel spent a month removing, so the record
+       drops every figure somebody could pay against. The counts stay:
+       "2 sales found" is the reason, not a price. */
+    if (action === 'NO_DECISION') {
+      market.value = null;
+      market.basis = null;
+      ['maximum_buy', 'target_offer', 'expected_net', 'expected_profit', 'roi'].forEach((k) => { economics[k] = null; });
+      economics.basis = null;
+    }
+
+    const confidence = confidenceLevel({
+      action, evidence, identity, risk: riskOut, cfg,
+      engineScore: payload.confidence ? payload.confidence.buymax_confidence : null,
+    });
+
+    /* WHAT WOULD CHANGE IT, AND WHAT ELSE TO DO. Built from the same numbers,
+       never from a model. */
+    const change = [];
+    const alternatives = [];
+    const max = economics.maximum_buy;
+    if (action === 'BUY') {
+      if (floorBasis) {
+        change.push('An ask high enough that the lowest recent sale no longer clears it.');
+        alternatives.push('Narrow the search to one version before paying anywhere near the typical price.');
+      } else {
+        change.push('An ask above ' + $(max) + ' -- the most this is worth paying.');
+        if (market.sold_low) change.push('Recent sales falling well below ' + $(market.sold_low) + '.');
+        if (economics.target_offer !== null && ask > economics.target_offer) alternatives.push('Open at ' + $(economics.target_offer) + '.');
+      }
+    } else if (action === 'WALK_AWAY') {
+      if (max > 0) {
+        change.push('The seller coming down to ' + $(max) + ' or less.');
+        alternatives.push('Counter at ' + $(economics.target_offer || max) + '; never above ' + $(max) + '.');
+      } else {
+        change.push('Nothing at this price: fees and postage exceed what it sells for. Sell it in a lot, not as a single.');
+      }
+    } else if (action === 'REVIEW') {
+      if (f.indexOf('identity_unconfirmed') > -1) change.push('Confirming the card' + (identity.reasons.length ? ': ' + identity.reasons.join('; ') : '') + '.');
+      if (f.indexOf('borderline') > -1 && max !== null) { change.push('Getting the price to ' + $(max) + ' or less.'); alternatives.push('Counter at ' + $(max) + '.'); }
+      if (f.indexOf('risk_above_buy_ceiling') > -1) change.push('Pinning down the risks: ' + riskOut.reasons.slice(0, 2).join('; ') + '.');
+      if (f.some((x) => /^analysis_confidence_below/.test(x)) || f.indexOf('provider_degraded') > -1) change.push('More clean completed sales of this exact card.');
+    } else {
+      if (evidence.quality === 'UNAVAILABLE') change.push('Trying again later -- the sold-price lookup allowance is spent for today.');
+      else if (evidence.quality === 'REFUSED') change.push('Narrowing the search to one version -- card number, parallel or grade -- so the sales describe a single card.');
+      else if (evidence.quality === 'ACTIVE_ONLY' || evidence.quality === 'NONE') change.push('Completed sales of this exact card. Asking prices alone are not a value.');
+      else if (evidence.quality === 'INSUFFICIENT' || evidence.quality === 'THIN') change.push('At least ' + (cfg.market.veryThinSoldComps + 1) + ' completed sales of this card (found ' + (market.sold_count || 0) + ').');
+      else change.push('Card details the pricing search can match.');
+    }
+
+    /* WHAT WE DON'T KNOW -- the gaps this decision stands on, from facts
+       already in hand (the scanner's identity doubts, the risk codes, the
+       evidence grade, the caller's liquidity). Never a guess. */
+    const unknown = [];
+    identity.reasons.forEach((r) => unknown.push('The card: ' + r + '.'));
+    if (riskOut.codes.indexOf('condition_unknown') > -1) unknown.push('Raw or graded: the sales may be for a different condition than this copy.');
+    if (riskOut.codes.indexOf('parallel_unknown') > -1 && !(request.item && request.item.parallel)) unknown.push('Whether it is a parallel: none was named, so it is priced as the base card.');
+    if (evidence.quality === 'THIN') unknown.push('Whether ' + (market.sold_count || 0) + ' sales are typical.');
+    if (ctx.liquidity && ctx.liquidity.known === false && ctx.liquidity.reason) unknown.push('How fast it sells: ' + ctx.liquidity.reason + '.');
+
+    return {
+      version: RECORD_VERSION,
+      kind: 'buy',
+      action,
+      engine_result: decision ? decision.result : null,
+      decided_at: new Date().toISOString(),
+      why: decision ? decision.reason : null,
+      summary: payload.explanation ? payload.explanation.summary : null,
+      ask,
+      market,
+      economics,
+      evidence,
+      identity,
+      liquidity: ctx.liquidity || null,
+      risk: riskOut,
+      confidence: {
+        level: confidence.level,
+        reasons: confidence.reasons,
+        meaning: CONFIDENCE_MEANING,
+        engine_score: payload.confidence ? payload.confidence.buymax_confidence : null,
+      },
+      assumptions: (payload.meta && payload.meta.assumptions) || [],
+      alternatives,
+      unknown,
+      what_would_change: change,
+      what_to_pay: whatToPay,
+    };
+  }
+
+  /* When the engine never ran (it threw), the only honest record is none. */
+  function noDecisionRecord(reason) {
+    return {
+      version: RECORD_VERSION, kind: 'buy', action: 'NO_DECISION', engine_result: null,
+      decided_at: new Date().toISOString(), why: reason, summary: reason, ask: null,
+      market: null, economics: null,
+      evidence: { quality: 'NONE', reasons: [reason], refusal: null },
+      identity: { status: 'not_checked', reasons: [], completeness: null }, liquidity: null,
+      risk: { score: null, level: null, reasons: [] },
+      confidence: { level: 'NONE', reasons: ['no decision was made'], meaning: CONFIDENCE_MEANING, engine_score: null },
+      assumptions: [], alternatives: [], unknown: [], what_would_change: ['Try again in a moment.'], what_to_pay: null,
+    };
+  }
+
+  module.exports = { buildDecisionRecord, noDecisionRecord, actionFor, evidenceQuality, riskLevel, ACTIONS, CONFIDENCE_MEANING, RECORD_VERSION };
+
+});
+
 // ==================== core/engine.js ====================
 __def('core/engine', function (module, exports, require) {
 
@@ -1149,6 +1563,7 @@ __def('core/engine', function (module, exports, require) {
   const { calculate } = require('./calc');
   const { decide } = require('./decision');
   const { explain } = require('./explain');
+  const { buildDecisionRecord } = require('./record');
   const { round2 } = require('./stats');
 
   async function runBuyMax(body, { cfg, providers }) {
@@ -1261,6 +1676,19 @@ __def('core/engine', function (module, exports, require) {
     // 9. Calculation ---------------------------------------------------------
     const calc = calculate({ expectedResale, request, riskScore: risk.score }, cfg);
 
+    /* The cheapest-sale test for a withheld pool (see decide). Uses the same
+       calculate() as everything else, with the caller's lowest recent sale
+       as the resale figure and no risk haircut -- it asks "does even the
+       worst case clear", not "what is the ceiling". */
+    let floor = null;
+    const floorPrice = request.context && request.context.sold_floor;
+    if (soldRefusal && floorPrice > 0) {
+      const fc = calculate({ expectedResale: floorPrice, request, riskScore: 0 }, cfg);
+      if (fc && Number.isFinite(fc.expected_profit_at_asking)) {
+        floor = { price: floorPrice, keep: fc.expected_profit_at_asking, net: fc.net_proceeds };
+      }
+    }
+
     // 10. Decision -----------------------------------------------------------
     const blockers = [];
     if (!providersUsed.length) {
@@ -1280,6 +1708,7 @@ __def('core/engine', function (module, exports, require) {
         soldRefusal,
         providerErrors,
         blockers,
+        floor,
       },
       cfg
     );
@@ -1383,6 +1812,7 @@ __def('core/engine', function (module, exports, require) {
            client kept rendering "Your call" because the flag never left
            the server. */
         no_call: !!decision.no_call,
+        basis: decision.basis || null,
         reason: decision.reason,
         factors: decision.factors,
       },
@@ -1410,6 +1840,13 @@ __def('core/engine', function (module, exports, require) {
       market: payload.market,
       decision,
       request,
+    });
+
+    // 12. The canonical decision record -- a projection, no new numbers. ----
+    payload.decision_record = buildDecisionRecord({
+      payload, calc, decision, request, cfg, risk, soldRefusal, floor,
+      soldAvailable, sold: intel.sold,
+      activeEstimate: activeMarket.active_market_estimate !== null,
     });
 
     return { status: 200, payload };
@@ -1944,6 +2381,7 @@ __def('providers/local', function (module, exports, require) {
         if (raw && (raw.refused === true || raw.refusal_reason)) {
           out.sold_refused = {
             reason: raw.refusal_reason || 'contaminated comp pool',
+            kind: typeof raw.refusal_kind === 'string' ? raw.refusal_kind : null,
             sold_count: Number(raw.sold_count) || 0,
           };
           out.available = true;
@@ -2288,11 +2726,18 @@ __def('index', function (module, exports, require) {
           error: 'engine_error',
           details: [err.message],
           decision: { result: 'REVIEW', reason: 'BuyMax failed before a decision could be made.' },
+          decision_record: require('./core/record').noDecisionRecord('BuyMax failed before a decision could be made.'),
         });
       }
 
       const payload = result.payload;
-      if (result.status === 200 && (store || pool)) {
+      /* PREVIEW (22 Sept): the scanner asks "what should I pay" for every
+         result before anybody types a price, with asking_price 0. That is
+         not a decision somebody made, so it is not logged -- the outcome
+         table stays a record of real asks. */
+      const preview = !!(req.body && req.body.preview === true);
+      if (preview && payload.meta) payload.meta.preview = true;
+      if (result.status === 200 && (store || pool) && !preview) {
         const request = { asking_price: payload.costs.purchase_price };
         /* Logging must never cost somebody their answer. If the write
            fails the analysis still returns, just without an id -- and
@@ -2366,7 +2811,8 @@ __def('index', function (module, exports, require) {
     return app;
   }
 
-  module.exports = { mountBuyMax, router, runBuyMax, config, buildProviders, makeLocalProvider };
+  const decisionRecord = require('./core/record');
+  module.exports = { mountBuyMax, router, runBuyMax, config, buildProviders, makeLocalProvider, decisionRecord };
 
 });
 
