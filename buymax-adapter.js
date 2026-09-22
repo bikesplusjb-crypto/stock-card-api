@@ -68,7 +68,7 @@ function makeCardGaugeHook(soldCompsFn) {
   return async function getSoldCompsForBuyMax(item) {
     const query = identityToQuery(item);
     if (!query) {
-      return { refused: true, refusal_reason: 'no card identity to search on' };
+      return { refused: true, refusal_kind: 'no_identity', refusal_reason: 'no card identity to search on' };
     }
 
     /* askMedian is passed as 0 deliberately. Inside getSoldComps it is
@@ -81,7 +81,7 @@ function makeCardGaugeHook(soldCompsFn) {
     /* No answer at all. Distinct from a refusal: nothing came back,
        rather than something came back and was rejected. */
     if (!raw) {
-      return { refused: true, refusal_reason: 'no sold comps returned' };
+      return { refused: true, refusal_kind: 'no_comps', refusal_reason: 'no sold comps returned' };
     }
 
     /* THE RATE LIMIT IS NOT A REFUSAL EITHER, AND MUST NOT READ AS ONE.
@@ -92,7 +92,7 @@ function makeCardGaugeHook(soldCompsFn) {
        own reason so a shop seeing NO CALL all afternoon can tell an
        exhausted allowance from a genuinely untradeable card. */
     if (raw.rateLimited) {
-      return { refused: true, refusal_reason: 'comp lookup rate limited — allowance spent' };
+      return { refused: true, refusal_kind: 'rate_limited', refusal_reason: 'comp lookup rate limited — allowance spent' };
     }
 
     /* THE TWO REAL REFUSALS, TRANSLATED.
@@ -110,6 +110,7 @@ function makeCardGaugeHook(soldCompsFn) {
     if (raw.soldContaminated) {
       return {
         refused: true,
+        refusal_kind: 'contaminated',
         refusal_reason: 'comp pool contaminated — the recent sales describe more than one version of this card',
         sold_count: raw.soldCount || 0
       };
@@ -117,6 +118,7 @@ function makeCardGaugeHook(soldCompsFn) {
     if (raw.soldLimited) {
       return {
         refused: true,
+        refusal_kind: 'limited',
         refusal_reason: 'too few clean sales of this exact card to price it',
         sold_count: raw.soldCount || 0
       };
@@ -169,6 +171,7 @@ function makeCardGaugeHook(soldCompsFn) {
       if (med > 0 && ((hi > 0 && hi / med >= WIDE_SPREAD_X) || (lo > 0 && med / lo >= WIDE_SPREAD_X))) {
         return {
           refused: true,
+          refusal_kind: 'wide_spread',
           refusal_reason: 'sale prices span several versions of this card — narrow the search to price it',
           sold_count: raw.soldCount || 0
         };
@@ -178,7 +181,7 @@ function makeCardGaugeHook(soldCompsFn) {
     const usedRaw = !!(raw.soldRaw && raw.soldRaw.count >= 3 && raw.soldRaw.median);
     const median  = Number(usedRaw ? raw.soldRaw.median : raw.soldMedian);
     if (!isFinite(median) || median <= 0) {
-      return { refused: true, refusal_reason: 'no usable sold median' };
+      return { refused: true, refusal_kind: 'no_median', refusal_reason: 'no usable sold median' };
     }
 
     /* DEPTH HAS TO MATCH THE MEDIAN, NOT THE SEARCH.
@@ -218,4 +221,9 @@ function makeCardGaugeHook(soldCompsFn) {
   };
 }
 
+/* refusal_kind (22 Sept): the same refusals, with a machine-readable name
+   beside the sentence, so the decision record can tell "we found sales and
+   would not trust them" (contaminated, wide_spread) from "there were none"
+   (no_comps) and "we never looked" (rate_limited). Additive -- the sentence
+   and the refused flag are unchanged. */
 module.exports = { makeCardGaugeHook, identityToQuery };
