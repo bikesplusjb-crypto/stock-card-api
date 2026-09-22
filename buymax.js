@@ -1381,8 +1381,10 @@ __def('core/record', function (module, exports, require) {
     } : {
       basis: c.net_proceeds === null || c.net_proceeds === undefined ? null
              : (soldAvailable ? 'sold_median' : 'asking_prices'),
-      maximum_buy: n2(c.maximum_buy_price),
-      target_offer: n2(c.target_offer),
+      /* No call means no ceiling: a NO_DECISION built on asking prices (or a
+         withheld pool) must not print a "Maximum buy" the engine refused to stand behind. */
+      maximum_buy: action === 'NO_DECISION' ? null : n2(c.maximum_buy_price),
+      target_offer: action === 'NO_DECISION' ? null : n2(c.target_offer),
       expected_net: c.net_proceeds === null || c.net_proceeds === undefined ? null : n2(c.net_proceeds - extras),
       expected_profit: n2(c.expected_profit_at_asking),
       roi: n2(c.roi_at_asking),
@@ -1682,7 +1684,12 @@ __def('core/engine', function (module, exports, require) {
        worst case clear", not "what is the ceiling". */
     let floor = null;
     const floorPrice = request.context && request.context.sold_floor;
-    if (soldRefusal && floorPrice > 0) {
+    /* Only for a pool refused because it MIXES versions (contaminated /
+       wide spread): there the cheapest sale is a real worst case across
+       versions. A "limited" / "no median" refusal means the pool is too
+       small or not this card, so its lowest sale is not a floor. */
+    const floorKind = soldRefusal && (soldRefusal.kind || soldRefusal.refusal_kind);
+    if (soldRefusal && floorPrice > 0 && (floorKind === 'contaminated' || floorKind === 'wide_spread')) {
       const fc = calculate({ expectedResale: floorPrice, request, riskScore: 0 }, cfg);
       if (fc && Number.isFinite(fc.expected_profit_at_asking)) {
         floor = { price: floorPrice, keep: fc.expected_profit_at_asking, net: fc.net_proceeds };
