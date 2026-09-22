@@ -14,7 +14,7 @@ const express = require("express");
    shape BuyMax expects; without it a contaminated pool would arrive as
    an ordinary median and BuyMax would quote a ceiling off sales this
    file already refuses to publish. */
-const { mountBuyMax } = require("./buymax");
+const { mountBuyMax, decisionRecord, config: buymaxConfig } = require("./buymax");
 const { makeCardGaugeHook } = require("./buymax-adapter");
 const cors = require("cors");
 const multer = require("multer");
@@ -4983,6 +4983,183 @@ function computeLiquidity(market, sold) {
            daysToClear: days, label, tone, plain, wait };
 }
 
+/* ── ONE FEE MODEL (22 Sept) ──────────────────────────────────────────
+
+   Selling costs were written down in three places with three answers:
+     BuyMax (and What to Pay)   13.25% + $0.30 + $0 postage  (buymax.js config, env)
+     scanner Sell/Keep/Grade    13%    + $0.30 + $4 postage  (scanner.html)
+     sort.html piles            13%    + $0.30 + $4.50 postage
+   so one screen could show two different "what you clear" numbers.
+
+   The canonical source is now BuyMax's config -- the one set of values
+   the server already calculates ceilings with, overridable per
+   environment (BUYMAX_SELL_FEE_RATE, BUYMAX_PAYMENT_FIXED,
+   BUYMAX_DEFAULT_SHIPPING). Every scan and typed search carries it as
+   `fees`, and the pages use it instead of their own constants.
+
+   NOT SWITCHED ON YET. The pages only adopt it when FEE_MODEL_UNIFIED is
+   "true" on the server, because turning it on changes numbers people see
+   and the intended postage has not been confirmed. Until then each page
+   keeps its current values, exactly as before. Set the three values and
+   FEE_MODEL_UNIFIED=true on Render -- no deploy -- and every page agrees.
+
+   Business is deliberately separate: a shop's own fee and postage
+   settings are that shop's economics, entered by the shop. */
+function feeModel() {
+  const c = (buymaxConfig && buymaxConfig.costs) || {};
+  return {
+    version: 1,
+    sell_fee_rate: Number(c.sellFeeRate),
+    payment_fixed: Number(c.paymentFixed),
+    shipping:      Number(c.defaultShipping),
+    unified:       String(process.env.FEE_MODEL_UNIFIED || "") === "true"
+  };
+}
+
+/* ── THE EVIDENCE RECEIPT: "CAN I TRUST THIS NUMBER?" (22 Sept) ─────────
+
+   Every scan and every typed search now carries `evidence`: what the price
+   rests on, how good that is, what we do not know, and what would change
+   it. 180 results were viewed last week against 5 BuyMax checks, so this --
+   not the buy panel -- is where trust is won or lost.
+
+   NOTHING NEW IS MEASURED HERE. It reads the fields the lookup already
+   returned (the sold pool, its refusals, the flags the scan handler set)
+   and puts them in one place:
+
+     quality  -- decisionRecord.evidenceQuality from buymax.js, the SAME
+                 function BuyMax's decision record uses, so the scanner
+                 and BuyMax can never grade one pool two ways. Thresholds
+                 are BuyMax's: <= veryThinSoldComps (2) sales is
+                 INSUFFICIENT, under 5 is THIN, a 3x spread is
+                 MIXED, 10+ sales inside 1.6x of the median is HIGH, else
+                 MODERATE. Refusals: contaminated / wide pool -> REFUSED,
+                 too few clean -> INSUFFICIENT, none -> NONE or ACTIVE_ONLY.
+     INDIRECT -- one extra grade for a price that is real but is not THIS
+                 card's: a broadened search, a dropped print run, a
+                 different year, or a range across numbered versions.
+                 These were "limited" in the scanner's own label; this
+                 names why.
+
+   It is a grade of the evidence, not a probability, and it says so. */
+function buildEvidenceReceipt(sold, market, f) {
+  /* A report, never a gate: if anything in here throws, the scan still
+     returns -- just without the receipt. */
+  try { return buildEvidenceReceiptInner(sold, market, f); }
+  catch (e) { console.log("[evidence] receipt skipped: " + (e && e.message)); return null; }
+}
+function buildEvidenceReceiptInner(sold, market, f) {
+  const x = f || {};
+  const cfg = buymaxConfig;
+  const s = sold || null;
+  const known = [], unknown = [], change = [];
+  const money = (v) => "$" + (Number(v) >= 100 ? Math.round(Number(v)) : Number(v).toFixed(2));
+
+  if (x.isRedemption) {
+    return { version: 1, quality: "NONE", value: null, basis: null, sold_count: 0,
+      reasons: ["a redemption voucher has no price of its own"], known: [],
+      unknown: ["What card the voucher redeems for -- that card, not the slip, has the value."],
+      would_change: ["Redeeming it, then scanning the card itself."],
+      meaning: decisionRecord.CONFIDENCE_MEANING.replace("this decision", "this price") };
+  }
+
+  // The headline the page prints: the raw pool when it has 3+ sales
+  // (unifySoldHeadline), else soldMedian -- the rule the adapter uses too.
+  const rp = (s && s.soldRaw) || {};
+  const useR = Number(rp.count) >= 3 && Number(rp.median) > 0;
+  const med = s ? Number(useR ? rp.median : s.soldMedian) || 0 : 0;
+  const lo  = s ? Number(useR && rp.low  ? rp.low  : s.soldLow)  || 0 : 0;
+  const hi  = s ? Number(useR && rp.high ? rp.high : s.soldHigh) || 0 : 0;
+  // Count by the scanner label's rule: the raw pool when it has 3+ sales.
+  const n   = s ? Number(Number(rp.count) >= 3 ? rp.count : (s.soldCountUsed || s.soldCount)) || 0 : 0;
+
+  let refusal = null;
+  if (!s || !(Number(s.soldCount) > 0)) refusal = { kind: s && s.rateLimited ? "rate_limited" : "no_comps", reason: "no completed sales found" };
+  else if (s.rateLimited)       refusal = { kind: "rate_limited", reason: "sold prices are unavailable right now" };
+  else if (s.soldContaminated)  refusal = { kind: "contaminated", reason: "the sales found mix different versions of this card" };
+  else if (!(med > 0))          refusal = { kind: "limited", reason: "sales were found, but too few of them are this exact card" };
+
+  const q = decisionRecord.evidenceQuality({
+    soldAvailable: !refusal, sold: { count: n, median: med, low: lo, high: hi },
+    soldRefusal: refusal, activeEstimate: Number(market && market.avgPrice) > 0, cfg
+  });
+  let quality = q.quality;
+  const reasons = q.reasons.slice();
+
+  if (!refusal && s.soldWideBase && (quality === "HIGH" || quality === "MODERATE")) {
+    quality = "MIXED"; reasons.push("the base sales span more than one card");
+  }
+  const yc = x.yearCheck || {};
+  const indirect = [];
+  if (s && s.mixedSerials)   indirect.push("a range across every numbered version, not a price for this copy");
+  if (x.serialDropped)       indirect.push("priced without the print run (" + (x.serialRead || "") + ")");
+  if (x.soldBroadened)       indirect.push("from a broader search that may include other versions");
+  if (yc.source === "empty-retry" || yc.source === "listings" || x.yearGuess)
+                             indirect.push("from sales under a different year than the one read");
+  if (indirect.length && quality !== "NONE" && quality !== "UNAVAILABLE") { quality = "INDIRECT"; reasons.push.apply(reasons, indirect); }
+
+  // WHAT WE KNOW -- facts about the pool, nothing inferred.
+  if (n > 0 && !refusal) {
+    known.push(n + " completed sale" + (n === 1 ? "" : "s") + " in the last " + ((s && s.lookbackDays) || CARDAPI_LOOKBACK) + " days" +
+               (s.soldRawBasis === "base" ? ", ungraded base copies" : s.soldRawBasis === "ungraded" ? ", ungraded copies" : ""));
+    if (lo > 0 && hi > 0) known.push(Math.abs(hi - lo) < 0.005 ? "They sold at " + money(lo) + "."
+                                      : "Most sold between " + money(lo) + " and " + money(hi) + ".");
+  }
+  let newestDays = null;
+  if (s && s.lastSaleDate) {
+    const t = Date.parse(s.lastSaleDate);
+    if (isFinite(t)) newestDays = Math.max(0, Math.floor((Date.now() - t) / 86400000));
+    if (newestDays !== null && !refusal) known.push("Newest sale " + (newestDays === 0 ? "today" : newestDays + " day" + (newestDays === 1 ? "" : "s") + " ago") + ".");
+  }
+  if (s && s.soldGraded && Number(s.soldGraded.count) > 0 && useR)
+    known.push(s.soldGraded.count + " graded sale" + (s.soldGraded.count === 1 ? " was" : "s were") + " kept out of this price.");
+
+  // WHAT WE DON'T KNOW -- each from a flag the lookup set, never a guess.
+  if (x.parallel && x.parallelCertain === false)
+    unknown.push("Whether this is the " + x.parallel + ": it was judged from colour, not printed text.");
+  if (x.serialDropped) unknown.push("What the " + x.serialRead + " itself sells for: no sales of that print run were found.");
+  if (x.soldBroadened) unknown.push("Sales of this exact card: none matched, so the price comes from a wider search.");
+  if (yc.conflict || yc.otherYear || x.yearGuess) unknown.push("The year: the front and back or the sales point to a different one.");
+  if (x.verified && x.verified.checked && x.verified.exists === false)
+    unknown.push("Whether that card number is in this set: the catalog could not find it.");
+  if (!refusal && n > 0 && quality === "THIN") unknown.push("Whether " + n + " sale" + (n === 1 ? " is" : "s are") + " typical: too few to be sure.");
+  if (newestDays !== null && newestDays > 7 && !refusal) unknown.push("Whether the price has moved in the " + newestDays + " days since the last sale.");
+  if (quality === "ACTIVE_ONLY") unknown.push("What it actually sells for: only asking prices were found, and an ask is not a sale.");
+
+  // WHAT WOULD CHANGE IT
+  if (quality === "MIXED" || quality === "REFUSED") change.push("Narrowing the search to one version -- card number, parallel or grade.");
+  if (quality === "THIN" || quality === "INSUFFICIENT" || quality === "NONE" || quality === "ACTIVE_ONLY")
+    change.push("More completed sales of this exact card.");
+  if (x.parallel && x.parallelCertain === false) change.push("Confirming the parallel below.");
+  if (x.serialDropped) change.push("Sales of the " + x.serialRead + " itself.");
+  if ((quality === "HIGH" || quality === "MODERATE") && lo > 0) change.push("New sales well below " + money(lo) + " would lower this value.");
+  if (quality === "UNAVAILABLE") change.push("Trying again later.");
+
+  /* One line under the grade, in the scanner label's own words. */
+  const why = quality === "INDIRECT" ? indirect[0]
+    : quality === "MIXED" ? (s && s.soldWideBase ? "the base sales span more than one card" : "the sale prices vary a lot")
+    : quality === "REFUSED" || quality === "INSUFFICIENT" ? (refusal ? refusal.reason : "too few sales of this card to set a value")
+    : quality === "THIN" ? "only a few sales of this card recently"
+    : quality === "ACTIVE_ONLY" ? "no completed sales -- asking prices only"
+    : quality === "UNAVAILABLE" ? "sold prices are unavailable right now"
+    : quality === "NONE" ? "no sales or listings found for this card"
+    : "";
+
+  const priced = quality === "HIGH" || quality === "MODERATE" || quality === "THIN" || quality === "INDIRECT" || quality === "MIXED";
+  return {
+    version: 1,
+    quality,
+    value: priced && med > 0 ? Math.round(med * 100) / 100 : null,
+    basis: priced && med > 0 ? "sold_median" : (quality === "ACTIVE_ONLY" ? "asking_prices" : null),
+    sold_count: refusal ? (Number(s && s.soldCount) || 0) : n,
+    window_days: (s && s.lookbackDays) || CARDAPI_LOOKBACK,
+    newest_sale_days: newestDays,
+    reasons, why,
+    known, unknown, would_change: change,
+    meaning: "A grade of the evidence behind this price. It is not a probability."
+  };
+}
+
 function askVsSold(market, sold) {
   if (!sold || !sold.soldCount) return null;
 
@@ -5809,6 +5986,9 @@ app.get("/api/card-market", async (req, res) => {
       sold:              sold || null,
       askVsSold:         askVsSold(market, sold),
       liquidity:         computeLiquidity(market, sold),
+      /* "Can I trust this number?" -- see buildEvidenceReceipt. New field. */
+      evidence:          buildEvidenceReceipt(sold, market, {}),
+      fees:              feeModel(),
       avgPrice:          market.avgPrice,
       avgSoldPrice:      market.avgPrice,
       lowPrice:          market.lowPrice,
@@ -7567,6 +7747,20 @@ app.post(
         sold:              sold || null,
         askVsSold:         askVsSold(market, sold),
       liquidity:         computeLiquidity(market, sold),
+        /* "Can I trust this number?" -- see buildEvidenceReceipt. New field
+           (22 Sept); built from flags this handler already set. */
+        evidence:          buildEvidenceReceipt(sold, market, {
+          isRedemption: ai.isRedemption === true,
+          parallel: cleanVal(ai.parallel) && !GENERIC_SET.test(cleanVal(ai.parallel)) ? cleanVal(ai.parallel) : "",
+          parallelCertain: parallelCertainFor(ai),
+          serialRead: serialDenominator(ai) || "",
+          serialDropped: !!(serialDenominator(ai)
+                            && String(soldQuery || "").indexOf(serialDenominator(ai)) < 0
+                            && String(searchQuery || "").indexOf(serialDenominator(ai)) >= 0),
+          soldBroadened: soldBroadened, yearGuess: yearGuess, yearCheck: yearCheck,
+          verified: verification
+        }),
+        fees:              feeModel(),   /* see feeModel -- one fee model */
         matchQuality:      market.matchQuality || "exact",
         tierUsed:          market.tierUsed     || "",
         priceNote:         market.priceNote    || "",
@@ -13417,7 +13611,17 @@ const buymaxStore = {
       decision_reason:   d.reason || null,
       /* The distinction the whole no_call change exists for: a REVIEW
          that weighed the ask, versus one that never looked at it. */
-      no_call:           !!d.no_call
+      no_call:           !!d.no_call,
+      /* THE DECISION RECORD, STORED WHOLE (22 Sept). Everything needed to
+         reconstruct what CardGauge said and why -- action, evidence,
+         economics, identity, confidence -- next to the outcome columns, so
+         "expected vs actual" can be asked later without guessing what the
+         expectation was. canonical_decision and evidence_quality are pulled
+         out beside it because they are what gets grouped by. */
+      decision_record:     payload.decision_record || null,
+      canonical_decision:  (payload.decision_record && payload.decision_record.action) || null,
+      evidence_quality:    (payload.decision_record && payload.decision_record.evidence
+                            && payload.decision_record.evidence.quality) || null
     };
     const { data, error } = await supabaseAdmin
       .from("buymax_analyses").insert(row).select("id").single();
@@ -13433,14 +13637,23 @@ const buymaxStore = {
     const ok = ["bought","passed","sold","ignored","corrected"];
     const action = ok.includes(String(outcome.action)) ? outcome.action : null;
     if (!action) return { ok: false, reason: "bad_action" };
+    /* AN OUTCOME IS A SEQUENCE, NOT ONE CELL (22 Sept).
+
+       "Bought" at the table and "sold" weeks later are two reports about
+       one decision. The old update wrote every column every time, so the
+       second report nulled the price from the first and there was no way
+       to measure time to sale. Now only what was reported is written, and
+       the moment of buying and of selling each get their own timestamp. */
+    const num = (v) => (v === null || v === undefined || v === "" || !isFinite(Number(v))) ? null : Number(v);
+    const now = new Date().toISOString();
+    const patch = { outcome_action: action, outcome_reported_at: now };
+    if (num(outcome.paid_price) !== null) patch.outcome_paid_price = num(outcome.paid_price);
+    if (num(outcome.sold_price) !== null) patch.outcome_sold_price = num(outcome.sold_price);
+    if (action === "bought") patch.outcome_bought_at = now;
+    if (action === "sold")   patch.outcome_sold_at = now;
     const { data, error } = await supabaseAdmin
       .from("buymax_analyses")
-      .update({
-        outcome_action:      action,
-        outcome_paid_price:  outcome.paid_price ?? null,
-        outcome_sold_price:  outcome.sold_price ?? null,
-        outcome_reported_at: new Date().toISOString()
-      })
+      .update(patch)
       .eq("id", id).select("id");
     if (error) return { ok: false, reason: error.message };
     return { ok: Array.isArray(data) && data.length > 0 };
