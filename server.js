@@ -781,6 +781,7 @@ setInterval(function () {
   const now = Date.now(), today = etDay();
   userProCache.forEach((v, k) => { if (v.exp < now) userProCache.delete(k); });
   userUsageCache.forEach((v, k) => { if (k.split("|")[1] !== today) userUsageCache.delete(k); });
+  scanRefunds.forEach((v, k) => { if (k.split("|")[1] !== today) scanRefunds.delete(k); });
 }, 30 * 60 * 1000).unref();
 
 /* Any valid session (no shop header). Returns { uid, pro } or null. */
@@ -866,10 +867,64 @@ async function userDailyGate(req, res, next, kind, onPass) {
     return true;
   }
   req.cgUser = user;
-  userTick(user.uid, day, kind);
+  if (kind === "scan") scanChargeOnSuccess(req, res, user.uid, day);
+  else userTick(user.uid, day, kind);
   if (onPass) onPass();
   next();
   return true;
+}
+
+/* A SCAN THAT FAILED DOES NOT COST ONE OF THE 25 (22 Sept).
+
+   The count used to go up before the scan ran, so a blurry photo, a
+   HEIC the server refused, "couldn't read this card" or a server error
+   each used up a free scan -- and a new user's first bad photo ate into
+   their day. Now the slot is RESERVED in memory up front (so twenty
+   scans fired at once still can't pass the cap) and only written to the
+   database when the scan comes back with a result. A failure gives the
+   reservation back.
+
+   Failure = HTTP 4xx/5xx, or a body (plain JSON or the final streamed
+   line) saying success:false. A scan the person closed half way still
+   counts: the vision call was spent. Refunds are capped per account per
+   day so a stream of junk photos can't run the vision bill for free. */
+const SCAN_REFUNDS_PER_DAY = envNum("SCAN_REFUNDS_PER_DAY", 10);
+const scanRefunds = new Map();   // uid|day -> refunds given
+function scanChargeOnSuccess(req, res, uid, day) {
+  const key = uid + "|" + day + "|scan";
+  userUsageCache.set(key, (userUsageCache.get(key) || 0) + 1);   // reserve
+  let failed = false, settled = false;
+  const sniff = function (body) {
+    try {
+      if (body && typeof body === "object") { if (body.success === false) failed = true; return; }
+      const t = Buffer.isBuffer(body) ? body.toString("utf8") : String(body || "");
+      const last = t.trim().split("\n").pop();
+      if (last && last.indexOf('"success":false') >= 0) failed = true;
+    } catch (e) {}
+  };
+  const origJson = res.json.bind(res), origEnd = res.end.bind(res);
+  res.json = function (body) { sniff(body); return origJson(body); };
+  res.end = function (chunk) { if (chunk) sniff(chunk); return origEnd.apply(res, arguments); };
+  const settle = function (finished) {
+    if (settled) return;
+    settled = true;
+    if (finished && (failed || res.statusCode >= 400)) {
+      const rk = uid + "|" + day;
+      const given = scanRefunds.get(rk) || 0;
+      if (given < SCAN_REFUNDS_PER_DAY) {
+        scanRefunds.set(rk, given + 1);
+        userUsageCache.set(key, Math.max(0, (userUsageCache.get(key) || 1) - 1));
+        console.log("[user-limit] failed scan not counted (" + res.statusCode + ") for " + uid);
+        return;
+      }
+    }
+    // Written to the DB. userTick adds one to the cache too, so take the
+    // reservation back first rather than counting this scan twice.
+    userUsageCache.set(key, Math.max(0, (userUsageCache.get(key) || 1) - 1));
+    userTick(uid, day, "scan");
+  };
+  res.on("finish", function () { settle(true); });
+  res.on("close",  function () { settle(res.writableFinished); });
 }
 
 let visionGlobalDay = "", visionGlobalCount = 0;
@@ -916,7 +971,13 @@ async function lookupGate(req, res, next) {
   if (req.method === "OPTIONS") return next();
   const shop = await shopFromRequest(req);
   if (!shop) {
-    if (await userDailyGate(req, res, next, "lookup")) return;
+    /* TYPED SEARCH IS FREE (22 Sept). Scans are capped at 25 a day; a
+       typed search is the way to keep going past that, and the scan-limit
+       message says so. So there is no per-account daily cap here -- only
+       the per-connection abuse limiter everyone gets (300 per 10 min,
+       3,000 a day). Signed-in searches are still counted, for stats. */
+    const u = await userFromRequest(req);
+    if (u) { req.cgUser = u; userTick(u.uid, etDay(), "lookup"); }
     return lookupLimiter(req, res, next);
   }
   const wait = shopBurstOk(shop.id, "lookup", SHOP_LOOKUP_PER_10MIN);
