@@ -18,7 +18,17 @@ const { mountBuyMax, decisionRecord, config: buymaxConfig } = require("./buymax"
 const { makeCardGaugeHook } = require("./buymax-adapter");
 const cors = require("cors");
 const multer = require("multer");
-const fetch = require("node-fetch");
+/* Every outbound call gets a ceiling. None had one: a hung upstream (eBay,
+   PSA, a catalog) held the request -- and any in-flight gate waiting on it --
+   open until the socket died. 60s is well past a slow vision call; a caller
+   that passes its own timeout keeps it. */
+const nodeFetch = require("node-fetch");
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS) || 60000;
+const fetch = function (url, opts) {
+  const o = Object.assign({}, opts || {});
+  if (o.timeout === undefined) o.timeout = FETCH_TIMEOUT_MS;
+  return nodeFetch(url, o);
+};
 const crypto = require("crypto");
 
 const app = express();
@@ -2919,6 +2929,71 @@ function listingReject(title){
   return null;
 }
 
+/* ── A LISTING FOR ANOTHER SPORT, OR ANOTHER TOPPS PRODUCT (22 Sept) ──────
+
+   Two live scans on launch day, both read correctly, both shown the
+   wrong cards:
+
+     2018 Panini Prizm Justin Jackson RA-JU (football) -- the search also
+       returned "2018-19 Donruss Optic Justin Jackson Rated Rookie", the
+       NBA player of the same name.
+     2023 Topps CJ Abrams /499 (flagship, set blank) -- the search
+       returned Bowman Chrome, Chrome Platinum and Topps Chrome /499s.
+
+   The query cannot carry the sport (sellers rarely type it) or exclude
+   products (eBay ANDs keywords), so the listings are filtered after the
+   fetch instead. Both rules only REMOVE listings, and only on evidence
+   in the title itself:
+
+     SPORT  -- the scan names a sport, and the title names another one
+               ("NBA", "hockey"...), or carries a season ("2018-19") on a
+               sport that uses single years (football, baseball) -- the
+               season format is basketball's and hockey's.
+     TOPPS  -- the scan reads plain Topps with no set or insert
+               (flagship), and the title names a different Topps product
+               (Chrome, Bowman, Platinum, Heritage, Stadium Club...).
+               Skipped when the scan itself named that product.
+
+   Year is deliberately NOT filtered: detectListingYear() reads these same
+   listings to catch a misread year, and a year filter would blind it. */
+const SPORT_WORDS = {
+  football:   /\b(nfl)\b|\bfootball\b/i,
+  baseball:   /\b(mlb)\b|\bbaseball\b/i,
+  basketball: /\b(nba|wnba)\b|\bbasketball\b/i,
+  hockey:     /\b(nhl)\b|\bhockey\b/i
+};
+/* A season date is "2024-25" / "2024/25": the second half must be the
+   NEXT year. Checking that stops a print run like "2023 /50" or
+   "2021 /25" (a baseball card numbered to 25) reading as a season. */
+function hasSeasonYear(t) {
+  const re = /\b((?:19|20)\d{2})\s*[-\u2013\/]\s*(\d{2})\b/g;
+  let m;
+  while ((m = re.exec(String(t || ""))) !== null) {
+    if ((Number(m[1]) + 1) % 100 === Number(m[2])) return true;
+  }
+  return false;
+}
+const OTHER_TOPPS = /\b(chrome|bowman|platinum|heritage|stadium club|finest|archives|allen\s*&?\s*ginter|gypsy queen|tribute|museum|inception|sterling|dynasty|triple threads|gallery|big league|pristine|cosmic|sapphire|black chrome|topps\s+now)\b/i;
+function listingConflictsCard(title, ai) {
+  const t = String(title || "");
+  if (!t || !ai) return null;
+  const sport = String(ai.sport || "").toLowerCase().trim();
+  if (SPORT_WORDS[sport]) {
+    for (const other in SPORT_WORDS) {
+      if (other !== sport && SPORT_WORDS[other].test(t)) return "another sport (" + other + ")";
+    }
+    if ((sport === "football" || sport === "baseball") && hasSeasonYear(t)) return "a season-dated card (another sport)";
+  }
+  const brand = cleanVal(ai.brand).toLowerCase();
+  const product = [cleanVal(ai.set), cleanVal(ai.insert), cleanVal(ai.cardName)].join(" ");
+  const setBlank = !cleanVal(ai.set) || GENERIC_SET.test(cleanVal(ai.set));
+  if (brand === "topps" && setBlank && !cleanVal(ai.insert)) {
+    const m = t.match(OTHER_TOPPS);
+    if (m && !new RegExp("\\b" + m[1].replace(/\s+/g, "\\s*") + "\\b", "i").test(product)) return "another Topps product (" + m[1] + ")";
+  }
+  return null;
+}
+
 function selectListings(ai, byTier) {
   /* THE ASK SIDE BELIEVED A PARALLEL THE SOLD SIDE HAD REFUSED.
 
@@ -3283,6 +3358,7 @@ async function getEbayCardMarket(query) {
 
 // Parallel-aware lookup for a scanned card. Searches tight first, widens
 // only if needed, then filters titles down to the right version.
+const fetchEbayListingsRaw = function (q, lim) { return fetchEbayListings(q, lim); };
 async function getCardMarketForCard(ai) {
   const tiers = buildQueryTiers(ai);
   if (!tiers.length) {
@@ -3295,6 +3371,17 @@ async function getCardMarketForCard(ai) {
   }
 
   const byTier = {};
+  /* Wrong sport / other Topps product out AS EACH TIER ARRIVES, so the
+     "came back thin -> widen" checks below count only usable listings.
+     See listingConflictsCard. Removal only; logged so it can be audited. */
+  let conflictDrops = 0;
+  const fetchEbayListings = async function (q, lim) {
+    const got = await fetchEbayListingsRaw(q, lim);
+    if (!Array.isArray(got)) return got;
+    const kept = got.filter(function (l) { return !listingConflictsCard(l && l.title, ai); });
+    conflictDrops += got.length - kept.length;
+    return kept;
+  };
   const tightTier = tiers.find(t => t.tier === "tight");
   if (tightTier) byTier.tight = await fetchEbayListings(tightTier.query);
 
@@ -3366,6 +3453,8 @@ async function getCardMarketForCard(ai) {
       }
     }
   }
+
+  if (conflictDrops) console.log("[listings] dropped " + conflictDrops + " listing(s) for another sport or Topps product");
 
   const picked = selectListings(ai, byTier);
   /* Which query the shown price actually came from. set-noNum has to
@@ -4797,7 +4886,7 @@ async function broadenTypedLookup(clean, market, sold, compact) {
       tried++;
 
       const alt = await getSoldComps(q, market.avgPrice, false);
-      const usable = alt && Number(alt.soldCount) > 0 && !alt.soldLimited
+      const usable = alt && Number(alt.soldCount) > 0 && !alt.soldLimited && !alt.soldContaminated
                      && alt.soldRaw && Number(alt.soldRaw.count) >= 3
                      && Number(alt.soldMedian) > 0;
       if (!usable) continue;
@@ -5077,7 +5166,8 @@ function buildEvidenceReceiptInner(sold, market, f) {
   if (!s || !(Number(s.soldCount) > 0)) refusal = { kind: s && s.rateLimited ? "rate_limited" : "no_comps", reason: "no completed sales found" };
   else if (s.rateLimited)       refusal = { kind: "rate_limited", reason: "sold prices are unavailable right now" };
   else if (s.soldContaminated)  refusal = { kind: "contaminated", reason: "the sales found mix different versions of this card" };
-  else if (!(med > 0))          refusal = { kind: "limited", reason: "sales were found, but too few of them are this exact card" };
+  else if (!(med > 0) || s.soldLimited)
+                                refusal = { kind: "limited", reason: "sales were found, but too few of them are this exact card" };
 
   const q = decisionRecord.evidenceQuality({
     soldAvailable: !refusal, sold: { count: n, median: med, low: lo, high: hi },
@@ -5096,7 +5186,13 @@ function buildEvidenceReceiptInner(sold, market, f) {
   if (x.soldBroadened)       indirect.push("from a broader search that may include other versions");
   if (yc.source === "empty-retry" || yc.source === "listings" || x.yearGuess)
                              indirect.push("from sales under a different year than the one read");
-  if (indirect.length && quality !== "NONE" && quality !== "UNAVAILABLE") { quality = "INDIRECT"; reasons.push.apply(reasons, indirect); }
+  /* Only a PRICED grade can become INDIRECT. Upgrading a refusal
+     (REFUSED / INSUFFICIENT) would hand a contaminated pool's median
+     back out as a value. A refusal keeps its grade; the reasons still say
+     the search was indirect. */
+  const pricedBefore = quality === "HIGH" || quality === "MODERATE" || quality === "THIN" || quality === "MIXED";
+  if (indirect.length && pricedBefore) quality = "INDIRECT";
+  if (indirect.length && quality !== "NONE" && quality !== "UNAVAILABLE") reasons.push.apply(reasons, indirect);
 
   // WHAT WE KNOW -- facts about the pool, nothing inferred.
   if (n > 0 && !refusal) {
@@ -5149,8 +5245,9 @@ function buildEvidenceReceiptInner(sold, market, f) {
   return {
     version: 1,
     quality,
-    value: priced && med > 0 ? Math.round(med * 100) / 100 : null,
-    basis: priced && med > 0 ? "sold_median" : (quality === "ACTIVE_ONLY" ? "asking_prices" : null),
+    /* A range across every numbered version has no single value for this copy. */
+    value: priced && med > 0 && !(s && s.mixedSerials) ? Math.round(med * 100) / 100 : null,
+    basis: priced && med > 0 ? (s && s.mixedSerials ? "numbered_range" : "sold_median") : (quality === "ACTIVE_ONLY" ? "asking_prices" : null),
     sold_count: refusal ? (Number(s && s.soldCount) || 0) : n,
     window_days: (s && s.lookbackDays) || CARDAPI_LOOKBACK,
     newest_sale_days: newestDays,
@@ -5841,6 +5938,9 @@ async function recordDailyPriceFromLookup(query, sold, market) {
     if (!supabaseAdmin) return;
     const s = sold || {};
     if (s.soldContaminated || s.soldLimited) return;
+    /* A range across numbered versions, or a base pool spanning more than
+       one card, is not one card's price -- keep it out of the series. */
+    if (s.mixedSerials || s.soldWideBase) return;
 
     /* A QUERY WITH NO NAME IN IT IS NOT A CARD.
 
@@ -6023,7 +6123,7 @@ app.get("/api/card-market", async (req, res) => {
     });
 
     /* After the response, never before it. */
-    if (!compact) recordDailyPriceFromLookup(clean, sold, market);
+    if (!compact) recordDailyPriceFromLookup((sold && sold.broadenedTo) || clean, sold, market); // file under the query that produced the comps
 
     /* Data foundation. A typed search is the person telling us the card,
        so a parallel they typed counts as printed evidence. */
@@ -6780,7 +6880,10 @@ app.post(
           copyrightYear: yearFromLine,
           alias:         buildDisplayName(ai)
         });
-        const lb = (localEarly && localEarly.sureRef) || (localEarly && localEarly.best);
+        /* sureRef null means "tied -- the checklist can't tell them apart";
+           falling back to best there would pick one of the tied rows anyway. */
+        const lb = !localEarly ? null
+          : ("sureRef" in localEarly ? localEarly.sureRef : localEarly.best);
         const ev = (lb && lb.evidence) || [];
         localSure = !!(lb && !lb.card_id && lb.source === "tcgdex"
                        && ev.indexOf("number in set") >= 0
@@ -6909,7 +7012,7 @@ app.post(
          verifyAgainstCatalog's "could not ask" answer, so the page renders
          "Card catalog: not checked -- ..." and nothing reads it as proof. */
       const localRef = localSure && localEarly
-        ? (localEarly.sureRef || localEarly.best) : null;
+        ? ("sureRef" in localEarly ? localEarly.sureRef : localEarly.best) : null;
       const verifyPromise = localSure
         ? Promise.resolve({
             checked: false, exists: null, confidence: null, ucid: null,
@@ -7981,6 +8084,9 @@ async function fetchPsaCert(certNumber) {
 }
 
 app.get("/api/psa-cert", async (req, res) => {
+  /* Express 4 does not catch a rejected async handler: without this a
+     failed lookup left the request hanging and logged an unhandled rejection. */
+  try {
   const certNumber = req.query.cert;
   if (!certNumber) return res.status(400).json({ success: false, error: "cert number required" });
 
@@ -8046,6 +8152,10 @@ app.get("/api/psa-cert", async (req, res) => {
     summary: "Identified from PSA cert " + d.certNumber + " — grade and card details are PSA's own record, not an AI guess.",
     timestamp: Date.now()
   });
+  } catch (e) {
+    console.log("[psa-cert] failed: " + (e && e.message));
+    if (!res.headersSent) res.status(502).json({ success: false, error: "PSA lookup failed -- try again", unavailable: true });
+  }
 });
 
 
@@ -9308,7 +9418,8 @@ async function getStockQuote(symbol) {
     if (!price) return { symbol, price: 0, ok: false, note: "No price (check symbol / key / rate limit)" };
     return { symbol, price, ok: true, note: "" };
   } catch (e) {
-    return { symbol, price: 0, ok: false, note: e.message };
+    // Never e.message: node-fetch errors carry the request URL, which has the API key in it.
+    return { symbol, price: 0, ok: false, note: "quote request failed" };
   }
 }
 
@@ -12555,6 +12666,13 @@ async function sendResendEmail(to, subject, html) {
   }
 }
 
+/* Card names are user-typed (watch-email, binder). Escaped before they go
+   into an email body, so a name can't inject markup or links. */
+function emailEsc(v) {
+  return String(v == null ? "" : v).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
 function alertCardRowHtml(item, pct) {
   const up = pct >= 0;
   const arrow = up ? "\u25B2" : "\u25BC";
@@ -12562,7 +12680,7 @@ function alertCardRowHtml(item, pct) {
   return (
     '<tr style="border-bottom:1px solid #1e2d45;">' +
       '<td style="padding:10px 0;color:#f1f5f9;font-family:sans-serif;font-size:14px;">' +
-        (item.card_name || "Card") +
+        emailEsc(item.card_name || "Card") +
       '</td>' +
       '<td style="padding:10px 0;text-align:right;color:' + color + ';font-family:monospace;font-size:14px;font-weight:700;white-space:nowrap;">' +
         arrow + ' ' + Math.abs(Math.round(pct)) + '%' +
@@ -12739,7 +12857,7 @@ function buildWatchAlertHtml(rows, token) {
     const up = r.pct >= 0;
     return '<tr style="border-bottom:1px solid #1e2d45;">'
       + '<td style="padding:10px 0;color:#f1f5f9;font-family:sans-serif;font-size:14px;">'
-        + String(r.item.card_name || "Card") + '</td>'
+        + emailEsc(r.item.card_name || "Card") + '</td>'
       + '<td style="padding:10px 0;text-align:right;color:' + (up ? "#22c55e" : "#ef4444")
         + ';font-family:monospace;font-size:14px;font-weight:700;white-space:nowrap;">'
         + (up ? "\u25B2 " : "\u25BC ") + Math.abs(Math.round(r.pct)) + '%</td>'
@@ -13068,9 +13186,14 @@ function buildWelcomeEmailHtml() {
   );
 }
 
+/* One run at a time: the startup call and the 5-minute cron could overlap
+   on a slow run, and two runs reading the same unsent rows sent two welcomes. */
+let welcomeRunning = false;
 async function runWelcomeEmails() {
   if (!supabaseAdmin) return;
   if (!SENDGRID_API_KEY) return;
+  if (welcomeRunning) return;
+  welcomeRunning = true;
 
   try {
     // Only accounts from the last 24 hours — see the note above on why
@@ -13100,6 +13223,21 @@ async function runWelcomeEmails() {
           continue;
         }
 
+        /* Claim the row BEFORE sending (only if still unsent). If the mark
+           failed after a send, the row stayed false and the next run sent
+           the welcome again. A failed send puts the flag back. */
+        const { data: claimed, error: claimErr } = await supabaseAdmin
+          .from("email_preferences")
+          .update({ welcome_sent: true, welcome_sent_at: new Date().toISOString() })
+          .eq("user_id", row.user_id)
+          .eq("welcome_sent", false)
+          .select("user_id");
+        if (claimErr || !claimed || !claimed.length) {
+          if (claimErr) console.error("[welcome-email] claim failed for " + row.user_id + ": " + claimErr.message);
+          skipped++;
+          continue;
+        }
+
         const ok = await sendResendEmail(
           userData.user.email,
           "Welcome to CardGauge \uD83D\uDC4B",
@@ -13108,10 +13246,6 @@ async function runWelcomeEmails() {
 
         if (ok) {
           sent++;
-          await supabaseAdmin
-            .from("email_preferences")
-            .update({ welcome_sent: true, welcome_sent_at: new Date().toISOString() })
-            .eq("user_id", row.user_id);
           try {
             await supabaseAdmin.rpc("log_scan_event", {
               p_event: "welcome_email_sent",
@@ -13122,6 +13256,10 @@ async function runWelcomeEmails() {
           } catch (e) { /* analytics failure must never block the send */ }
         } else {
           skipped++;
+          await supabaseAdmin
+            .from("email_preferences")
+            .update({ welcome_sent: false, welcome_sent_at: null })
+            .eq("user_id", row.user_id);
         }
       } catch (e) {
         console.error("[welcome-email] error for user " + row.user_id + ":", e.message);
@@ -13134,6 +13272,8 @@ async function runWelcomeEmails() {
     }
   } catch (e) {
     console.error("[welcome-email] fatal error:", e.message);
+  } finally {
+    welcomeRunning = false;
   }
 }
 
@@ -13186,7 +13326,7 @@ function digestMoverRowHtml(name, from, to) {
   const color = up ? "#22c55e" : "#ef4444";
   return (
     '<tr style="border-bottom:1px solid #1e2d45;">' +
-      '<td style="padding:9px 0;color:#f1f5f9;font-family:sans-serif;font-size:13.5px;">' + name + '</td>' +
+      '<td style="padding:9px 0;color:#f1f5f9;font-family:sans-serif;font-size:13.5px;">' + emailEsc(name) + '</td>' +
       '<td style="padding:9px 0;text-align:right;color:' + color + ';font-family:monospace;font-size:13px;font-weight:700;white-space:nowrap;">' +
         arrow + ' ' + Math.abs(pct) + '%' +
       '</td>' +
