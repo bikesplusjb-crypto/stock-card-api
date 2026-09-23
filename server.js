@@ -13387,6 +13387,345 @@ async function runPriceAlerts() {
 cron.schedule("30 4 * * *", runPriceAlerts, { timezone: "America/New_York" });
 console.log("Price alerts scheduled for 4:30 AM ET");
 
+/* ══════════════════════════════════════════════════════════════
+   PRICE TARGETS — 23 Sept 2026
+
+   The generic alert above fires on a 10% move against a baseline WE
+   chose. This fires on a number the USER chose, which is the whole
+   difference: a 10% move may or may not matter to them, but the price
+   they said they cared about always does. It is also self-limiting --
+   it can only fire when they asked it to -- so it does not need the
+   frequency tuning a digest needs.
+
+   OWN a card -> "tell me when it reaches $X" (above).
+   CHASING a card -> "tell me when it falls to $X" (below).
+   Direction is stored, not derived, so changing a card's status later
+   cannot silently invert a number somebody typed.
+
+   THREE RULES IT WILL NOT BREAK:
+
+   1. A REFUSED PRICE NEVER FIRES. The target reads card_price_history,
+      the same series the headline price comes from. A counts-only row --
+      CompGuard found the pool contaminated, thin or wide and withheld
+      the median -- pauses the target. 1,418 of 2,802 history rows are
+      counts-only, so this is the common case, not the edge case. This is
+      the one screen where somebody acts by actually selling a card; an
+      alert off a pool we would not price is the worst possible moment to
+      spend the engine's credibility.
+
+   2. A THIN POOL NEVER FIRES. A median can move because two sales
+      happened -- technically priced, practically noise. TARGET_MIN_SALES
+      is the floor, matching the evidence grading the scanner already
+      uses, so a crossing means the same thing a trusted price means.
+
+   3. ONE EMAIL PER CROSSING, NOT PER MORNING. A card resting at $201
+      against a $200 target is one email ever. It re-arms only when the
+      price falls back past the target and crosses again.
+
+   The batching is deliberate too: three targets crossing on one morning
+   is ONE email listing three cards. Per-card sends are how a useful
+   alert becomes a muted one.
+
+   It writes last_alerted_price on send, which the 10% mover job reads as
+   its baseline -- so a card that fired a target here will not also send a
+   "your card moved" email about the same movement. That suppression is
+   free; it falls out of the existing design rather than coupling the two.
+══════════════════════════════════════════════════════════════ */
+
+const TARGET_MIN_SALES   = envNum("TARGET_MIN_SALES", 3);
+const FREE_TARGET_LIMIT  = envNum("FREE_TARGET_LIMIT", 10);
+
+/* Decide, for one card, whether today crosses. Pure and deterministic:
+   no rounding of its own, no pricing, no side effects. Returns the verdict
+   and, when it declines, why -- so the log says something useful. */
+function targetVerdict(opts) {
+  const dir      = opts.direction === "below" ? "below" : "above";
+  const target   = Number(opts.target);
+  const current  = Number(opts.current);
+  const lastAl   = opts.lastAlerted === null || opts.lastAlerted === undefined
+                     ? null : Number(opts.lastAlerted);
+  const sales    = Number(opts.sales) || 0;
+  const priced   = opts.priced === true;
+
+  if (!(target > 0))   return { fire: false, rearm: false, why: "no target" };
+  if (!(current > 0))  return { fire: false, rearm: false, why: "no current price" };
+  if (!priced)         return { fire: false, rearm: false, why: "price refused — target paused" };
+  if (sales < TARGET_MIN_SALES)
+    return { fire: false, rearm: false, why: "only " + sales + " sale" + (sales === 1 ? "" : "s") + " behind the price" };
+
+  const crossed = dir === "above" ? current >= target : current <= target;
+
+  if (!crossed) {
+    /* Back on the far side of the line. Clear the marker so the next
+       crossing counts as a new one. */
+    const wasFired = lastAl !== null && (dir === "above" ? lastAl >= target : lastAl <= target);
+    return { fire: false, rearm: wasFired, why: "not crossed" };
+  }
+
+  const armed = lastAl === null || (dir === "above" ? lastAl < target : lastAl > target);
+  if (!armed) return { fire: false, rearm: false, why: "already told them about this crossing" };
+
+  return { fire: true, rearm: false, why: "crossed" };
+}
+
+function buildTargetEmailHtml(rows) {
+  const money = v => "$" + Number(v).toLocaleString(undefined,
+    { minimumFractionDigits: Number(v) % 1 ? 2 : 0, maximumFractionDigits: 2 });
+
+  const cards = rows.map(function (r) {
+    const up = r.direction === "above";
+    return '<div style="border:1px solid #1e2d45;border-radius:12px;padding:14px 16px;margin-bottom:10px;">' +
+      '<div style="color:#f1f5f9;font-size:15px;font-weight:700;line-height:1.35;margin-bottom:10px;">' +
+        emailEsc(r.cardName) + '</div>' +
+      '<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;font-size:13px;">' +
+        '<tr><td style="color:#94a3b8;padding:3px 0;">Your target</td>' +
+            '<td align="right" style="color:#f1f5f9;font-weight:700;">' + money(r.target) + '</td></tr>' +
+        '<tr><td style="color:#94a3b8;padding:3px 0;">Selling for now</td>' +
+            '<td align="right" style="color:' + (up ? '#22c55e' : '#3b82f6') + ';font-weight:700;">' +
+              money(r.current) + '</td></tr>' +
+        '<tr><td style="color:#94a3b8;padding:3px 0;">Based on</td>' +
+            '<td align="right" style="color:#94a3b8;">' + r.sales + ' sale' + (r.sales === 1 ? '' : 's') + '</td></tr>' +
+      '</table></div>';
+  }).join("");
+
+  return '<div style="background:#0a0e1a;padding:32px 16px;font-family:Arial,sans-serif;">' +
+    '<div style="max-width:480px;margin:0 auto;background:#111827;border:1px solid #1e2d45;border-radius:14px;padding:28px;">' +
+      '<div style="font-size:20px;font-weight:800;color:#f1f5f9;margin-bottom:18px;">CARD<span style="color:#f59e0b;">GAUGE</span></div>' +
+      '<p style="color:#f1f5f9;font-size:17px;font-weight:800;margin:0 0 6px;">' +
+        (rows.length === 1 ? "It hit your number." : rows.length + " of your targets hit.") + '</p>' +
+      '<p style="color:#94a3b8;font-size:13.5px;line-height:1.6;margin:0 0 18px;">' +
+        'Based on completed sales over the last 30 days.</p>' +
+      cards +
+      '<a href="https://www.cardgauge.com/my-binder" style="display:block;background:#f59e0b;color:#1a1408;text-decoration:none;text-align:center;padding:13px;border-radius:10px;font-weight:800;font-size:14px;margin-top:6px;">Open your binder →</a>' +
+      '<p style="color:#94a3b8;font-size:12px;line-height:1.6;margin:18px 0 0;">' +
+        'That is what buyers paid, not what sellers are asking. Prices move — this is where it ' +
+        'stands today, not a promise about tomorrow.</p>' +
+      '<p style="color:#64748b;font-size:11px;line-height:1.6;margin-top:20px;">' +
+        'You set ' + (rows.length === 1 ? 'this target' : 'these targets') + ' yourself. ' +
+        'One email per crossing — we will not send this again until the price moves back and returns. ' +
+        '<a href="https://www.cardgauge.com/my-binder" style="color:#64748b;">Change or remove ' +
+        (rows.length === 1 ? 'it' : 'them') + '</a>' +
+      '</p>' +
+    '</div></div>';
+}
+
+let targetAlertsRunning = false;
+
+async function runTargetAlerts() {
+  if (!supabaseAdmin) { console.log("[targets] skipped — no Supabase client"); return; }
+  if (!SENDGRID_API_KEY) { console.log("[targets] skipped — SENDGRID_API_KEY not set"); return; }
+  if (targetAlertsRunning) { console.log("[targets] skipped — already running"); return; }
+  targetAlertsRunning = true;
+
+  const startTime = Date.now();
+  console.log("[targets] starting…");
+
+  try {
+    const { data: items, error } = await supabaseAdmin
+      .from("watchlist_items")
+      .select("id, user_id, card_name, current_price, last_alerted_price, target_price, target_direction, status")
+      .not("target_price", "is", null);
+
+    if (error) { console.error("[targets] fetch error:", error.message); return; }
+    if (!items || !items.length) { console.log("[targets] no targets set"); return; }
+
+    /* The sales count and the priced/refused state come from the SAME
+       series the headline price comes from -- never recomputed here. One
+       query for every card with a target, newest row per cache key. */
+    const keys = [...new Set(items.map(i => cacheKeyFor(i.card_name || "")))];
+    const { data: hist } = await supabaseAdmin
+      .from("card_price_history")
+      .select("cache_key, sale_date, sold_median, sold_count")
+      .in("cache_key", keys)
+      .gte("sale_date", daysAgoISO(7))
+      .order("sale_date", { ascending: false });
+
+    const newest = {};
+    (hist || []).forEach(h => { if (!newest[h.cache_key]) newest[h.cache_key] = h; });
+
+    const fired = [], rearm = [];
+    let paused = 0, thin = 0, quiet = 0;
+
+    for (const it of items) {
+      const h = newest[cacheKeyFor(it.card_name || "")] || null;
+      const v = targetVerdict({
+        direction:   it.target_direction,
+        target:      it.target_price,
+        current:     it.current_price,
+        lastAlerted: it.last_alerted_price,
+        sales:       h ? h.sold_count : 0,
+        priced:      !!(h && h.sold_median !== null && Number(h.sold_median) > 0)
+      });
+
+      if (v.fire) {
+        fired.push({ item: it, cardName: it.card_name || "Your card",
+                     target: Number(it.target_price), current: Number(it.current_price),
+                     direction: it.target_direction === "below" ? "below" : "above",
+                     sales: h ? h.sold_count : 0 });
+      } else if (v.rearm) {
+        rearm.push(it);
+      } else if (v.why.indexOf("refused") > -1) { paused++; }
+      else if (v.why.indexOf("sale") > -1)      { thin++; }
+      else                                       { quiet++; }
+    }
+
+    /* Re-arm first, and whether or not anything sends: a card that fell
+       back past its target must be ready again even on a morning with no
+       crossings at all. */
+    for (const it of rearm) {
+      try {
+        await supabaseAdmin.from("watchlist_items")
+          .update({ last_alerted_price: it.current_price }).eq("id", it.id);
+      } catch (e) { /* re-arming is best effort */ }
+    }
+
+    if (!fired.length) {
+      console.log("[targets] done. crossed=0 paused=" + paused + " thin=" + thin +
+                  " watching=" + quiet + " rearmed=" + rearm.length);
+      return;
+    }
+
+    const byUser = {};
+    fired.forEach(f => { (byUser[f.item.user_id] = byUser[f.item.user_id] || []).push(f); });
+
+    let sent = 0, skipped = 0;
+    for (const userId of Object.keys(byUser)) {
+      try {
+        const { data: prefs } = await supabaseAdmin
+          .from("email_preferences").select("price_alerts, unsubscribed_all")
+          .eq("user_id", userId).maybeSingle();
+        if (!prefs || !prefs.price_alerts || prefs.unsubscribed_all) { skipped++; continue; }
+
+        const { data: userData, error: uErr } = await supabaseAdmin.auth.admin.getUserById(userId);
+        if (uErr || !userData || !userData.user || !userData.user.email) { skipped++; continue; }
+
+        const rows = byUser[userId];
+        const subject = rows.length === 1
+          ? "🎯 " + rows[0].cardName + " hit your target"
+          : rows.length + " of your CardGauge targets hit";
+
+        const ok = await sendResendEmail(userData.user.email, subject, buildTargetEmailHtml(rows));
+        if (!ok) { skipped++; continue; }
+        sent++;
+
+        for (const r of rows) {
+          await supabaseAdmin.from("watchlist_items").update({
+            last_alerted_price: r.current,
+            last_alerted_at:    new Date().toISOString()
+          }).eq("id", r.item.id);
+        }
+        try {
+          await supabaseAdmin.rpc("log_scan_event", {
+            p_event: "target_crossed", p_card_name: String(rows.length),
+            p_used_back: false, p_is_owner: false
+          });
+        } catch (e) { /* analytics must never block a send */ }
+      } catch (e) {
+        console.error("[targets] error for user " + userId + ":", e.message);
+        skipped++;
+      }
+    }
+
+    console.log("[targets] done. crossed=" + fired.length + " sent=" + sent +
+                " skipped=" + skipped + " paused=" + paused + " thin=" + thin +
+                " watching=" + quiet + " rearmed=" + rearm.length +
+                " elapsed=" + Math.round((Date.now() - startTime) / 1000) + "s");
+  } catch (e) {
+    console.error("[targets] fatal error:", e.message);
+  } finally {
+    targetAlertsRunning = false;
+  }
+}
+
+/* 4:35, between the 10% movers at 4:30 and the email-only watches at
+   4:45, and after the 08:07 refresh has written today's current_price. */
+cron.schedule("35 4 * * *", runTargetAlerts, { timezone: "America/New_York" });
+console.log("Price targets scheduled for 4:35 AM ET");
+
+app.get("/api/run-target-alerts", async (req, res) => {
+  if (!process.env.REFRESH_SECRET || req.query.key !== process.env.REFRESH_SECRET) {
+    return res.status(403).json({ success: false, error: "Forbidden" });
+  }
+  res.json({ success: true, message: "Target alerts started — check server logs" });
+  runTargetAlerts();
+});
+
+/* SET OR CLEAR A TARGET.
+
+   The cap is enforced HERE and not in the browser. binder.html's
+   FREE_CARD_LIMIT is a client-side nudge and that is fine for a saved
+   card, which costs nothing. A target can send email, so the gate has to
+   be somewhere a person cannot edit. */
+app.post("/api/card-target", async (req, res) => {
+  try {
+    const user = await userFromRequest(req);
+    if (!user) return res.status(401).json({ success: false, error: "Sign in to set a target." });
+    if (!supabaseAdmin) return res.status(503).json({ success: false, error: "Not configured" });
+
+    const id    = String((req.body && req.body.id) || "").trim();
+    const clear = (req.body && req.body.clear) === true;
+    if (!id) return res.status(400).json({ success: false, error: "Which card?" });
+
+    const { data: row, error: rowErr } = await supabaseAdmin
+      .from("watchlist_items").select("id, user_id, status, target_price")
+      .eq("id", id).maybeSingle();
+    if (rowErr || !row) return res.status(404).json({ success: false, error: "Card not found." });
+    if (row.user_id !== user.uid) return res.status(403).json({ success: false, error: "Not your card." });
+
+    if (clear) {
+      await supabaseAdmin.from("watchlist_items")
+        .update({ target_price: null, target_direction: null, target_set_at: null })
+        .eq("id", id);
+      return res.json({ success: true, cleared: true });
+    }
+
+    const price = safeNumber(req.body && req.body.price, 0);
+    if (!(price > 0)) return res.status(400).json({ success: false, error: "Enter a price above zero." });
+
+    /* Default the direction off the status they already set, so most
+       people never touch the toggle: a card you own is one you would
+       sell high, a card you are chasing is one you would buy low. */
+    let dir = String((req.body && req.body.direction) || "").toLowerCase();
+    if (dir !== "above" && dir !== "below") {
+      dir = (row.status === "want" || row.status === "watching") ? "below" : "above";
+    }
+
+    /* Only counts against the cap when this card does not already have
+       one -- editing a target is not spending another. */
+    if (!row.target_price && !user.pro) {
+      const { count } = await supabaseAdmin
+        .from("watchlist_items")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", user.uid).not("target_price", "is", null);
+      if ((count || 0) >= FREE_TARGET_LIMIT) {
+        return res.status(429).json({
+          success: false,
+          limitReached: "free_targets",
+          limit: FREE_TARGET_LIMIT,
+          error: "Free accounts can watch " + FREE_TARGET_LIMIT + " targets at a time. " +
+                 "Clear one, or go Pro for unlimited."
+        });
+      }
+    }
+
+    await supabaseAdmin.from("watchlist_items").update({
+      target_price:     price,
+      target_direction: dir,
+      target_set_at:    new Date().toISOString()
+    }).eq("id", id);
+
+    try {
+      await supabaseAdmin.rpc("log_scan_event", {
+        p_event: "target_set", p_card_name: dir, p_used_back: false, p_is_owner: false
+      });
+    } catch (e) { /* analytics must never block the save */ }
+
+    res.json({ success: true, target: price, direction: dir });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "Could not save that target." });
+  }
+});
+
 // Manual trigger for testing — same auth pattern as /api/refresh-watchlist.
 app.get("/api/run-price-alerts", async (req, res) => {
   if (!process.env.REFRESH_SECRET || req.query.key !== process.env.REFRESH_SECRET) {
