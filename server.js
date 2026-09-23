@@ -9555,11 +9555,23 @@ app.get("/api/cardapi-status", async (req, res) => {
    staleDays is advisory. A feed written on every lookup should read 0 on
    any day the scanner was used; anything above a couple of days on those
    means the writer is gone. */
+/* WATCH THE WRITE DATE, NOT THE BUSINESS DATE.
+
+   First version of this list watched market_sales.sale_date and reported
+   "no rows in 2 days" on a perfectly healthy feed -- sale_date is the day
+   the CARD SOLD, so the newest one trails the calendar by however long ago
+   the last completed sale was. That is normal and says nothing about
+   whether anything is still writing. first_seen_at is when the row landed
+   here, which is the question.
+
+   The other three are already write dates: recordPriceHistory stamps
+   sale_date with today, and card_daily_prices.day and
+   price_history.recorded_on are both set at write time. */
 const FEED_TABLES = [
-  { table: "card_price_history",   column: "sale_date",   expectDaily: true  },
-  { table: "card_daily_prices",    column: "day",         expectDaily: true  },
-  { table: "price_history",        column: "recorded_on", expectDaily: false },
-  { table: "market_sales",         column: "sale_date",   expectDaily: true  }
+  { table: "card_price_history",   column: "sale_date",     expectDaily: true  },
+  { table: "card_daily_prices",    column: "day",           expectDaily: true  },
+  { table: "price_history",        column: "recorded_on",   expectDaily: false },
+  { table: "market_sales",         column: "first_seen_at", expectDaily: true  }
 ];
 
 async function feedFreshness() {
@@ -9573,7 +9585,12 @@ async function feedFreshness() {
       if (error) { out[f.table] = { error: error.message }; return; }
       const newest = data && data[0] ? data[0][f.column] : null;
       if (!newest) { out[f.table] = { newest: null, staleDays: null, note: "empty" }; return; }
-      const days = Math.floor((today - new Date(newest + "T00:00:00Z").getTime()) / 86400000);
+      /* Some of these columns are dates ("2026-09-23") and one is a
+         timestamp. A bare date needs the time added or it parses as local
+         midnight and can read a day out; a timestamp is already complete
+         and must not have anything appended to it. */
+      const iso  = String(newest).indexOf("T") > -1 ? String(newest) : String(newest) + "T00:00:00Z";
+      const days = Math.floor((today - new Date(iso).getTime()) / 86400000);
       out[f.table] = {
         newest: newest,
         staleDays: days,
