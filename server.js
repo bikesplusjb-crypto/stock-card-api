@@ -5136,6 +5136,36 @@ function computeLiquidity(market, sold) {
   if (!listed)
     return { known: false, sold30, reason: "nothing currently listed to compare against" };
 
+  /* CEILINGS ARE NOT TOTALS. (23 Sept)
+
+     Both halves of this ratio are capped. eBay is asked for at most
+     EBAY_FETCH_LIMIT listings and TheCardAPI for at most CARDAPI_LIMIT
+     sales, so a count sitting on its ceiling means "we stopped
+     counting", not "this is how many there are". The first version of
+     this function treated both as exact, and the two caps fail in
+     opposite directions:
+
+       listed at the ceiling -> the real supply is HIGHER, so the real
+         ratio is higher, the queue is longer, and every number here is
+         wrong in the flattering direction. Seen live: 100 sold / 99
+         listed printed "more buyers than sellers" off a numerator that
+         had simply stopped counting.
+
+       sold at the ceiling -> the real sale rate is HIGHER, so the real
+         ratio is LOWER and the card moves faster than stated. Wrong,
+         but conservative, and safe to print as a floor.
+
+     So a capped listing count is a refusal -- the denominator of the
+     whole claim is unknown -- and a capped sale count keeps the rate
+     but says out loud that it is a bound, not a measurement. */
+  const listedCapped = listed >= EBAY_FETCH_LIMIT;
+  const soldCapped   = sold30 >= CARDAPI_LIMIT;
+
+  if (listedCapped)
+    return { known: false, sold30, listed, soldCapped, listedCapped,
+             reason: "over " + EBAY_FETCH_LIMIT + " copies listed — we stop counting there, so any "
+                   + "rate would understate how many sellers you are up against" };
+
   const ratio = listed / sold30;              // sellers waiting per monthly buyer
   const days  = Math.round(ratio * 30);       // how long today's queue takes to clear
 
@@ -5152,11 +5182,13 @@ function computeLiquidity(market, sold) {
   /* Plain words, and deliberately a range rather than a single figure:
      the listing count is a snapshot and the sale count is a month, so
      precision here would be false. */
+  const soldTxt = (soldCapped ? CARDAPI_LIMIT + "+" : sold30) + " sold in 30 days";
+  const about   = soldCapped ? "at most " : "about ";   // capped sales => the ratio is a ceiling
   const plain =
-    sold30 + " sold in 30 days, " + listed + " listed now" +
+    soldTxt + ", " + listed + " listed now" +
     (ratio <= 1.5 ? " — more buyers than sellers."
-     : ratio <= 4  ? " — about " + ratio.toFixed(1) + " sellers per monthly buyer."
-     : " — about " + Math.round(ratio) + " sellers for every monthly buyer.");
+     : ratio <= 4  ? " — " + about + ratio.toFixed(1) + " sellers per monthly buyer."
+     : " — " + about + Math.round(ratio) + " sellers for every monthly buyer.");
 
   const wait =
     days <= 21  ? "At this rate the copies listed now clear in about " + Math.max(1, Math.round(days / 7)) + " week" + (Math.round(days/7) === 1 ? "" : "s") + "."
@@ -5164,8 +5196,16 @@ function computeLiquidity(market, sold) {
   : days <= 150 ? "Around " + Math.round(days / 30) + " months for the cards listed now to clear."
   :               "Over " + Math.round(days / 30) + " months to clear at this rate. Price it to move, or be patient.";
 
-  return { known: true, sold30, listed, ratio: Number(ratio.toFixed(1)),
-           daysToClear: days, label, tone, plain, wait };
+  /* A capped sale count makes every figure above a slow-side bound: more
+     sold than we counted means it clears sooner than this says. Say so
+     rather than letting the reader take the number as measured. */
+  const waitOut = soldCapped
+    ? wait + " We stop counting sales at " + CARDAPI_LIMIT + ", so it may move faster than that."
+    : wait;
+
+  return { known: true, sold30, listed, soldCapped, listedCapped,
+           ratio: Number(ratio.toFixed(1)),
+           daysToClear: days, label, tone, plain, wait: waitOut };
 }
 
 /* ── ONE FEE MODEL (22 Sept) ──────────────────────────────────────────
