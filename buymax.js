@@ -163,6 +163,10 @@ __def('config', function (module, exports, require) {
       maxRiskForBuy: num(process.env.BUYMAX_MAX_RISK_FOR_BUY, 70),
       // Asking price within this band above max buy price is REVIEW, not PASS.
       borderlineBand: num(process.env.BUYMAX_BORDERLINE_BAND, 0.10),
+      /* Above the ceiling but still worth a person's look. Under this
+         return, an ask is treated as a refusal rather than a thin deal:
+         the margin is inside the fee model's own error bar. */
+      minRoiForThinDeal: num(process.env.BUYMAX_MIN_ROI_FOR_THIN_DEAL, 0.05),
       /* SOLD-FIRST, ENFORCED (22 Sept). With no completed sales the resale
          figure is built from asking prices, and an ask is not a sale. Such
          a result is a no-call, not a BUY or a PASS. Set false to restore the
@@ -1224,9 +1228,57 @@ __def('core/decision', function (module, exports, require) {
       };
     }
 
+    /* ABOVE THE CEILING IS NOT THE SAME AS LOSING MONEY. (23 Sept)
+
+       PASS used to fire on one test -- ask over ceiling -- and the record
+       layer turns PASS into WALK_AWAY. But the ceiling is not a
+       profitability line: it is net proceeds minus a desired profit of
+       30% OF RESALE, minus a risk haircut. On a $330 card it holds back
+       $99 before the ceiling is even drawn.
+
+       So a $200 ask on that card came back WALK_AWAY while still clearing
+       about $79, a 40% return. That is a thinner deal than the engine
+       wants, not a bad one, and "walk away" is the wrong word for it --
+       WALK_AWAY is defined two modules down as "we know, and it is a bad
+       deal", and this contradicted that definition every time it fired on
+       a profitable ask.
+
+       Split on the thing that actually matters. No money in it -> PASS,
+       and WALK_AWAY means what it says. Money in it but under the target
+       margin -> REVIEW, which is already the vocabulary for "the evidence
+       holds, a person decides". Nothing here is softened: an ask that
+       loses money still refuses exactly as before, and the ceiling, the
+       margin and the risk haircut are untouched. */
+    /* "Still profitable" needs a floor, or the split just moves the bad
+       call rather than fixing it. At $285 on a $330 card this returned
+       98 cents of profit and called it "a thinner deal, not a losing
+       one" -- which is false. A return that thin is inside the error bar
+       on the fee model and one postage surprise from negative, so it is
+       not a deal a person should be nudged toward. Below the floor it
+       stays a refusal. */
+    const profitAtAsk = calc.expected_profit_at_asking;
+    const roiAtAsk    = calc.roi_at_asking;
+    const thinFloor   = d.minRoiForThinDeal;
+    if (Number.isFinite(profitAtAsk) && profitAtAsk > 0
+        && Number.isFinite(roiAtAsk) && roiAtAsk >= thinFloor) {
+      /* The margin actually used, read back off the calculation rather than
+         the default -- a caller may have supplied its own desired_profit. */
+      const inp = calc.inputs || {};
+      const marginPct = inp.expected_resale > 0
+        ? Math.round((inp.desired_profit / inp.expected_resale) * 100) : null;
+      return {
+        result: 'REVIEW',
+        reason: `Asking price ${fmt(ask)} is over the maximum buy price ${fmt(max)}`
+              + (marginPct ? `, because that ceiling holds back a ${marginPct}% margin before risk` : '')
+              + `. At ${fmt(ask)} it still clears about ${fmt(profitAtAsk)} — a thinner deal, `
+              + `not a losing one. Your call.`,
+        factors: ['above_ceiling_still_profitable'],
+      };
+    }
+
     return {
       result: 'PASS',
-      reason: `Asking price ${fmt(ask)} exceeds the maximum buy price ${fmt(max)}.`,
+      reason: `Asking price ${fmt(ask)} exceeds the maximum buy price ${fmt(max)} and leaves no profit after costs.`,
       factors: [],
     };
   }
