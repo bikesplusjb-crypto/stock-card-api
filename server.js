@@ -1027,6 +1027,34 @@ const EPN_CAMPAIGN_ID = "5339149252";
 const EPN_DEFAULT_CUSTOMID = "api";
 const EBAY_FETCH_LIMIT = 100;   // was 25 — too small to filter parallels out of
 
+/* DID WE SEE ALL THE LISTINGS, OR JUST THE FIRST PAGE? (23 Sept)
+
+   listingCount is counted AFTER parallels and junk are filtered out, so
+   it cannot tell a card with 40 listings from a card with 4,000 whose
+   first hundred happened to include sixty parallels. Both arrive here as
+   "40". computeLiquidity divides by that number, so the difference is the
+   difference between a true rate and a flattering one.
+
+   The only honest signal is whether eBay handed back a full page: ask for
+   100, get 100, and there are almost certainly more behind it. That fact
+   is known inside fetchEbayListings and nowhere else -- selectListings
+   rebuilds the array when it strips parallels, so a property hung on the
+   array does not survive the trip.
+
+   So it is recorded here against the query that was fetched, and read
+   back by summarizeListings under that same query. Bounded, because this
+   is a hint and not a cache: when it grows past a few hundred it is
+   dropped wholesale, and a miss simply means "no reason to think we were
+   truncated", which is the pre-existing behaviour. */
+const ebayTruncated = new Map();
+function noteEbayTruncation(query, got, askedFor) {
+  if (ebayTruncated.size > 500) ebayTruncated.clear();
+  ebayTruncated.set(String(query || ""), got >= askedFor);
+}
+function listingsWereTruncated(query) {
+  return ebayTruncated.get(String(query || "")) === true;
+}
+
 function ebayUrl(query, sold) {
   const base = "https://www.ebay.com/sch/i.html";
   const q = encodeURIComponent(normalizeCardQuery(query));
@@ -3305,6 +3333,10 @@ async function fetchEbayListings(query, limit) {
     const data = await response.json();
     const rawItems = Array.isArray(data.itemSummaries) ? data.itemSummaries : [];
 
+    /* Recorded before any filtering: a full page back means there is more
+       behind it, so the count this query ends up producing is a floor. */
+    noteEbayTruncation(cleanQuery, rawItems.length, limit || EBAY_FETCH_LIMIT);
+
     return rawItems
       .filter(item => isLikelyCardListing(item.title, sealedMode))
       .map(item => {
@@ -3385,6 +3417,10 @@ function summarizeListings(listings, cleanQuery, extra) {
     lowPrice:       range.low,
     highPrice:      range.high,
     listingCount:   listings.length,
+    /* True when eBay handed back a full page for this query, so
+       listingCount is a floor rather than a total. computeLiquidity
+       refuses to state a rate on it. */
+    listedTruncated: listingsWereTruncated(cleanQuery),
     spreadRatio:    Number(spread.toFixed(1)),
     wideSpread:     wide,
     image:          pickListingImage(listings, cleanQuery),
@@ -3419,7 +3455,7 @@ function summarizeListings(listings, cleanQuery, extra) {
 
 const EMPTY_MARKET = (q, source) => ({
   query: q, avgPrice: 0, lowPrice: 0, highPrice: 0,
-  listingCount: 0, image: "", priceSource: source,
+  listingCount: 0, listedTruncated: false, image: "", priceSource: source,
   raw: { count:0, median:0, low:0, high:0, thin:false },
   graded: { count:0, median:0, low:0, high:0, thin:false },
   gradeBreakdown: [], listings: [],
@@ -5158,13 +5194,18 @@ function computeLiquidity(market, sold) {
      So a capped listing count is a refusal -- the denominator of the
      whole claim is unknown -- and a capped sale count keeps the rate
      but says out loud that it is a bound, not a measurement. */
-  const listedCapped = listed >= EBAY_FETCH_LIMIT;
+  /* listedTruncated is the reliable half: it is set when eBay returned a
+     full page, BEFORE parallels were filtered out, so it catches the case
+     listingCount alone cannot -- a thousand listings filtered down to 40.
+     The >= check stays as a floor for any path that never set the flag. */
+  const listedCapped = (market && market.listedTruncated === true) || listed >= EBAY_FETCH_LIMIT;
   const soldCapped   = sold30 >= CARDAPI_LIMIT;
 
   if (listedCapped)
     return { known: false, sold30, listed, soldCapped, listedCapped,
-             reason: "over " + EBAY_FETCH_LIMIT + " copies listed — we stop counting there, so any "
-                   + "rate would understate how many sellers you are up against" };
+             reason: "more copies listed than we can count — eBay returns at most "
+                   + EBAY_FETCH_LIMIT + " per search, so any rate would understate how many "
+                   + "sellers you are up against" };
 
   const ratio = listed / sold30;              // sellers waiting per monthly buyer
   const days  = Math.round(ratio * 30);       // how long today's queue takes to clear
@@ -9490,12 +9531,61 @@ app.get("/api/cardapi-status", async (req, res) => {
       cacheTtlHours: CACHE_TTL_HOURS,
       recordLimit:        CARDAPI_LIMIT,
       recordLimitCompact: CARDAPI_LIMIT_COMPACT,
-      soldLogicVersion:   SOLD_LOGIC_VERSION
+      soldLogicVersion:   SOLD_LOGIC_VERSION,
+      feeds:              await feedFreshness()
     });
   } catch (e) {
     res.json({ success: false, configured: true, error: e.message });
   }
 });
+
+/* IS ANYTHING STILL WRITING? (23 Sept)
+
+   price_history stopped being written on 23 July when the history tables
+   were reworked, and nothing noticed for two months -- a separate site
+   read that table and spent the whole time drawing empty charts. The
+   table did not break; it went quiet, and nothing was watching for quiet.
+
+   A feed that stops is invisible precisely because it throws no error, so
+   the only way to catch it is to ask how old the newest row is. Reported
+   here rather than alarmed on, because this endpoint is already the thing
+   you check when something feels wrong -- and a number that says "newest
+   row is 62 days old" answers the question immediately.
+
+   staleDays is advisory. A feed written on every lookup should read 0 on
+   any day the scanner was used; anything above a couple of days on those
+   means the writer is gone. */
+const FEED_TABLES = [
+  { table: "card_price_history",   column: "sale_date",   expectDaily: true  },
+  { table: "card_daily_prices",    column: "day",         expectDaily: true  },
+  { table: "price_history",        column: "recorded_on", expectDaily: false },
+  { table: "market_sales",         column: "sale_date",   expectDaily: true  }
+];
+
+async function feedFreshness() {
+  if (!supabaseAdmin) return null;
+  const today = Date.now();
+  const out = {};
+  await Promise.all(FEED_TABLES.map(async f => {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from(f.table).select(f.column).order(f.column, { ascending: false }).limit(1);
+      if (error) { out[f.table] = { error: error.message }; return; }
+      const newest = data && data[0] ? data[0][f.column] : null;
+      if (!newest) { out[f.table] = { newest: null, staleDays: null, note: "empty" }; return; }
+      const days = Math.floor((today - new Date(newest + "T00:00:00Z").getTime()) / 86400000);
+      out[f.table] = {
+        newest: newest,
+        staleDays: days,
+        note: !f.expectDaily ? "not expected to be current"
+            : days <= 1 ? "current"
+            : days <= 7 ? "no rows in " + days + " days"
+            : "STOPPED — no rows in " + days + " days"
+      };
+    } catch (e) { out[f.table] = { error: e.message }; }
+  }));
+  return out;
+}
 
 // ── /api/vs-market ─────────────────────────────────────────────
 const VS_MARKET_DOLLARS    = 100;
