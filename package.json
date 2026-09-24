@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/decision/decision.test.js test/decision/evidence.test.js test/decision/fees.test.js test/decision/listings.test.js test/decision/receipt.test.js test/decision/pool.test.js test/decision/quota.test.js test/decision/targets.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
