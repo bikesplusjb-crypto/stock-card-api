@@ -5159,18 +5159,51 @@ const IMPLAUSIBLE_GAP_PCT = 65;
    number this whole product exists to not print. */
 const LIQ_MIN_SOLD = 3;
 
+/* A REFUSAL NOBODY COUNTED. (24 Sept)
+
+   The capped-listings refusal below shipped on the 23rd and fires on the
+   hot end of the catalogue -- exactly the cards people look up. It
+   produced no log line, no event and no row, so there was no way to
+   answer the only question that matters about it: is this refusing one
+   lookup in fifty, or half of them? A refusal that frequent would mean
+   EBAY_FETCH_LIMIT is set too low rather than that the market is
+   genuinely uncountable, and we would never have known.
+
+   Counted in process, not written to a table. These are diagnostics
+   about our own coverage, not facts about a card: they belong next to
+   the feed ages on /api/cardapi-status, not in the sales record, and a
+   row per lookup would be a write on the hottest path in the app for a
+   number that is only ever read as a proportion.
+
+   The cost is that a Render restart resets it, so the tally is always
+   "since this process started" and says so. That is enough to size the
+   problem; it is not an audit trail and must not be used as one. */
+const liqTally = { since: new Date().toISOString(), total: 0, known: 0,
+                   contaminated: 0, tooFewSales: 0, noListings: 0,
+                   listedCapped: 0, soldCapped: 0 };
+function noteLiquidity(kind) {
+  liqTally.total++;
+  if (Object.prototype.hasOwnProperty.call(liqTally, kind)) liqTally[kind]++;
+}
+
 function computeLiquidity(market, sold) {
   const listed = Number(market && market.listingCount) || 0;
   const sold30 = Number(sold && sold.soldCount) || 0;
 
-  if (!sold || sold.soldContaminated)
+  if (!sold || sold.soldContaminated) {
+    noteLiquidity("contaminated");
     return { known: false, reason: "sales mix several versions of this card" };
-  if (sold30 < LIQ_MIN_SOLD)
+  }
+  if (sold30 < LIQ_MIN_SOLD) {
+    noteLiquidity("tooFewSales");
     return { known: false, sold30, listed, reason: sold30 === 0
       ? "no completed sales in the last 30 days"
       : "only " + sold30 + " sale" + (sold30 === 1 ? "" : "s") + " in 30 days — too few to call a rate" };
-  if (!listed)
+  }
+  if (!listed) {
+    noteLiquidity("noListings");
     return { known: false, sold30, reason: "nothing currently listed to compare against" };
+  }
 
   /* CEILINGS ARE NOT TOTALS. (23 Sept)
 
@@ -5201,11 +5234,15 @@ function computeLiquidity(market, sold) {
   const listedCapped = (market && market.listedTruncated === true) || listed >= EBAY_FETCH_LIMIT;
   const soldCapped   = sold30 >= CARDAPI_LIMIT;
 
-  if (listedCapped)
+  if (listedCapped) {
+    noteLiquidity("listedCapped");
     return { known: false, sold30, listed, soldCapped, listedCapped,
              reason: "more copies listed than we can count — eBay returns at most "
                    + EBAY_FETCH_LIMIT + " per search, so any rate would understate how many "
                    + "sellers you are up against" };
+  }
+  noteLiquidity("known");
+  if (soldCapped) liqTally.soldCapped++;   // a qualifier on a published rate, not a refusal
 
   const ratio = listed / sold30;              // sellers waiting per monthly buyer
   const days  = Math.round(ratio * 30);       // how long today's queue takes to clear
@@ -9532,7 +9569,8 @@ app.get("/api/cardapi-status", async (req, res) => {
       recordLimit:        CARDAPI_LIMIT,
       recordLimitCompact: CARDAPI_LIMIT_COMPACT,
       soldLogicVersion:   SOLD_LOGIC_VERSION,
-      feeds:              await feedFreshness()
+      feeds:              await feedFreshness(),
+      liquidity:          liquidityTally()
     });
   } catch (e) {
     res.json({ success: false, configured: true, error: e.message });
@@ -9567,10 +9605,38 @@ app.get("/api/cardapi-status", async (req, res) => {
    The other three are already write dates: recordPriceHistory stamps
    sale_date with today, and card_daily_prices.day and
    price_history.recorded_on are both set at write time. */
+/* Percentages are computed here rather than in the caller so the numbers
+   on the page and the counters behind them can never disagree, and they
+   are rounded to whole points because a tally this small does not
+   support a decimal. */
+function liquidityTally() {
+  const t = liqTally, n = t.total;
+  const pct = (x) => n ? Math.round((x / n) * 100) : null;
+  return {
+    since: t.since,
+    lookups: n,
+    rateShown:  { n: t.known,        pct: pct(t.known) },
+    refusals: {
+      listedCapped:  { n: t.listedCapped,  pct: pct(t.listedCapped),
+                       note: "more listings than eBay will return — the one added 23 Sept" },
+      tooFewSales:   { n: t.tooFewSales,   pct: pct(t.tooFewSales) },
+      contaminated:  { n: t.contaminated,  pct: pct(t.contaminated) },
+      noListings:    { n: t.noListings,    pct: pct(t.noListings) }
+    },
+    soldCappedOnShownRates: { n: t.soldCapped, pct: pct(t.soldCapped),
+                              note: "rate published as a ceiling, not refused" },
+    caveat: "in-process counters — reset on every deploy or restart"
+  };
+}
+
 const FEED_TABLES = [
   { table: "card_price_history",   column: "sale_date",     expectDaily: true  },
   { table: "card_daily_prices",    column: "day",           expectDaily: true  },
-  { table: "price_history",        column: "recorded_on",   expectDaily: false },
+  /* price_history was dropped on 24 Sept. It was CardStock's daily feed,
+     stopped writing on 23 July, and CardStock is retired -- the 5,231
+     rows were exported before the drop. Watching a table that no longer
+     exists would report an error here every time this endpoint is read,
+     which is the opposite of what an alarm is for. */
   { table: "market_sales",         column: "first_seen_at", expectDaily: true  }
 ];
 
