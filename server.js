@@ -863,7 +863,15 @@ async function userDailyGate(req, res, next, kind, onPass) {
           : "You've done " + cap + " typed searches today. They reset at midnight Eastern.");
     res.status(429).json({ success: false, error: msg,
       limitReached: (user.pro ? "pro_daily_" : "free_daily_") + kind, limit: cap,
-      businessUrl: "https://app.cardgauge.com/business.html" });
+      /* www, not app. Three hostnames were serving the whole site --
+         www.cardgauge.com, app.cardgauge.com and scan.cardgauge.com --
+         and Render does not redirect between custom domains, so each
+         was a separate site to Google with the domain's authority split
+         between them. www is the one robots.txt, sitemap.xml and the
+         canonical tags all name, so www is the one that survives. This
+         link is sent to somebody who has just hit their daily cap, so
+         it has to keep working after the other two are removed. */
+      businessUrl: "https://www.cardgauge.com/business.html" });
     return true;
   }
   req.cgUser = user;
