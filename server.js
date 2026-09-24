@@ -13601,13 +13601,37 @@ async function runTargetAlerts() {
     const keys = [...new Set(items.map(i => cacheKeyFor(i.card_name || "")))];
     const { data: hist } = await supabaseAdmin
       .from("card_price_history")
-      .select("cache_key, sale_date, sold_median, sold_count")
+      .select("cache_key, sale_date, sold_median, sold_count, verified_count")
       .in("cache_key", keys)
       .gte("sale_date", daysAgoISO(7))
       .order("sale_date", { ascending: false });
 
     const newest = {};
     (hist || []).forEach(h => { if (!newest[h.cache_key]) newest[h.cache_key] = h; });
+
+    /* HOW MANY SALES ARE ACTUALLY BEHIND THE PRICE. (24 Sept)
+
+       The first version passed sold_count, which is how many rows the
+       API returned BEFORE CompGuard threw anything out -- not how many
+       survived to form the median. The two are nowhere near each other
+       on a busy card: the first target set on this system reads
+       sold_count 89 and verified_count 4, because 24 were PSA 10s, 24
+       were PSA 9s, 19 were a different parallel, and so on. The $648
+       rests on four sales.
+
+       So a floor written to mean "at least three real sales behind this
+       number" was reading a figure that only means "at least three
+       results came back", and a card whose price rested on ONE verified
+       sale would have sailed past it. An email telling somebody to sell
+       off one sale is the most expensive thing this feature can do.
+
+       sold_count is kept as a fallback for rows written before
+       verified_count existed, where it is the only count there is. */
+    const salesBehind = (h) => {
+      if (!h) return 0;
+      const v = Number(h.verified_count);
+      return Number.isFinite(v) && h.verified_count !== null ? v : (Number(h.sold_count) || 0);
+    };
 
     const fired = [], rearm = [];
     let paused = 0, thin = 0, quiet = 0;
@@ -13619,7 +13643,7 @@ async function runTargetAlerts() {
         target:      it.target_price,
         current:     it.current_price,
         lastAlerted: it.last_alerted_price,
-        sales:       h ? h.sold_count : 0,
+        sales:       salesBehind(h),
         priced:      !!(h && h.sold_median !== null && Number(h.sold_median) > 0)
       });
 
@@ -13627,7 +13651,7 @@ async function runTargetAlerts() {
         fired.push({ item: it, cardName: it.card_name || "Your card",
                      target: Number(it.target_price), current: Number(it.current_price),
                      direction: it.target_direction === "below" ? "below" : "above",
-                     sales: h ? h.sold_count : 0 });
+                     sales: salesBehind(h) });
       } else if (v.rearm) {
         rearm.push(it);
       } else if (v.why.indexOf("refused") > -1) { paused++; }
