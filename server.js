@@ -9578,7 +9578,19 @@ app.get("/api/cardapi-status", async (req, res) => {
       recordLimitCompact: CARDAPI_LIMIT_COMPACT,
       soldLogicVersion:   SOLD_LOGIC_VERSION,
       feeds:              await feedFreshness(),
-      liquidity:          liquidityTally()
+      liquidity:          liquidityTally(),
+      /* Reported because the webhook now fails closed: an unset key turns
+         email telemetry off completely, and that has to be visible here
+         rather than inferred from an empty stats panel later. */
+      emailWebhook: {
+        configured: !!SENDGRID_WEBHOOK_KEY,
+        note: SENDGRID_WEBHOOK_KEY
+          ? "verified deliveries only"
+          : "SENDGRID_WEBHOOK_KEY unset — every delivery is rejected and no open/click/bounce is being recorded"
+      },
+      /* The bar a move has to clear before it becomes an email, so a quiet
+         alert run can be told apart from a misconfigured one. */
+      alertThresholds: { pct: PRICE_ALERT_PCT, minMoveUsd: PRICE_ALERT_MIN_MOVE }
     });
   } catch (e) {
     res.json({ success: false, configured: true, error: e.message });
@@ -12968,6 +12980,50 @@ const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";
 const ALERT_FROM_EMAIL = "CardGauge <alerts@cardgauge.com>";
 const PRICE_ALERT_PCT = 10;   // minimum move to bother somebody about
 
+/* A PERCENTAGE IS NOT A REASON TO EMAIL SOMEBODY (25 Sept).
+
+   The refusals above this line are all about POOL QUALITY -- contaminated,
+   limited, wide base. Nothing was ever about MAGNITUDE, so a card worth a
+   dollar that moved to $1.15 cleared the 10% bar and sent somebody an
+   unprompted "moved 15%" email about fifteen cents.
+
+   That was survivable while the email ask lived only in the local-cards
+   prompt: one active watch in a month. As of this morning the same ask
+   renders on every priced result for every signed-out visitor, which is
+   the main funnel -- and HALF of everything this scanner prices is under
+   $10. Measured 25 Sept across 1,496 priced rows: median $9, lower
+   quartile $3, 488 rows under $5. On the median card 10% is ninety cents.
+
+   So a move has to clear the percentage AND be worth real money. A
+   dollar floor rather than a value floor, deliberately: a floor on the
+   card's price would silence a $6 card that doubled, which is exactly
+   the move worth knowing about. This way nothing is too cheap to talk
+   about -- it just has to move enough to matter.
+
+   Erring high on purpose. Missing a $4 move costs nobody anything. A
+   junk email costs a spam complaint, and enough of those degrade the
+   sending domain and take the REAL alerts down with them. runEmailWatchAlerts
+   already says it outright about noise: sending that is worse than
+   sending nothing.
+
+   NOT applied to runTargetAlerts. A price target is a number the person
+   chose themselves; crossing it is the event they asked to hear about,
+   and second-guessing the size of their own target would be wrong. */
+const PRICE_ALERT_MIN_MOVE = envNum("PRICE_ALERT_MIN_MOVE", 5);
+
+/* Returns the signed percentage when a move is worth an email, or null.
+   One function, two callers -- the watch alerts and the binder price
+   alerts -- because two places computing one threshold is how this
+   codebase got four buy-ceiling bugs in a single day. */
+function moveWorthSending(base, now) {
+  const b = safeNumber(base, 0), n = safeNumber(now, 0);
+  if (!b || !n) return null;
+  const pct = ((n - b) / b) * 100;
+  if (Math.abs(pct) < PRICE_ALERT_PCT) return null;
+  if (Math.abs(n - b) < PRICE_ALERT_MIN_MOVE) return null;
+  return pct;
+}
+
 async function sendResendEmail(to, subject, html) {
   if (!SENDGRID_API_KEY) {
     console.log("[email] SENDGRID_API_KEY missing — skipping send to " + to);
@@ -13238,6 +13294,7 @@ async function runEmailWatchAlerts() {
 
     const movers = {};
     let priced = 0;
+    let tooSmall = 0;
 
     for (const row of rows) {
       try {
@@ -13276,10 +13333,15 @@ async function runEmailWatchAlerts() {
         if (newPrice) {
           const base = safeNumber(row.last_alerted_price, 0) || safeNumber(row.price_when_added, 0);
           if (base) {
-            const pct = ((newPrice - base) / base) * 100;
-            if (Math.abs(pct) >= PRICE_ALERT_PCT) {
+            const pct = moveWorthSending(base, newPrice);
+            if (pct !== null) {
               const k = row.email;
               (movers[k] = movers[k] || []).push({ item: row, pct: pct, newPrice: newPrice });
+            } else if (Math.abs(((newPrice - base) / base) * 100) >= PRICE_ALERT_PCT) {
+              /* Cleared the percentage, not the dollars. Counted rather
+                 than dropped in silence, so "the alerts stopped" can be
+                 told apart from "nothing moved" without a code read. */
+              tooSmall++;
             }
           }
         }
@@ -13311,7 +13373,8 @@ async function runEmailWatchAlerts() {
       }
     }
 
-    console.log("[watch-alerts] done. checked=" + rows.length + " priced=" + priced + " sent=" + sent);
+    console.log("[watch-alerts] done. checked=" + rows.length + " priced=" + priced +
+                " sent=" + sent + " tooSmall=" + tooSmall);
   } catch (e) {
     console.error("[watch-alerts] fatal:", e.message);
   }
@@ -13362,13 +13425,20 @@ async function runPriceAlerts() {
 
     // Which moves actually clear the bar, per-card, against each card's own baseline.
     const movers = [];
+    let tooSmall = 0;
     for (const item of items) {
       const baseline = safeNumber(item.last_alerted_price, 0) || safeNumber(item.price_when_added, 0);
       if (!baseline || !item.current_price) continue;
-      const pct = ((item.current_price - baseline) / baseline) * 100;
-      if (Math.abs(pct) >= PRICE_ALERT_PCT) {
+      const pct = moveWorthSending(baseline, item.current_price);
+      if (pct !== null) {
         movers.push({ item: item, pct: pct });
+      } else if (Math.abs(((item.current_price - baseline) / baseline) * 100) >= PRICE_ALERT_PCT) {
+        tooSmall++;   // percentage yes, dollars no. See moveWorthSending.
       }
+    }
+    if (tooSmall) {
+      console.log("[price-alerts] " + tooSmall + " card(s) moved " + PRICE_ALERT_PCT +
+                  "%+ but under $" + PRICE_ALERT_MIN_MOVE + " \u2014 not emailed");
     }
 
     if (!movers.length) {
@@ -14285,7 +14355,31 @@ app.post("/api/sendgrid-webhook", async (req, res) => {
   // failing analytics write must never cause repeated redelivery.
   res.status(200).send("ok");
 
-  if (SENDGRID_WEBHOOK_KEY && req.query.key !== SENDGRID_WEBHOOK_KEY) {
+  /* THIS USED TO FAIL OPEN (25 Sept).
+
+     The test was `if (SENDGRID_WEBHOOK_KEY && req.query.key !== ...)`, so
+     an UNSET env var did not mean "reject everything" — it meant the
+     check did not happen at all. Anyone who knew the URL could POST a
+     batch of invented opens, clicks and bounces straight into
+     scan_events, and the only thing reading those rows is the stats
+     email panel. So the failure mode of leaving the key unset was silent
+     corruption of exactly the numbers the key exists to protect.
+
+     Now it fails closed. An unset key rejects every delivery, which is
+     the safe direction but a LOUD one to be in: real email telemetry
+     stops with it. That is why it is also reported on /api/cardapi-status
+     as emailWebhook.configured, which the daily health check reads. The
+     alternative is discovering it as an empty stats panel weeks later
+     and assuming the webhook broke.
+
+     Still 200 either way. SendGrid retries non-2xx, and a rejected
+     forgery must not be redelivered all day. */
+  if (!SENDGRID_WEBHOOK_KEY) {
+    console.log("[sendgrid] webhook rejected — SENDGRID_WEBHOOK_KEY is not set, so no " +
+                "delivery can be verified. Email telemetry is OFF until it is set.");
+    return;
+  }
+  if (req.query.key !== SENDGRID_WEBHOOK_KEY) {
     console.log("[sendgrid] webhook rejected — bad or missing key");
     return;
   }
