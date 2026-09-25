@@ -1,0 +1,143 @@
+'use strict';
+/* THE DOLLAR FLOOR ON ALERT EMAILS.
+
+   moveWorthSending() is pulled straight out of server.js rather than
+   copied here. A test against a copy passes while the shipped code is
+   broken, and that has already happened in this repo -- see the note at
+   the top of targets.test.js.
+
+   Most of these are about NOT sending. The percentage bar was the only
+   bar until 25 Sept, and half of everything this scanner prices is under
+   $10, so the failure being guarded against is a stream of emails about
+   loose change -- which costs spam complaints, and enough of those
+   degrade the sending domain and take the real alerts down with it. */
+const test = require('node:test');
+const assert = require('node:assert');
+const fs = require('fs');
+const path = require('path');
+
+const src = fs.readFileSync(path.join(__dirname, '../../server.js'), 'utf8');
+
+function load() {
+  const a = src.indexOf('const PRICE_ALERT_MIN_MOVE = envNum(');
+  const b = src.indexOf('async function sendResendEmail(', a);
+  assert.ok(a > -1 && b > a, 'markers not found in server.js');
+  const body = src.slice(a, b);
+  return new Function(
+    'envNum', 'safeNumber', 'PRICE_ALERT_PCT',
+    body + '\nreturn { moveWorthSending, PRICE_ALERT_MIN_MOVE };'
+  )(
+    (k, d) => d,
+    (v, d) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : (d || 0); },
+    10
+  );
+}
+
+const { moveWorthSending, PRICE_ALERT_MIN_MOVE } = load();
+
+test('the floor is a real number that came out of server.js', () => {
+  assert.strictEqual(typeof moveWorthSending, 'function');
+  assert.strictEqual(PRICE_ALERT_MIN_MOVE, 5);
+});
+
+/* ── the reason this exists ─────────────────────────────────────── */
+
+test('a dollar card moving fifteen cents is not an email', () => {
+  // 15% -- clears the percentage bar outright, and is fifteen cents.
+  assert.strictEqual(moveWorthSending(1, 1.15), null);
+});
+
+test('the median card this scanner prices needs more than 10%', () => {
+  // Measured 25 Sept: median priced row is $9. 10% of it is ninety cents.
+  assert.strictEqual(moveWorthSending(9, 9.9), null);
+});
+
+test('a cheap card that really moved still gets through', () => {
+  // The whole reason this is a floor on the MOVE and not on the price:
+  // $6 to $14 is the move worth knowing about, and a value floor would
+  // have silenced it.
+  const pct = moveWorthSending(6, 14);
+  assert.ok(pct !== null, 'a cheap card that doubled must still alert');
+  assert.ok(pct > 100);
+});
+
+/* ── the ordinary cases ─────────────────────────────────────────── */
+
+test('a fifty dollar card up 10% clears both bars', () => {
+  const pct = moveWorthSending(50, 55);
+  assert.ok(pct !== null);
+  assert.ok(Math.abs(pct - 10) < 0.001);
+});
+
+test('a drop alerts the same as a rise, and keeps its sign', () => {
+  const pct = moveWorthSending(200, 150);
+  assert.ok(pct !== null);
+  assert.ok(pct < 0, 'a fall must stay negative so the email can say it fell');
+});
+
+test('a big dollar move that is a small percentage is still refused', () => {
+  // $1,000 -> $1,040 is $40, plenty of money, but 4%. The percentage bar
+  // is not weakened by adding the dollar one; both have to clear.
+  assert.strictEqual(moveWorthSending(1000, 1040), null);
+});
+
+test('exactly at both bars sends', () => {
+  // $50 -> $55 is exactly 10% and exactly $5. Boundaries are inclusive,
+  // matching the >= the percentage bar has always used.
+  assert.ok(moveWorthSending(50, 55) !== null);
+});
+
+test('exactly on the percentage but a cent under the dollars refuses', () => {
+  assert.strictEqual(moveWorthSending(49.9, 54.89), null);
+});
+
+/* ── nothing to compare against ─────────────────────────────────── */
+
+test('no baseline is not a move', () => {
+  assert.strictEqual(moveWorthSending(0, 50), null);
+  assert.strictEqual(moveWorthSending(null, 50), null);
+  assert.strictEqual(moveWorthSending(undefined, 50), null);
+});
+
+test('no current price is not a move', () => {
+  assert.strictEqual(moveWorthSending(50, 0), null);
+  assert.strictEqual(moveWorthSending(50, null), null);
+});
+
+test('junk in does not become a percentage', () => {
+  assert.strictEqual(moveWorthSending('abc', 50), null);
+  assert.strictEqual(moveWorthSending(50, 'abc'), null);
+  assert.strictEqual(moveWorthSending(NaN, NaN), null);
+});
+
+/* ── both callers actually use it ───────────────────────────────────
+
+   The helper being correct is worth nothing if a call site still does
+   the arithmetic itself. This is the check that would have caught the
+   saveTarget collision class of bug: shipped code that looks right in
+   one place and is bypassed in another. */
+
+test('runEmailWatchAlerts goes through the helper', () => {
+  const a = src.indexOf('async function runEmailWatchAlerts');
+  const b = src.indexOf('cron.schedule("30 4 * * *"', a);
+  const body = src.slice(a, b);
+  assert.ok(body.includes('moveWorthSending(base, newPrice)'),
+            'the watch alerts must not compute their own threshold');
+});
+
+test('runPriceAlerts goes through the helper', () => {
+  const a = src.indexOf('async function runPriceAlerts');
+  const b = src.indexOf('async function runEmailWatchAlerts', a);
+  const body = src.slice(a, b > a ? b : undefined);
+  assert.ok(body.includes('moveWorthSending(baseline, item.current_price)'),
+            'the binder price alerts must not compute their own threshold');
+});
+
+test('runTargetAlerts is deliberately NOT floored', () => {
+  // A price target is a number the person chose. Crossing it is the event
+  // they asked to hear about, whatever its size.
+  const a = src.indexOf('async function runTargetAlerts');
+  const body = src.slice(a, a + 12000);
+  assert.ok(!body.includes('moveWorthSending'),
+            'a user-chosen target must not be second-guessed for size');
+});
