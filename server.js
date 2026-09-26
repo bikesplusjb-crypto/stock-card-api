@@ -3970,7 +3970,7 @@ function summarizeSold(records, query, limitUsed) {
                                  : saleRejectReason(r);
       if (!why) { base.push(r); return; }
       if (tag === "raw") {
-        rejected.push({ price: r.price, title: r.title,
+        rejected.push({ price: r.price, title: r.title, saleDate: r.saleDate,
                         rule: why.rule, reason: why.reason });
       }
     });
@@ -4306,9 +4306,49 @@ function summarizeSold(records, query, limitUsed) {
         considered: clean.length,
         leftOut:   leftOut,
         reasons:   reasons,
-        samples:   rejected.slice(0, 6).map(function (x) {
-                     return { price: x.price, reason: x.reason };
-                   })
+        /* THE SALES WE THREW OUT, NOT JUST HOW MANY (25 Sept).
+
+           This was `samples`: six rejects, price and reason, and nothing
+           read it. The counts went out, the sales themselves did not, so
+           the scanner could say "85 thrown out" and had no way to SHOW
+           them -- the chart could only ever draw the survivors.
+
+           That is the wrong way round. On a contaminated card the
+           picture IS the argument: $8 base cards sitting beside $300
+           PSA 10s, and the four real sales clustered between them. A
+           reader sees the contamination in one glance and needs no copy
+           at all. Telling somebody we filtered is a claim; showing them
+           what we filtered is evidence.
+
+           Price and date only -- enough to plot a point. No titles: they
+           are seller-written, sometimes carry names or handles, and
+           nothing on the page renders them. Capped at 150, above the
+           100-result ceiling a single lookup can return, so a normal
+           card is never truncated. Undated sales are dropped here rather
+           than in the client, since a point with no x cannot be drawn.
+
+           Graded exclusions are included when the headline is raw. They
+           are the biggest single group on most cards and leaving them
+           out would draw a picture that disagrees with the count printed
+           above it. */
+        excluded:  (function () {
+                     const out = [];
+                     rejected.forEach(function (x) {
+                       if (x.saleDate && Number(x.price) > 0) {
+                         out.push({ price: Number(x.price), date: x.saleDate, reason: x.reason });
+                       }
+                     });
+                     if (basis === "raw") {
+                       gradedAll.forEach(function (r) {
+                         if (r.saleDate && Number(r.price) > 0) {
+                           out.push({ price: Number(r.price), date: r.saleDate,
+                                      reason: "Graded" + (r.grader ? " " + r.grader : "") +
+                                              (r.grade ? " " + r.grade : "") });
+                         }
+                       });
+                     }
+                     return out.slice(0, 150);
+                   })()
       };
     })(),
     soldMedianAll: median(prices),
